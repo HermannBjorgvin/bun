@@ -4219,7 +4219,13 @@ pub(crate) extern "C" fn Blob__dupe(this: &Blob) -> *mut Blob {
 
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn Blob__getFileNameString(this: &Blob) -> bun_core::StringView<'_> {
-    bun_core::StringView::from_bytes(this.get_file_name().unwrap_or_default())
+    let filename = this.get_file_name().unwrap_or_default();
+    let name = if this.needs_to_read_file() || this.is_s3() {
+        bun_paths::basename(filename)
+    } else {
+        filename
+    };
+    bun_core::StringView::from_bytes(name)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
