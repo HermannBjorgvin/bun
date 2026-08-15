@@ -1345,7 +1345,8 @@ pub fn format2(
         fmt.can_throw_stack_overflow = true;
         fmt.error_display_level = options.error_display_level;
         let tag = formatter::Tag::get(vals[0], global)?;
-        if fmt.write_indent(writer).is_err() {
+        fmt.write_indent(writer);
+        if fmt.failed {
             return Ok(());
         }
 
@@ -1409,7 +1410,8 @@ pub fn format2(
     fmt.error_display_level = options.error_display_level;
     let mut tag: formatter::TagResult;
 
-    if fmt.write_indent(writer).is_err() {
+    fmt.write_indent(writer);
+    if fmt.failed {
         return Ok(());
     }
 
@@ -2651,18 +2653,8 @@ pub mod formatter {
         /// Mirror of `Formatter::write_indent` routed through the wrapped
         /// `ctx` writer. Takes the current `Formatter::indent` by value.
         pub(crate) fn write_indent(&mut self, indent: u32) {
-            let mut total_remain: u32 = indent;
-            while total_remain > 0 {
-                let written: u8 = total_remain.min(32) as u8;
-                if self
-                    .ctx
-                    .write_all(&INDENTATION_BUF[0..(written as usize) * 2])
-                    .is_err()
-                {
-                    self.failed = true;
-                    return;
-                }
-                total_remain = total_remain.saturating_sub(u32::from(written));
+            if write_indent_n(indent, self.ctx).is_err() {
+                self.failed = true;
             }
         }
 
@@ -2720,11 +2712,6 @@ pub mod formatter {
 
     const INDENTATION_BUF: [u8; 64] = [b' '; 64];
 
-    /// Free-function indent writer for callsites where a `WrappedWriter`
-    /// already holds `&mut self.estimated_line_length`, which would otherwise
-    /// conflict with the `&self` borrow `Formatter::write_indent` takes.
-    /// `self.indent` is a disjoint field read, so passing it by value here
-    /// keeps the borrow checker happy.
     fn write_indent_n(indent: u32, writer: &mut dyn bun_io::Write) -> bun_io::Result<()> {
         let mut total_remain: u32 = indent;
         while total_remain > 0 {
@@ -2735,18 +2722,27 @@ pub mod formatter {
         Ok(())
     }
 
+    /// Like `WrappedWriter`, these record a failed write in `self.failed`
+    /// rather than returning it; callers check `failed` to stop early.
     impl Formatter<'_> {
-        pub(crate) fn write_indent(&self, writer: &mut dyn bun_io::Write) -> bun_io::Result<()> {
-            write_indent_n(self.indent, writer)
+        pub(crate) fn write_all(&mut self, writer: &mut dyn bun_io::Write, bytes: &[u8]) {
+            if writer.write_all(bytes).is_err() {
+                self.failed = true;
+            }
+        }
+
+        pub(crate) fn write_indent(&mut self, writer: &mut dyn bun_io::Write) {
+            if write_indent_n(self.indent, writer).is_err() {
+                self.failed = true;
+            }
         }
 
         pub(crate) fn print_comma<const ENABLE_ANSI_COLORS: bool>(
             &mut self,
             writer: &mut dyn bun_io::Write,
-        ) -> bun_io::Result<()> {
-            writer.write_all(pfmt!("<r><d>,<r>", ENABLE_ANSI_COLORS).as_bytes())?;
+        ) {
+            self.write_all(writer, pfmt!("<r><d>,<r>", ENABLE_ANSI_COLORS).as_bytes());
             self.estimated_line_length += 1;
-            Ok(())
         }
     }
 
@@ -2784,10 +2780,8 @@ pub mod formatter {
                 return;
             }
             if SINGLE_LINE && this.count > 0 {
-                this.formatter
-                    .print_comma::<C>(this.writer)
-                    .expect("unreachable");
-                this.writer.write_all(b" ").expect("unreachable");
+                this.formatter.print_comma::<C>(this.writer);
+                this.formatter.write_all(this.writer, b" ");
             }
             if !IS_ITERATOR {
                 let Ok(key) = next_value.get_index(global_object, 0) else {
@@ -2798,9 +2792,10 @@ pub mod formatter {
                 };
 
                 if !SINGLE_LINE {
-                    this.formatter
-                        .write_indent(this.writer)
-                        .expect("unreachable");
+                    this.formatter.write_indent(this.writer);
+                }
+                if this.formatter.failed {
+                    return;
                 }
                 let mut opts = TagOptions::HIDE_GLOBAL;
                 if this.formatter.disable_inspect_custom {
@@ -2816,7 +2811,10 @@ pub mod formatter {
                     key,
                     this.formatter.global_this,
                 );
-                this.writer.write_all(b": ").expect("unreachable");
+                this.formatter.write_all(this.writer, b": ");
+                if this.formatter.failed {
+                    return;
+                }
                 let Ok(value_tag) = Tag::get_advanced(value, global_object, opts) else {
                     return;
                 };
@@ -2828,10 +2826,11 @@ pub mod formatter {
                 );
             } else {
                 if !SINGLE_LINE {
-                    this.writer.write_all(b"\n").expect("unreachable");
-                    this.formatter
-                        .write_indent(this.writer)
-                        .expect("unreachable");
+                    this.formatter.write_all(this.writer, b"\n");
+                    this.formatter.write_indent(this.writer);
+                }
+                if this.formatter.failed {
+                    return;
                 }
                 let mut opts = TagOptions::HIDE_GLOBAL;
                 if this.formatter.disable_inspect_custom {
@@ -2849,11 +2848,9 @@ pub mod formatter {
             }
             this.count += 1;
             if !SINGLE_LINE {
-                this.formatter
-                    .print_comma::<C>(this.writer)
-                    .expect("unreachable");
+                this.formatter.print_comma::<C>(this.writer);
                 if !IS_ITERATOR {
-                    this.writer.write_all(b"\n").expect("unreachable");
+                    this.formatter.write_all(this.writer, b"\n");
                 }
             }
         }
@@ -2881,14 +2878,15 @@ pub mod formatter {
             }
             if SINGLE_LINE {
                 if !this.is_first {
-                    this.formatter
-                        .print_comma::<C>(this.writer)
-                        .expect("unreachable");
-                    this.writer.write_all(b" ").expect("unreachable");
+                    this.formatter.print_comma::<C>(this.writer);
+                    this.formatter.write_all(this.writer, b" ");
                 }
                 this.is_first = false;
             } else {
-                let _ = this.formatter.write_indent(this.writer);
+                this.formatter.write_indent(this.writer);
+            }
+            if this.formatter.failed {
+                return;
             }
             let mut opts = TagOptions::HIDE_GLOBAL;
             if this.formatter.disable_inspect_custom {
@@ -2905,10 +2903,8 @@ pub mod formatter {
             );
 
             if !SINGLE_LINE {
-                this.formatter
-                    .print_comma::<C>(this.writer)
-                    .expect("unreachable");
-                this.writer.write_all(b"\n").expect("unreachable");
+                this.formatter.print_comma::<C>(this.writer);
+                this.formatter.write_all(this.writer, b"\n");
             }
         }
     }
@@ -2947,10 +2943,10 @@ pub mod formatter {
             self.formatter.indent += 1;
             self.formatter.depth += 1;
             if self.single_line {
-                let _ = self.writer.write_all(b"{ ");
+                self.formatter.write_all(self.writer, b"{ ");
             } else {
-                let _ = self.writer.write_all(b"{\n");
-                let _ = self.formatter.write_indent(self.writer);
+                self.formatter.write_all(self.writer, b"{\n");
+                self.formatter.write_indent(self.writer);
             }
             Ok(())
         }
@@ -3555,8 +3551,15 @@ pub mod formatter {
                     return Ok(());
                 }
 
-                JSPrinter::write_json_string(str.latin1(), writer.ctx, JSPrinter::Encoding::Latin1)
-                    .expect("unreachable");
+                if JSPrinter::write_json_string(
+                    str.latin1(),
+                    writer.ctx,
+                    JSPrinter::Encoding::Latin1,
+                )
+                .is_err()
+                {
+                    writer.failed = true;
+                }
 
                 if C {
                     writer.write_all(pfmt!("<r>", true).as_bytes());
@@ -3583,13 +3586,14 @@ pub mod formatter {
                         failed: false,
                         estimated_line_length: &mut self.estimated_line_length,
                     };
-                } else {
-                    JSPrinter::write_json_string(
-                        str.latin1(),
-                        writer.ctx,
-                        JSPrinter::Encoding::Latin1,
-                    )
-                    .expect("unreachable");
+                } else if JSPrinter::write_json_string(
+                    str.latin1(),
+                    writer.ctx,
+                    JSPrinter::Encoding::Latin1,
+                )
+                .is_err()
+                {
+                    writer.failed = true;
                 }
 
                 writer.print(format_args!("]"));
@@ -4634,7 +4638,7 @@ pub mod formatter {
                 }
             }
             if !self.single_line {
-                let _ = self.write_indent(writer_);
+                self.write_indent(writer_);
             }
             let _ = writer_.write_all(b"}");
             Ok(())
@@ -4698,7 +4702,7 @@ pub mod formatter {
                 }
             }
             if !self.single_line {
-                let _ = self.write_indent(writer_);
+                self.write_indent(writer_);
             }
             let _ = writer_.write_all(b"}");
             Ok(())
@@ -4776,7 +4780,7 @@ pub mod formatter {
                 }
             }
             if !self.single_line {
-                let _ = self.write_indent(writer_);
+                self.write_indent(writer_);
             }
             let _ = writer_.write_all(b"}");
             Ok(())
@@ -4845,7 +4849,7 @@ pub mod formatter {
                 let old_quote_strings = self.quote_strings;
                 self.quote_strings = true;
                 let _qs = defer_restore!(self.quote_strings, old_quote_strings);
-                self.write_indent(writer_).expect("unreachable");
+                self.write_indent(writer_);
 
                 if self.single_line {
                     let _ = write!(
@@ -4876,7 +4880,7 @@ pub mod formatter {
                 {
                     if message_value.is_string() {
                         if !self.single_line {
-                            self.write_indent(writer_).expect("unreachable");
+                            self.write_indent(writer_);
                         }
                         let _ = write!(
                             writer_,
@@ -4891,7 +4895,7 @@ pub mod formatter {
                         if self.failed {
                             return Ok(());
                         }
-                        self.print_comma::<C>(writer_).expect("unreachable");
+                        self.print_comma::<C>(writer_);
                         if !self.single_line {
                             let _ = writer_.write_all(b"\n");
                         }
@@ -4901,7 +4905,7 @@ pub mod formatter {
                 match event_type {
                     EventType::MessageEvent => {
                         if !self.single_line {
-                            self.write_indent(writer_).expect("unreachable");
+                            self.write_indent(writer_);
                         }
                         let _ = write!(
                             writer_,
@@ -4918,7 +4922,7 @@ pub mod formatter {
                         if self.failed {
                             return Ok(());
                         }
-                        self.print_comma::<C>(writer_).expect("unreachable");
+                        self.print_comma::<C>(writer_);
                         if !self.single_line {
                             let _ = writer_.write_all(b"\n");
                         }
@@ -4928,7 +4932,7 @@ pub mod formatter {
                             value.fast_get(self.global_this, jsc::BuiltinName::Error)?
                         {
                             if !self.single_line {
-                                self.write_indent(writer_).expect("unreachable");
+                                self.write_indent(writer_);
                             }
                             let _ = write!(
                                 writer_,
@@ -4943,7 +4947,7 @@ pub mod formatter {
                             if self.failed {
                                 return Ok(());
                             }
-                            self.print_comma::<C>(writer_).expect("unreachable");
+                            self.print_comma::<C>(writer_);
                             if !self.single_line {
                                 let _ = writer_.write_all(b"\n");
                             }
@@ -4954,7 +4958,7 @@ pub mod formatter {
             }
 
             if !self.single_line {
-                self.write_indent(writer_).expect("unreachable");
+                self.write_indent(writer_);
             }
             let _ = writer_.write_all(b"}");
             Ok(())
@@ -5148,7 +5152,7 @@ pub mod formatter {
                                 )
                             {
                                 writer.write_all(b"\n");
-                                write_indent_n(self.indent, writer.ctx).expect("unreachable");
+                                writer.write_indent(self.indent);
                             } else if props_i + 1 < count_without_children {
                                 writer.space();
                             }
@@ -5179,21 +5183,18 @@ pub mod formatter {
                                         } else {
                                             self.indent += 1;
                                             writer.write_all(b"\n");
-                                            write_indent_n(self.indent, writer.ctx)
-                                                .expect("unreachable");
+                                            writer.write_indent(self.indent);
                                             self.indent = self.indent.saturating_sub(1);
                                             writer.write_string(&children_string);
                                             writer.write_all(b"\n");
-                                            write_indent_n(self.indent, writer.ctx)
-                                                .expect("unreachable");
+                                            writer.write_indent(self.indent);
                                         }
                                     }
                                     Tag::JSX => {
                                         writer.write_all(b">\n");
                                         {
                                             self.indent += 1;
-                                            write_indent_n(self.indent, writer.ctx)
-                                                .expect("unreachable");
+                                            writer.write_indent(self.indent);
                                             let _ind = defer_decrement!(self.indent);
                                             if writer.failed {
                                                 self.failed = true;
@@ -5212,8 +5213,7 @@ pub mod formatter {
                                             };
                                         }
                                         writer.write_all(b"\n");
-                                        write_indent_n(self.indent, writer.ctx)
-                                            .expect("unreachable");
+                                        writer.write_indent(self.indent);
                                     }
                                     Tag::Array => {
                                         let length = children.get_length(self.global_this)?;
@@ -5223,8 +5223,7 @@ pub mod formatter {
                                         writer.write_all(b">\n");
                                         {
                                             self.indent += 1;
-                                            write_indent_n(self.indent, writer.ctx)
-                                                .expect("unreachable");
+                                            writer.write_indent(self.indent);
                                             let _prev_quote_strings = self.quote_strings;
                                             self.quote_strings = false;
                                             let _qs2 = defer_restore!(
@@ -5260,15 +5259,13 @@ pub mod formatter {
                                                 };
                                                 if (j as u64) + 1 < length {
                                                     writer.write_all(b"\n");
-                                                    write_indent_n(self.indent, writer.ctx)
-                                                        .expect("unreachable");
+                                                    writer.write_indent(self.indent);
                                                 }
                                                 j += 1;
                                             }
                                         }
                                         writer.write_all(b"\n");
-                                        write_indent_n(self.indent, writer.ctx)
-                                            .expect("unreachable");
+                                        writer.write_indent(self.indent);
                                     }
                                     _ => unreachable!(),
                                 }
@@ -5398,7 +5395,7 @@ pub mod formatter {
                 let _ = writer_.write_all(b" ");
             } else if self.always_newline_scope || self.good_time_for_a_new_line() {
                 let _ = writer_.write_all(b"\n");
-                let _ = self.write_indent(writer_);
+                self.write_indent(writer_);
                 self.reset_line();
             }
 
@@ -5441,9 +5438,9 @@ pub mod formatter {
 
                 if iter_always_newline {
                     self.indent = self.indent.saturating_sub(1);
-                    self.print_comma::<C>(writer_).expect("unreachable");
+                    self.print_comma::<C>(writer_);
                     let _ = writer_.write_all(b"\n");
-                    let _ = self.write_indent(writer_);
+                    self.write_indent(writer_);
                     let _ = writer_.write_all(b"}");
                     self.estimated_line_length += 1;
                 } else {
