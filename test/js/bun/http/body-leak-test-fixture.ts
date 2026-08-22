@@ -5,6 +5,8 @@ import { rss } from "harness";
 // later, so a sample taken right after it still counts the previous batch's garbage.
 // Bun.shrink() queues a full GC plus a synchronous scavenge for the moment the VM goes
 // idle; yielding to the event loop runs it. Repeat until the reading stops falling.
+// Bun.shrink() also deletes all compiled code, so this belongs in a measurement fixture
+// like this one and not in the test runner's own VM.
 async function settledMemoryUsage(): Promise<number> {
   let previous = Infinity;
   for (let attempt = 0; attempt < 10; attempt++) {

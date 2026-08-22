@@ -11,20 +11,22 @@ const concurrency = 40;
 // Each scenario sends requestCount requests and samples the fixture's settled RSS at
 // `checkpoints` evenly spaced points. Growth is measured from the first checkpoint, so it
 // covers the last 3/4 of the requests. Sizing: a retained 512 KB body per request grows RSS
-// by 360 MB (release) or 150 MB (ASAN/debug), and a retained 64 KB chunk per request by
+// by 360 MB (release) or 120 MB (ASAN/debug), and a retained 64 KB chunk per request by
 // 46 MB on release, where requests are cheap enough to afford the larger count.
-const requestCount = isASAN || isDebug ? 400 : 960;
+const requestCount = isASAN || isDebug ? 320 : 960;
 const checkpoints = 4;
-// Warmup requests per route: enough to JIT the handlers, grow the heap to its steady
-// state and, under ASAN, fill the 256 MB free-memory quarantine before anything is measured.
+// Warmup requests per route: enough to JIT the handlers, grow the heap to its steady state
+// and, under ASAN, fill the free-memory quarantine before anything is measured.
 const warmupCount = 80;
-// Settled samples of a leak-free scenario stay within a few MB on release. Under ASAN the
-// free-memory quarantine drains to 90% of its 256 MB whenever it fills, so a settled reading
-// moves by up to 26 MB with no leak, and the retained bytes of a real leak show up damped.
-const maxGrowthMB = isASAN ? 64 : 32;
-// Absolute bound on the settled RSS after a scenario: the release fixture sits near 40 MB,
-// the ASAN one near 600 MB (340 MB baseline plus the quarantine).
-const maxRssMB = isASAN || isDebug ? 768 : 256;
+// Leak-free settled samples stay within a few MB when the fixture's scavenge reaches every
+// allocator: release builds link JSC against Bun's mimalloc, and ASAN builds get a 32 MB
+// quarantine below. A debug build without ASAN links JSC against libpas instead, so
+// Bun.shrink() cannot purge Bun-native mimalloc frees; those wait for the allocator's
+// 100 ms background purge, and a sample can still hold a batch of freed body buffers.
+const maxGrowthMB = isDebug && !isASAN ? 64 : 32;
+// Absolute bound on the settled RSS after a scenario: the release fixture sits near 50 MB,
+// the debug one near 110 MB and the ASAN one near 410 MB.
+const maxRssMB = isASAN ? 512 : 256;
 
 type Scenario = { name: string; path: string; body: Blob; expected: string };
 const scenarios: Scenario[] = [
@@ -103,7 +105,12 @@ describe("request body leak", () => {
   beforeAll(async () => {
     const defer = Promise.withResolvers<string>();
     fixture = Bun.spawn([bunExe(), "--smol", join(import.meta.dirname, "body-leak-test-fixture.ts")], {
-      env: bunEnv,
+      env: {
+        ...bunEnv,
+        // ASAN parks freed allocations in a 256 MB quarantine, so the fixture's RSS would
+        // track the quarantine instead of live memory. Cap it like fetch-leak.test.ts does.
+        ...(isASAN && { ASAN_OPTIONS: `${bunEnv.ASAN_OPTIONS ?? ""}:quarantine_size_mb=32`.replace(/^:/, "") }),
+      },
       stdout: "inherit",
       stderr: "inherit",
       stdin: "ignore",
