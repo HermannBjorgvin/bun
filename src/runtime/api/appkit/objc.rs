@@ -2,14 +2,19 @@
 //! functions: the JavaScript face of `bun_appkit::dynamic`, which sends any
 //! selector to any object or class. `src/js/internal/objc.ts` wraps these in
 //! the `objc` proxy layer (selector name mangling, `objc.classes`, handles).
+//!
+//! Everything here is per thread: the main thread and each Worker that loads
+//! the module get their own handle table, hooks, script functions and
+//! release queue, and are each an [`Owner`] the bridge hands stray blocks
+//! and instances back to. [`retire`] lets go of a thread's half when it exits.
 
 use core::cell::{Cell, RefCell};
 use core::mem::ManuallyDrop;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::rc::Rc;
 
 use bun_appkit::dynamic::{self, Enc, Plain, Receiver, Reply};
-use bun_appkit::handoff::{self, Post};
+use bun_appkit::handoff::{self, Owner, Post};
 use bun_appkit::script::{self, Call, ClassSpec, MethodSpec};
 use bun_appkit::{DynClass, DynObject, DynValue, View, block};
 use bun_jsc::ConcurrentTask::ConcurrentTask;
@@ -31,14 +36,50 @@ thread_local! {
             views: Vec::new(),
         }))
     };
-    /// What `internal/objc.ts` hands over once; see [`Hooks`]. Never dropped: it
-    /// lives as long as the module.
+    /// What `internal/objc.ts` hands over once; see [`Hooks`]. Never dropped
+    /// by the thread-local: it goes in [`retire`] or lives as long as the module.
     static HOOKS: RefCell<Option<ManuallyDrop<Hooks>>> = const { RefCell::new(None) };
     /// The live wrapper of each object or class by address, so one object is
     /// one JavaScript object for as long as the script can reach it. Nothing
     /// that allocates on the JavaScript heap may run while this is borrowed:
-    /// a collection would finalize wrappers, which come back here.
-    static HANDLES: RefCell<HashMap<usize, Weak<()>>> = RefCell::new(HashMap::new());
+    /// a collection would finalize wrappers, which come back here. Emptied
+    /// by [`retire`], never dropped by the thread-local.
+    static HANDLES: RefCell<ManuallyDrop<HashMap<usize, Weak<()>>>> =
+        RefCell::new(ManuallyDrop::new(HashMap::new()));
+    /// Every live [`Roots`] on the thread, for [`retire`] to empty.
+    static ROOTS: RefCell<Vec<std::rc::Weak<Roots>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether [`retire`] has run on this thread: its JavaScript side is going
+/// or gone, so nothing here may touch the heap any more.
+fn retired() -> bool {
+    handoff::this_thread().is_some_and(Owner::retired)
+}
+
+/// The functions (or table) one block, script class or attached table keeps
+/// alive, held so that [`retire`] can let them go while the heap is still
+/// there; from then on whatever owned them answers nothing.
+struct Roots(RefCell<Vec<Strong>>);
+
+impl Roots {
+    fn new(global: &JSGlobalObject, values: &[JSValue]) -> Rc<Roots> {
+        let roots = Rc::new(Roots(RefCell::new(
+            values.iter().map(|v| Strong::create(*v, global)).collect(),
+        )));
+        ROOTS.with_borrow_mut(|all| {
+            // Forget the ones already dropped now and then, so the list
+            // stays about as long as what is alive.
+            if all.len().is_power_of_two() {
+                all.retain(|r| r.strong_count() > 0);
+            }
+            all.push(Rc::downgrade(&roots));
+        });
+        roots
+    }
+
+    fn get(&self, index: usize) -> Option<JSValue> {
+        self.0.borrow().get(index).map(Strong::get)
+    }
 }
 
 /// The script side's half of the bridge, from `objcSetHooks`.
@@ -89,7 +130,7 @@ fn canonical(
     }
     let value = make();
     let weak = Weak::create_passive(value, global);
-    HANDLES.with_borrow_mut(|handles| handles.insert(address, weak));
+    drop(HANDLES.with_borrow_mut(|handles| handles.insert(address, weak)));
     value
 }
 
@@ -106,35 +147,66 @@ fn forget(address: usize) {
     });
 }
 
-/// The main thread's VM, for [`post`] to reach from other threads.
-static VM: OnceLock<VmHandle> = OnceLock::new();
+/// How `bun_appkit` reaches this thread from another: a task on its event
+/// loop that frees handed-back values or reports a call made elsewhere.
+struct VmHome(VmHandle);
 
-/// What `bun_appkit` learns on another thread, brought to this one: a task
-/// on the event loop that frees handed-over values or reports the call.
-fn post(post: Post) {
-    let Some(vm) = VM.get() else {
-        return;
-    };
-    fn posted(post: *mut Post) -> JsResult<()> {
-        // SAFETY: what the enclosing function boxed for this one task.
-        match *unsafe { bun_core::heap::take(post) } {
-            Post::FreeDeferred => handoff::free_deferred(),
-            Post::WrongThread(what) => {
-                let global = VirtualMachine::get().global();
-                let err = conv::throw(global, bun_appkit::Error::CalledOffMainThread(what));
-                let _ = bun_jsc::task::report_error_or_terminate(global, err);
+impl handoff::Home for VmHome {
+    fn post(&self, post: Post) -> bool {
+        fn posted(post: *mut Post) -> JsResult<()> {
+            // SAFETY: what the enclosing function boxed for this one task.
+            match *unsafe { bun_core::heap::take(post) } {
+                Post::FreeDeferred => handoff::free_deferred(),
+                Post::WrongThread(_) if retired() => {}
+                Post::WrongThread(what) => {
+                    let global = VirtualMachine::get().global();
+                    let err = conv::throw(global, bun_appkit::Error::CalledOnOtherThread(what));
+                    let _ = bun_jsc::task::report_error_or_terminate(global, err);
+                }
+            }
+            Ok(())
+        }
+        let task = ConcurrentTask::create(ManagedTask::new_owned(
+            bun_core::heap::into_raw(Box::new(post)),
+            posted,
+        ));
+        match self.0.post(LoopKind::Regular, task) {
+            Posted::Queued => true,
+            Posted::Refused(task) => {
+                // SAFETY: refused, so still ours; this frees the boxed `Post` too.
+                unsafe { ConcurrentTask::release_refused(task) };
+                false
             }
         }
-        Ok(())
     }
-    let task = ConcurrentTask::create(ManagedTask::new_owned(
-        bun_core::heap::into_raw(Box::new(post)),
-        posted,
-    ));
-    if let Posted::Refused(task) = vm.post(LoopKind::Regular, task) {
-        // SAFETY: refused, so still ours; this frees the boxed `Post` too.
-        unsafe { ConcurrentTask::release_refused(task) };
+}
+
+/// This thread's JavaScript side is shutting down (a Worker ending, or the
+/// process): free what other threads handed back while the heap is still
+/// here, then let go of every function, table, hook and wrapper the bridge
+/// holds on it and tell `bun_appkit` the thread is gone, so a block or
+/// script method reached later (here during teardown, or on another thread)
+/// runs nothing. Objective-C objects the collector frees from now on are
+/// released on the spot.
+extern "C" fn retire(_: *mut core::ffi::c_void) {
+    let Some(owner) = handoff::this_thread() else {
+        return;
+    };
+    if owner.retired() {
+        return;
     }
+    handoff::free_deferred();
+    owner.retire();
+    release_finalized();
+    let roots = ROOTS.with_borrow_mut(core::mem::take);
+    for roots in roots.iter().filter_map(std::rc::Weak::upgrade) {
+        roots.0.borrow_mut().clear();
+    }
+    drop(roots);
+    if let Some(hooks) = HOOKS.with_borrow_mut(Option::take) {
+        drop(ManuallyDrop::into_inner(hooks));
+    }
+    drop(HANDLES.with_borrow_mut(|handles| core::mem::take(&mut **handles)));
 }
 
 /// Applies `function` to `receiver` (or `undefined`) and `args` through the
@@ -276,7 +348,13 @@ impl Released {
 }
 
 /// Queues `item` to be dropped outside the collection; see [`Finalized`].
+/// Once the thread has [`retire`]d there is no later, and no script method
+/// a `dealloc` could reach runs any more, so it is dropped here.
 pub(super) fn drop_later(item: Finalized) {
+    if retired() {
+        dynamic::drop_pooled(item);
+        return;
+    }
     let first = RELEASED.with_borrow_mut(|queue| {
         let first = queue.is_empty();
         match item {
@@ -634,34 +712,68 @@ fn objc_lookup_protocol(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<
 /// Never dropped: the class is registered for the life of the process.
 struct JsMethods {
     global: GlobalRef,
-    functions: Vec<Strong>,
+    functions: Rc<Roots>,
 }
 
-/// What `objc.target()` and friends attach to one instance: an object whose
-/// own function-valued properties, named by selector, take precedence over
-/// the class's functions. Dropped when the instance deallocates.
-struct JsInstance {
-    table: Strong,
-}
+const NO_REPLY: Reply = Reply {
+    value: None,
+    outs: Vec::new(),
+};
 
 impl script::Methods for JsMethods {
     fn call(&self, call: Call<'_>) -> Reply {
         let global = &*self.global;
-        let per_instance = || -> JsResult<Option<JSValue>> {
-            match call
-                .instance
-                .and_then(|data| data.downcast_ref::<JsInstance>())
-            {
-                Some(instance) => Ok(instance
-                    .table
-                    .get()
-                    .get(global, call.selector)?
-                    .filter(|f| f.is_callable())),
-                None => Ok(None),
-            }
+        let Some(function) = self.functions.get(call.index) else {
+            return NO_REPLY;
         };
-        let function = match per_instance() {
-            Ok(function) => function.unwrap_or_else(|| self.functions[call.index].get()),
+        let receiver = ObjCObject::lend(global, call.receiver);
+        call_js(
+            global,
+            function,
+            receiver,
+            call.method,
+            call.args,
+            call.params,
+            call.ret,
+        )
+    }
+
+    fn report(&self, err: bun_appkit::Error) {
+        let global = &*self.global;
+        let _ = bun_jsc::task::report_error_or_terminate(global, conv::throw(global, err));
+    }
+}
+
+/// What `objc.target()` attaches to one instance of [`TARGETS`]: an object
+/// whose function-valued properties, named by selector, are the instance's
+/// methods. Dropped when the instance deallocates.
+struct JsInstance {
+    table: Rc<Roots>,
+}
+
+/// The methods of `objc.target()`'s one class, whose every instance carries
+/// a [`JsInstance`] some thread attached and is called only there.
+struct Targets;
+
+/// That class, defined by whichever thread makes a target first.
+static TARGETS: std::sync::Mutex<Option<DynClass>> = std::sync::Mutex::new(None);
+
+impl script::Methods for Targets {
+    fn call(&self, call: Call<'_>) -> Reply {
+        let global = VirtualMachine::get().global();
+        let function = match call
+            .instance
+            .and_then(|data| data.downcast_ref::<JsInstance>())
+            .and_then(|instance| instance.table.get(0))
+        {
+            Some(table) => table
+                .get(global, call.selector)
+                .map(|f| f.filter(|f| f.is_callable())),
+            None => Ok(None),
+        };
+        let function = match function {
+            Ok(Some(function)) => function,
+            Ok(None) => return NO_REPLY,
             Err(err) => {
                 return Reply {
                     value: returned(global, call.method, call.ret, Err(err)),
@@ -682,7 +794,7 @@ impl script::Methods for JsMethods {
     }
 
     fn report(&self, err: bun_appkit::Error) {
-        let global = &*self.global;
+        let global = VirtualMachine::get().global();
         let _ = bun_jsc::task::report_error_or_terminate(global, conv::throw(global, err));
     }
 }
@@ -691,7 +803,7 @@ impl script::Methods for JsMethods {
 /// is released.
 pub(super) struct JsBlock {
     global: GlobalRef,
-    function: Strong,
+    function: Rc<Roots>,
 }
 
 impl JsBlock {
@@ -703,7 +815,7 @@ impl JsBlock {
     ) -> bun_appkit::Result<bun_appkit::DynObject> {
         let handler = Box::new(JsBlock {
             global: GlobalRef::new(global),
-            function: Strong::create(function, global),
+            function: Roots::new(global, &[function]),
         });
         block::make(types, handler)
     }
@@ -711,9 +823,12 @@ impl JsBlock {
 
 impl block::BlockFn for JsBlock {
     fn call(&self, call: block::Call<'_>) -> Reply {
+        let Some(function) = self.function.get(0) else {
+            return NO_REPLY;
+        };
         call_js(
             &self.global,
-            self.function.get(),
+            function,
             JSValue::UNDEFINED,
             call.method,
             call.args,
@@ -783,8 +898,7 @@ fn objc_set_hooks(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValu
     if let Some(old) = old {
         drop(ManuallyDrop::into_inner(old));
         if other {
-            let stale = HANDLES.with_borrow_mut(core::mem::take);
-            drop(stale);
+            drop(HANDLES.with_borrow_mut(|handles| core::mem::take(&mut **handles)));
         }
     }
     Ok(JSValue::UNDEFINED)
@@ -851,7 +965,7 @@ fn objc_define_class(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSV
         return Err(global.throw_type_error(format_args!("objcDefineClass: bad arguments")));
     }
     let mut methods = Vec::with_capacity(selectors.len());
-    let mut retained = Vec::with_capacity(selectors.len());
+    let mut bodies = Vec::with_capacity(selectors.len());
     for (i, selector) in selectors.into_iter().enumerate() {
         let types = match types.get_index(global, i as u32)? {
             t if t.is_undefined_or_null() => None,
@@ -867,7 +981,7 @@ fn objc_define_class(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSV
         };
         let body = functions.get_index(global, i as u32)?;
         let constant = if body.is_callable() {
-            retained.push(Strong::create(body, global));
+            bodies.push(body);
             None
         } else {
             Some(constant_body(global, body, &selector)?)
@@ -883,10 +997,11 @@ fn objc_define_class(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSV
         superclass,
         protocols,
         methods,
+        instance_owned: false,
     };
     let handler = Box::new(JsMethods {
         global: GlobalRef::new(global),
-        functions: retained,
+        functions: Roots::new(global, &bodies),
     });
     let class = conv::check(global, script::define_class(&spec, handler))?;
     Ok(ObjCClass::wrap(global, class))
@@ -906,8 +1021,40 @@ fn objc_block(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
     Ok(ObjCObject::wrap(global, block))
 }
 
-/// `objcAttach(handle, table)`: per-instance functions for a script-class
-/// instance, kept alive by the instance from now until it deallocates.
+/// `objcTargetClass()`: the one class every thread's `objc.target()` makes
+/// instances of, defined now if no thread has yet. Its `action:` runs, on
+/// the thread that attached it, the function in the table [`objc_attach`]
+/// gave the instance.
+#[bun_jsc::host_fn]
+fn objc_target_class(global: &JSGlobalObject, _frame: &CallFrame) -> JsResult<JSValue> {
+    let mut slot = TARGETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let class = match *slot {
+        Some(class) => class,
+        None => {
+            let spec = ClassSpec {
+                name: String::new(),
+                superclass: conv::check(global, dynamic::lookup_class("NSObject"))?,
+                protocols: Vec::new(),
+                methods: vec![MethodSpec {
+                    selector: "action:".into(),
+                    types: Some("v@:@".into()),
+                    constant: None,
+                }],
+                instance_owned: true,
+            };
+            let class = conv::check(global, script::define_class(&spec, Box::new(Targets)))?;
+            *slot.insert(class)
+        }
+    };
+    drop(slot);
+    Ok(ObjCClass::wrap(global, class))
+}
+
+/// `objcAttach(handle, table)`: the functions of one [`TARGETS`] instance,
+/// by selector, kept alive by the instance from now until it deallocates
+/// and run on this thread.
 #[bun_jsc::host_fn]
 fn objc_attach(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
     let (Some(wrapper), table) = (conv::objc_object(frame.argument(0)), frame.argument(1)) else {
@@ -919,7 +1066,7 @@ fn objc_attach(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> 
         );
     }
     let data = Box::new(JsInstance {
-        table: Strong::create(table, global),
+        table: Roots::new(global, &[table]),
     });
     conv::check(global, script::attach(wrapper.object(), data))?;
     Ok(JSValue::UNDEFINED)
@@ -1010,13 +1157,17 @@ fn objc_constant(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue
     conv::dyn_to_js(global, value)
 }
 
-/// Adds the classes and functions above to the `createObjcBinding` object; from
-/// here on Objective-C exceptions inside sends are errors, and what
-/// `bun_appkit` hears of on other threads comes to this one.
+/// Adds the classes and functions above to the `createObjcBinding` object;
+/// from here on Objective-C exceptions inside sends are errors, this thread
+/// is one `bun_appkit` hands its blocks and instances back to, and its half
+/// of the bridge is let go when the thread exits ([`retire`]).
 pub(super) fn install(global: &JSGlobalObject, binding: JSValue) {
     dynamic::catch_exceptions_with(dynamic::Bun__NSInvocation__tryInvoke);
-    if handoff::post_with(post) {
-        let _ = VM.set(global.bun_vm().handle());
+    let vm = global.bun_vm();
+    if handoff::install(Box::new(VmHome(vm.handle()))) {
+        vm.as_mut()
+            .rare_data()
+            .push_cleanup_hook(global, core::ptr::null_mut(), retire);
     }
     binding.put(global, b"ObjCObject", ObjCObject::get_constructor(global));
     binding.put(global, b"ObjCClass", ObjCClass::get_constructor(global));
@@ -1025,7 +1176,7 @@ pub(super) fn install(global: &JSGlobalObject, binding: JSValue) {
         b"ObjCSelector",
         ObjCSelector::get_constructor(global),
     );
-    let functions: [(&str, bun_jsc::JSHostFn, u32); 14] = [
+    let functions: [(&str, bun_jsc::JSHostFn, u32); 15] = [
         ("objcLookupClass", __jsc_host_objc_lookup_class, 1),
         ("objcLookupProtocol", __jsc_host_objc_lookup_protocol, 1),
         ("objcJs", __jsc_host_objc_js, 1),
@@ -1038,6 +1189,7 @@ pub(super) fn install(global: &JSGlobalObject, binding: JSValue) {
         ("objcInvokeBlock", __jsc_host_objc_invoke_block, 1),
         ("objcSetHooks", __jsc_host_objc_set_hooks, 2),
         ("objcDefineClass", __jsc_host_objc_define_class, 6),
+        ("objcTargetClass", __jsc_host_objc_target_class, 0),
         ("objcAttach", __jsc_host_objc_attach, 2),
         ("objcBlock", __jsc_host_objc_block, 2),
     ];

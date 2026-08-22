@@ -113,6 +113,7 @@ impl App {
         if let Some(app) = App::get() {
             return Ok(app);
         }
+        objc::main_thread()?;
         objc::load()?;
         let _pool = AutoreleasePool::new();
         // No up-front WindowServer check: sandboxed and headless sessions
@@ -266,6 +267,7 @@ impl App {
     /// [`has_display`] without starting the application: loads the
     /// frameworks if needed and asks `NSScreen`.
     pub fn query_display() -> Result<bool> {
+        objc::main_thread()?;
         objc::load()?;
         Ok(has_display())
     }

@@ -269,6 +269,13 @@ objc_methods! { impl NSProcessInfo {
     pub fn end_activity(&self, activity: &NSObject) = "endActivity:";
 }}
 
+objc_class!(pub struct NSThread: NSObject = "NSThread");
+objc_methods! { impl NSThread {
+    pub(crate) fn is_multi_threaded() -> bool = "isMultiThreaded";
+    pub(crate) fn init(this: Allocated<Self>) -> Retained<NSThread> = "init";
+    pub(crate) fn start(&self) = "start";
+}}
+
 objc_class!(pub struct NSException: NSObject = "NSException");
 objc_methods! { impl NSException {
     /// Declared nonnull, but `exceptionWithName:nil` makes one without.

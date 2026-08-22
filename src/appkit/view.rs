@@ -91,6 +91,7 @@ pub struct View {
 impl View {
     /// Creates a Metal view with default configuration. Events go to `sink`.
     pub fn new(sink: Box<dyn ViewSink>) -> Result<View> {
+        crate::objc::main_thread()?;
         crate::objc::load()?;
         let _pool = AutoreleasePool::new();
         let inner = Rc::new_cyclic(|weak: &Weak<Inner>| {

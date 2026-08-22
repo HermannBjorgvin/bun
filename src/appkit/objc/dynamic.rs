@@ -23,8 +23,8 @@ use super::foundation::{
     NSMutableArray, NSMutableDictionary, NSNull, NSNumber, NSObject, NSString, Upcast,
 };
 use super::{
-    AutoreleasePool, Class, ClassType, Id, NsStr, Obj, Object, Ptr, block, load, register_sel, rt,
-    sdk,
+    AutoreleasePool, Class, ClassType, Id, NsStr, Obj, Object, Ptr, block, load, main_thread_only,
+    register_sel, rt, sdk,
 };
 use crate::error::{Error, Result};
 use bun_core::strings;
@@ -1513,7 +1513,8 @@ thread_local! {
 
 /// Looks the method up on the receiver. `Unrecognized` unless the receiver
 /// responds to `sel`, so a typo is an error here rather than an exception
-/// inside the send.
+/// inside the send; [`Error::MainThreadOnly`] for a receiver AppKit keeps to
+/// the main thread, anywhere else.
 pub fn signature(receiver: Receiver<'_>, sel: &str) -> Result<Rc<Signature>> {
     load()?;
     let _pool = AutoreleasePool::new();
@@ -1570,6 +1571,9 @@ pub fn signature(receiver: Receiver<'_>, sel: &str) -> Result<Rc<Signature>> {
         instance: receiver.is_instance(),
     };
     let (mut owner, class_method) = receiver.method_owner()?;
+    // Nothing this refuses is ever put in the cache above, which is the
+    // thread's own, so a hit there needed no check.
+    main_thread_only(owner.0, Some(sel))?;
     // An `alloc` awaiting its `init…` is not messaged: its class's method
     // table answers for it (what `+instancesRespondToSelector:` reads too),
     // or, when the class leaves this `init…` to whatever `+alloc` returns,

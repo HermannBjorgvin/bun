@@ -7,9 +7,9 @@
 //! which the runtime encodes as a bare `@?`; and the protocols Foundation,
 //! AppKit, QuartzCore, Metal and MetalKit declare without registering on
 //! the generating machine (plus the ones bun:appkit adopts itself), with
-//! their method descriptions. Generated from the SDK headers and the
-//! BridgeSupport metadata by `bun scripts/appkit-sdk-methods.ts`; do not
-//! edit by hand.
+//! their method descriptions; and the classes AppKit marks for the main
+//! thread only. Generated from the SDK headers and the BridgeSupport
+//! metadata by `bun scripts/appkit-sdk-methods.ts`; do not edit by hand.
 
 use core::ffi::CStr;
 
@@ -1502,4 +1502,48 @@ pub(super) const PROTOCOLS: &[Protocol] = &[
             (c"writingToolsCoordinator:willChangeToState:completion:", c"v40@0:8@16q24@?32", false, true),
         ],
     },
+];
+
+/// The AppKit classes declared `NS_SWIFT_UI_ACTOR`, sorted by name.
+#[rustfmt::skip]
+pub(super) const MAIN_THREAD_CLASSES: &[&CStr] = &[
+    c"NSAlert",
+    c"NSCell",
+    c"NSCollectionLayoutAnchor",
+    c"NSCollectionLayoutDimension",
+    c"NSCollectionLayoutEdgeSpacing",
+    c"NSCollectionLayoutGroupCustomItem",
+    c"NSCollectionLayoutItem",
+    c"NSCollectionLayoutSection",
+    c"NSCollectionLayoutSize",
+    c"NSCollectionLayoutSpacing",
+    c"NSCollectionViewCompositionalLayoutConfiguration",
+    c"NSCollectionViewLayout",
+    c"NSCollectionViewLayoutAttributes",
+    c"NSCollectionViewLayoutInvalidationContext",
+    c"NSCollectionViewUpdateItem",
+    c"NSDocument",
+    c"NSDocumentController",
+    c"NSGestureRecognizer",
+    c"NSGridCell",
+    c"NSGridColumn",
+    c"NSGridRow",
+    c"NSHelpManager",
+    c"NSPDFPanel",
+    c"NSPageLayout",
+    c"NSPrintOperation",
+    c"NSPrintPanel",
+    c"NSResponder",
+    c"NSScrollEdgeEffectStyle",
+    c"NSScrubberLayout",
+    c"NSScrubberSelectionStyle",
+    c"NSSliderAccessory",
+    c"NSSliderAccessoryBehavior",
+    c"NSTableColumn",
+    c"NSTextPreview",
+    c"NSToolbar",
+    c"NSToolbarItem",
+    c"NSTouchBar",
+    c"NSTouchBarItem",
+    c"NSWritingToolsCoordinator",
 ];

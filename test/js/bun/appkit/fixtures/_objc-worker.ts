@@ -15,4 +15,6 @@ postMessage({
   ns: attempt(() => objc.ns(1)),
   // Pure JavaScript, so allowed anywhere.
   sel: attempt(() => String(objc.sel("length"))),
+  // AppKit's windows and views belong to the main thread.
+  window: attempt(() => objc.classes.NSWindow.alloc()),
 });

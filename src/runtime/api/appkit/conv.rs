@@ -213,7 +213,10 @@ pub(crate) fn throw(global: &JSGlobalObject, err: bun_appkit::Error) -> JsError 
         E::Load(_) => global
             .err(ErrorCode::APPKIT_UNAVAILABLE, format_args!("{err}"))
             .throw(),
-        E::WrongThread | E::CalledOffMainThread(_) | E::ActivationPolicyRefused(_) => global
+        E::WrongThread
+        | E::MainThreadOnly { .. }
+        | E::CalledOnOtherThread(_)
+        | E::ActivationPolicyRefused(_) => global
             .err(ErrorCode::INVALID_STATE, format_args!("{err}"))
             .throw(),
         E::NoGpu => global.throw_type_error(format_args!("Metal is not available on this machine")),
@@ -456,7 +459,8 @@ fn ns_value_at(
             },
         )?;
         while let Some(key) = iter.next()? {
-            let key = JsStr(OwnedString::new(key));
+            // The iterator lends the name; `JsStr` gives its reference back.
+            let key = JsStr(OwnedString::new(key.dupe_ref()));
             let key = check(global, DynObject::string(key.ns()))?;
             let value = match ns_value_at(global, iter.value, what, depth + 1)? {
                 Some(o) => o,

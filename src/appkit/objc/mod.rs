@@ -28,7 +28,7 @@ use core::cell::Cell;
 use core::ffi::{CStr, c_char, c_void};
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
 
 use crate::error::{Error, Result};
 
@@ -937,9 +937,9 @@ pub(crate) struct CFFileDescriptorContext {
     pub copy_description: *const c_void,
 }
 
-// SAFETY: function pointers and a never-closed dlopen handle; use is confined
-// to the main thread (asserted in `send` and enforced in `load`), storage in a
-// OnceLock needs these.
+// SAFETY: function pointers and a never-closed dlopen handle, written once
+// and only read afterwards; the runtime's own entry points are callable from
+// any thread. Storage in a OnceLock needs these.
 unsafe impl Send for Runtime {}
 // SAFETY: as above.
 unsafe impl Sync for Runtime {}
@@ -947,21 +947,106 @@ unsafe impl Sync for Runtime {}
 /// The `Err` is the raw cause: dlerror text, the library path, or `symbol <name>`.
 static RUNTIME: OnceLock<core::result::Result<Runtime, String>> = OnceLock::new();
 
-/// Whether this is the process main thread, which is the only thread AppKit may be used from.
+/// Whether this is the process main thread, which is the only thread AppKit's
+/// windows, views, menus and application object may be used from.
 #[inline]
 pub(crate) fn is_main_thread() -> bool {
     // SAFETY: plain libc query with no preconditions.
     unsafe { libc::pthread_main_np() == 1 }
 }
 
-/// Loads the frameworks on first call. Fails with `WrongThread` anywhere but the process main thread.
-pub(crate) fn load() -> Result<&'static Runtime> {
-    if !is_main_thread() {
-        return Err(Error::WrongThread);
+/// `Ok` on the process main thread, [`Error::WrongThread`] anywhere else:
+/// the gate for the application, the Metal view and `gpu`.
+#[inline]
+pub(crate) fn main_thread() -> Result<()> {
+    if is_main_thread() {
+        Ok(())
+    } else {
+        Err(Error::WrongThread)
     }
-    match RUNTIME.get_or_init(Runtime::open) {
-        Ok(rt) => Ok(rt),
-        Err(cause) => Err(Error::Load(cause.clone())),
+}
+
+/// Loads the frameworks on first call, once for the process, from any thread.
+pub(crate) fn load() -> Result<&'static Runtime> {
+    let rt = match RUNTIME.get_or_init(Runtime::open) {
+        Ok(rt) => rt,
+        Err(cause) => return Err(Error::Load(cause.clone())),
+    };
+    static MULTITHREADED: Once = Once::new();
+    MULTITHREADED.call_once(enter_multithreaded_mode);
+    Ok(rt)
+}
+
+/// Scripts run on POSIX threads Foundation did not start, and Cocoa only
+/// takes its locks once some `NSThread` has been started
+/// (`+[NSThread isMultiThreaded]`); so one that does nothing is, if none was.
+fn enter_multithreaded_mode() {
+    let _pool = AutoreleasePool::new();
+    if !foundation::NSThread::is_multi_threaded() {
+        foundation::NSThread::init(alloc::<foundation::NSThread>()).start();
+    }
+}
+
+/// Classes kept to the main thread besides the ones the AppKit headers mark
+/// ([`sdk::MAIN_THREAD_CLASSES`]): each builds or drives user interface
+/// that AppKit only touches on the main thread, without saying so in its
+/// declaration.
+const MAIN_THREAD_CLASSES: [&CStr; 7] = [
+    // The menu bar and its items are laid out and drawn by the main thread.
+    c"NSMenu",
+    c"NSMenuItem",
+    // Creates status items, whose buttons are views.
+    c"NSStatusBar",
+    c"NSStatusItem",
+    // Instantiating either builds windows and views.
+    c"NSNib",
+    c"NSStoryboard",
+    // Draws into the Dock through a view.
+    c"NSDockTile",
+];
+
+/// What any thread may ask any object: identity, class membership and
+/// description, which read nothing AppKit keeps to the main thread.
+const INTROSPECTION: [&str; 13] = [
+    "class",
+    "superclass",
+    "self",
+    "hash",
+    "isEqual:",
+    "isKindOfClass:",
+    "isMemberOfClass:",
+    "respondsToSelector:",
+    "conformsToProtocol:",
+    "isProxy",
+    "className",
+    "description",
+    "debugDescription",
+];
+
+/// When the calling thread is not the main thread and `cls` is or inherits
+/// a class AppKit keeps to the main thread (the headers' list plus
+/// [`MAIN_THREAD_CLASSES`]): the [`Error::MainThreadOnly`] naming both,
+/// unless `sel` is one of the [`INTROSPECTION`] selectors. Only the receiver
+/// is looked at, never a message's arguments or result.
+pub(crate) fn main_thread_only(cls: Class, sel: Option<&str>) -> Result<()> {
+    if is_main_thread() || sel.is_some_and(|sel| INTROSPECTION.contains(&sel)) {
+        return Ok(());
+    }
+    static CLASSES: OnceLock<Vec<Class>> = OnceLock::new();
+    let classes = CLASSES.get_or_init(|| {
+        sdk::MAIN_THREAD_CLASSES
+            .iter()
+            .chain(MAIN_THREAD_CLASSES.iter())
+            .filter_map(|name| lookup_class(name))
+            .collect()
+    });
+    let rt = rt();
+    match rt.class_chain(cls).find(|c| classes.contains(c)) {
+        None => Ok(()),
+        Some(root) => Err(Error::MainThreadOnly {
+            class: rt.class_name(cls),
+            kind: (root != cls).then(|| rt.class_name(root)),
+        }),
     }
 }
 
@@ -983,8 +1068,8 @@ pub(crate) struct MetalRuntime {
     create_system_default_device: unsafe extern "C" fn() -> Obj,
 }
 
-// SAFETY: a function pointer and never-closed dlopen handles, used on the
-// main thread only (`metal()` goes through `load()`, which enforces it).
+// SAFETY: a function pointer and never-closed dlopen handles, written once
+// and only read afterwards (on the main thread: `metal()` enforces it).
 unsafe impl Send for MetalRuntime {}
 // SAFETY: as above.
 unsafe impl Sync for MetalRuntime {}
@@ -992,8 +1077,10 @@ unsafe impl Sync for MetalRuntime {}
 static METAL: OnceLock<core::result::Result<MetalRuntime, String>> = OnceLock::new();
 
 /// Loads Metal.framework and MetalKit.framework on first call (after AppKit).
-/// Classes such as `MTKView` only resolve once this has succeeded.
+/// Classes such as `MTKView` only resolve once this has succeeded. Main
+/// thread only, like the view and `gpu` built on it.
 pub(crate) fn metal() -> Result<&'static MetalRuntime> {
+    main_thread()?;
     load()?;
     match METAL.get_or_init(MetalRuntime::open) {
         Ok(m) => Ok(m),
@@ -1180,7 +1267,6 @@ impl Runtime {
     /// `receiver` must be nil or a live object (or class) responding to `sel`.
     #[inline(always)]
     pub(crate) unsafe fn send<R, A: Args>(&self, receiver: Obj, sel: Sel, args: A) -> R {
-        debug_assert!(is_main_thread(), "AppKit used off the main thread");
         #[cfg(target_arch = "x86_64")]
         if core::mem::size_of::<R>() > 16 {
             // SAFETY: caller contract; large aggregates return via the hidden
@@ -1195,12 +1281,15 @@ impl Runtime {
         if obj.is_null() {
             return "nil".into();
         }
-        // SAFETY: obj is live; class_getName returns a static C string.
-        unsafe {
-            CStr::from_ptr((self.class_getName)((self.object_getClass)(obj)))
-                .to_string_lossy()
-                .into_owned()
-        }
+        // SAFETY: obj is live, so it has a class.
+        self.class_name(unsafe { self.class_of_raw(obj) })
+    }
+
+    fn class_name(&self, cls: Class) -> String {
+        // SAFETY: a registered class; class_getName returns a static C string.
+        unsafe { CStr::from_ptr((self.class_getName)(cls.as_obj())) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn sel_name(&self, sel: Sel) -> String {
@@ -1542,7 +1631,8 @@ pub(crate) struct FrameworkGlobal<T> {
     _t: PhantomData<fn() -> T>,
 }
 
-// SAFETY: Id of an immortal constant; used on the main thread only.
+// SAFETY: Id of an immortal constant, written once; retaining it again from
+// any thread is all `get` does with it.
 unsafe impl<T> Sync for FrameworkGlobal<T> {}
 
 impl<T: Object> FrameworkGlobal<T> {

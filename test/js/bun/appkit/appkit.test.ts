@@ -1675,15 +1675,19 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
     const r = await runFixture("wrong-thread.ts");
     const worker = step(r, "worker");
     expect(worker, r.stderr).toBeDefined();
-    // The thread check runs before the frameworks are loaded, so this holds even where they cannot load.
+    // The app's thread check runs before the frameworks are loaded, so this holds even where they cannot load.
     const refused = { threw: true, message: expect.stringMatching(/main thread/) };
-    expect(worker.view).toMatchObject(refused);
     expect(worker.start).toMatchObject(refused);
     // A refused start is not remembered as a start: the next call is refused the same way.
     expect(worker.window).toMatchObject(refused);
     expect(worker.keepAlive).toMatchObject(refused);
     expect({ running: worker.running, keptAlive: worker.keptAlive }).toEqual({ running: false, keptAlive: false });
     if (r.skipped) return;
+    // A view is refused by its AppKit class, which takes the frameworks to name.
+    expect(worker.view).toMatchObject({
+      ...refused,
+      message: expect.stringMatching(/^objc: NSTextField \(a kind of NSResponder\)/),
+    });
     expect(step(r, "main")).toEqual({ step: "main", windows: 1 });
     expect(r.exitCode).toBe(0);
   });
@@ -1692,10 +1696,21 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
     "objc: classes and selectors by name, conversion by type encoding, ownership, .native, and the errors",
     async () => {
       const r = await runFixture("objc-bridge.ts");
-      // The thread check comes first, so a Worker is refused even where the frameworks cannot load.
-      const refused = { threw: true, message: expect.stringMatching(/main thread/) };
-      expect(step(r, "worker"), r.stderr).toMatchObject({ lookup: refused, ns: refused, sel: { threw: false } });
       if (r.skipped) return;
+      // Foundation works in a Worker; a window (any NSResponder) is the main thread's, and the error names the class.
+      expect(step(r, "worker"), r.stderr).toEqual({
+        step: "worker",
+        lookup: { threw: false },
+        ns: { threw: false },
+        sel: { threw: false },
+        window: {
+          threw: true,
+          code: "ERR_INVALID_STATE",
+          message: expect.stringMatching(
+            /^objc: NSWindow \(a kind of NSResponder\) can only be used on the process's main thread, not in a Worker/,
+          ),
+        },
+      });
       expect(step(r, "nsstring"), r.stderr).toEqual({
         step: "nsstring",
         length: 2,
@@ -2103,7 +2118,7 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
         responds: true,
         mainThread: [42, 1],
         uncaught: [
-          "objc: -[FixtureAsks level] was called on another thread; its JavaScript function only runs on the main thread, so the caller received 0 / NO / nil",
+          "objc: -[FixtureAsks level] was called on another thread; its JavaScript function only runs on the thread that created it, so the caller received 0 / NO / nil",
         ],
         wrongBool: misfit("isFlipped", "a boolean (B)", "an integer"),
         wrongObject: misfit(
@@ -2373,7 +2388,7 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
         step: "off thread",
         ran: 0,
         uncaught: [
-          "objc: block v@? was called on another thread; its JavaScript function only runs on the main thread, so the caller received 0 / NO / nil",
+          "objc: block v@? was called on another thread; its JavaScript function only runs on the thread that created it, so the caller received 0 / NO / nil",
         ],
       });
       const typeError = { threw: true, isTypeError: true };
@@ -2784,6 +2799,72 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
       });
       expect(step(r, "done")).toEqual({ step: "done" });
       expect(r.signal).toBeNull();
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "objc: Foundation in a Worker, the classes it is refused there, both threads at once, and a Worker terminated mid-send",
+    async () => {
+      const r = await runFixture("objc-threads.ts", { timeoutMs: 60_000 });
+      if (r.skipped) return;
+      const mainThreadOnly = (cls: string) => ({
+        threw: true,
+        code: "ERR_INVALID_STATE",
+        message: expect.stringMatching(
+          new RegExp(`^objc: ${cls} can only be used on the process's main thread, not in a Worker: `),
+        ),
+      });
+      expect(step(r, "worker foundation"), r.stderr).toEqual({
+        step: "worker foundation",
+        // Cocoa is in multithreaded mode before either thread uses it.
+        multiThreaded: true,
+        workerMultiThreaded: true,
+        string: { js: "from a worker", length: 13, sameHandle: true },
+        array: ["a", 2, true],
+        fileExists: { execPath: true, nowhere: false },
+        defaults: { nested: [1, "two"] },
+        json: { parsed: { k: [1, 2, 3] }, nonEmpty: true, failed: null, error: "NSCocoaErrorDomain" },
+        // A bare function passed for a known block parameter, made and called on the Worker's thread.
+        block: [
+          ["a", 0],
+          [2, 1],
+        ],
+        // The Worker defined the name first and still got a numbered one; the plain name went to the main thread after.
+        defined: { name: expect.stringMatching(/^FixtureSharedName_\d+$/), tag: 2, isKind: true },
+        mainClass: "FixtureSharedName",
+        mainTag: 1,
+        // objc.target() in the Worker: the process's one target class, the function run on the Worker.
+        target: { className: expect.stringMatching(/^BunScriptObject\d+$/), actions: 1 },
+        sameTargetClass: true,
+        refused: {
+          windowAlloc: mainThreadOnly("NSWindow \\(a kind of NSResponder\\)"),
+          viewNew: mainThreadOnly("NSView \\(a kind of NSResponder\\)"),
+          menuClass: mainThreadOnly("NSMenu"),
+          subclass: mainThreadOnly("NSView \\(a kind of NSResponder\\)"),
+          color: { threw: false, value: expect.stringMatching(/Color/) },
+        },
+      });
+      // Each thread read back only its own 300 strings; one object is one handle per thread.
+      expect(step(r, "concurrent")).toEqual({
+        step: "concurrent",
+        main: { count: 300, own: 300 },
+        worker: { count: 300, own: 300 },
+        processInfo: { mainSame: true, workerSame: true, sameObject: true },
+        // A class the main thread defined cannot be the superclass of one a Worker defines.
+        subclass: {
+          threw: true,
+          code: "ERR_INVALID_STATE",
+          message: expect.stringMatching(
+            /superclass is a script-defined class whose methods do not run on this thread/,
+          ),
+        },
+      });
+      // The terminated Worker's blocks (called on a dispatch queue's thread, then on the main
+      // thread) and class do nothing and answer zero from then on; stderr says why once, in all.
+      expect(step(r, "terminated")).toEqual({ step: "terminated", after: "still here", mainTag: 1, orphan: [0, 0] });
+      expect(r.stderr.match(/was called after the thread that created it/g) ?? []).toHaveLength(1);
+      expect(r.stderr).toContain("objc: block v@?@ was called after the thread that created it exited");
       expect(r.exitCode).toBe(0);
     },
   );

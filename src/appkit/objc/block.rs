@@ -13,7 +13,8 @@
 //! what it returns. The descriptor carries the signature string
 //! (`BLOCK_HAS_SIGNATURE`), which Foundation reads when it wants an
 //! `NSMethodSignature` for the block, and a dispose helper that frees `Data`
-//! once the last reference is released.
+//! once the last reference is released. The function runs on the thread that
+//! made the block only (see [`handoff`]); a call anywhere else returns zero.
 
 use core::ffi::{CStr, c_char, c_void};
 
@@ -22,7 +23,8 @@ use super::dynamic::{
     pool_if_none, read_out, write_out,
 };
 use super::foundation::NSMethodSignature;
-use super::{Bool, Class, Obj, Object, handoff, is_main_thread, load, lookup_class, rt};
+use super::handoff::{self, Owner};
+use super::{Bool, Class, Obj, Object, load, lookup_class, rt};
 use crate::error::{Error, Result};
 use crate::geometry::Range;
 
@@ -64,9 +66,10 @@ unsafe extern "C" {
 }
 
 /// What a block's captured pointer points at, from `_Block_copy` until the
-/// dispose helper runs.
+/// dispose helper runs. `handler` is only touched on `owner`'s thread.
 struct Data {
     shim: &'static Shim,
+    owner: &'static Owner,
     handler: Box<dyn BlockFn>,
 }
 
@@ -84,8 +87,8 @@ pub struct Call<'a> {
     pub ret: &'a Enc,
 }
 
-/// The script side of a block. Runs on the main thread, inside whatever
-/// called the block, so it may be re-entered.
+/// The script side of a block. Runs on the thread that made the block,
+/// inside whatever called it, so it may be re-entered.
 pub trait BlockFn {
     /// A `None` value also sets every `BOOL *` argument, so an enumeration
     /// stops.
@@ -358,13 +361,18 @@ fn find(types: &str, ret: &Enc, params: &[Enc]) -> Result<&'static Shim> {
 
 /// A heap block of type `types` (see [`SIGNATURES`]) whose body is `handler`,
 /// as an object: retaining and releasing it are `Block_copy` and
-/// `Block_release`, and `handler` is dropped when the last reference goes.
+/// `Block_release`, and `handler` is dropped (on this thread) when the last
+/// reference goes.
 pub fn make(types: &str, handler: Box<dyn BlockFn>) -> Result<DynObject> {
     load()?;
     let _pool = pool_if_none();
     let (ret, params) = parse(types)?;
     let shim = find(types, &ret, &params)?;
-    let data = bun_core::heap::into_raw(Box::new(Data { shim, handler }));
+    let data = bun_core::heap::into_raw(Box::new(Data {
+        shim,
+        owner: handoff::current(),
+        handler,
+    }));
     let literal = Literal {
         isa: core::ptr::addr_of!(_NSConcreteStackBlock).cast(),
         flags: BLOCK_HAS_COPY_DISPOSE | BLOCK_HAS_SIGNATURE,
@@ -402,17 +410,21 @@ unsafe extern "C" fn copy(_dst: *mut Literal, _src: *const Literal) {}
 
 /// Called when the heap block's last reference is released, on whichever
 /// thread that happens; `Data` holds the script's values, which are only
-/// let go on the main thread.
+/// let go on the thread that made the block.
 unsafe extern "C" fn dispose(block: *mut Literal) {
     // SAFETY: `block` is the heap copy `make` had made, being deallocated;
-    // `data` is what `make` leaked and nothing else frees.
-    unsafe { handoff::free_on_main_thread((*block).data) };
+    // `data` is what `make` leaked and nothing else frees; `owner` is a
+    // `&'static` written once by `make`.
+    unsafe {
+        let data = (*block).data;
+        handoff::free_on_owner((*data).owner, data);
+    }
 }
 
 /// Runs the script behind `block` with `args` (one frame per block argument,
 /// in its C layout) and returns its result laid out for the block's return
-/// type; zero when it cannot. A caller on another thread gets zero without
-/// the script running, and the main thread is told.
+/// type; zero when it cannot. A caller on another thread than the block's
+/// gets zero without the script running, and the block's thread is told.
 ///
 /// # Safety
 /// `block` is a live block [`make`] built, being invoked with arguments of
@@ -421,10 +433,15 @@ unsafe fn invoke(block: *mut Literal, args: &[Frame]) -> Frame {
     // SAFETY: per contract, and `data` lives as long as the block, which the
     // caller holds a reference to at least until this is entered.
     let data = unsafe { (*block).data };
-    if !is_main_thread() {
-        // SAFETY: `shim` is a `&'static` written once by `make`; nothing
-        // else in `Data` is touched here.
-        handoff::wrong_thread(unsafe { (*data).shim }.name.to_owned());
+    // SAFETY: `shim` and `owner` are `&'static`s written once by `make`;
+    // nothing else in `Data` is touched until the thread is known to be
+    // the owner's.
+    let (shim, owner) = unsafe { ((*data).shim, (*data).owner) };
+    if !owner.is_current() {
+        owner.wrong_thread(shim.name.to_owned());
+        return Frame::new();
+    }
+    if owner.retired() {
         return Frame::new();
     }
     // The script may let go of every other reference while it runs (its own

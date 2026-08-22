@@ -8,9 +8,12 @@
 //! It never names a JavaScript type: `bun_runtime` converts JS values into
 //! the calls defined here and receives events back through the sink traits.
 //!
-//! Everything runs on the main thread, which is both the JavaScript thread
-//! and the AppKit main thread; [`run_loop`] is what lets the two event loops
-//! share it. Raw Objective-C and CoreFoundation calls live only in [`objc`]
+//! The application, the view and the GPU run on the main thread, which is
+//! both a JavaScript thread and the AppKit main thread; [`run_loop`] is what
+//! lets the two event loops share it. The bridge runs on any JavaScript
+//! thread for the classes AppKit does not keep to the main one; [`handoff`]
+//! is how a block or script class that ends up on another thread finds its
+//! way back. Raw Objective-C and CoreFoundation calls live only in [`objc`]
 //! and [`run_loop`]; `unsafe_code` is forbidden in every other module, and
 //! every way `objc` offers to name a raw pointer, wrap an arbitrary object in
 //! a typed wrapper, register a method implementation or allocate a protocol
@@ -47,7 +50,7 @@ pub use objc::block;
 /// Run-time (selector-by-name) messaging: `objc.classes`, `msgSend` and
 /// `.native` in `bun:appkit`.
 pub use objc::dynamic;
-/// What other threads hand the main thread, and how it is reached.
+/// The threads scripts run on, and how each is reached from the others.
 pub use objc::handoff;
 /// Classes whose methods are script functions: `objc.defineClass` and
 /// `objc.target` in `bun:appkit`.

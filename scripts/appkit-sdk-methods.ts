@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // What the macOS SDK knows about Objective-C methods and protocols that the
 // runtime's type encodings and registered metadata do not tell the `objc`
-// bridge in bun:appkit. Writes src/appkit/objc/sdk.rs with four tables:
+// bridge in bun:appkit. Writes src/appkit/objc/sdk.rs with five tables:
 //
 // - VARIADIC: methods that read a variable argument list (`...` or a
 //   `va_list`), which an encoding does not show; from the headers of every
@@ -20,6 +20,9 @@
 //   machine and read back from a compiled Objective-C file. Which protocols a
 //   framework registers varies by macOS version, so the ones bun:appkit itself
 //   adopts (ADOPTED below) are always written, whatever this machine says.
+// - MAIN_THREAD_CLASSES: the AppKit classes whose `@interface` carries
+//   NS_SWIFT_UI_ACTOR, AppKit's own statement of what only the main thread
+//   may use (their subclasses follow at run time from the class chain).
 //
 // Why the headers and not BridgeSupport alone: on current macOS the
 // .bridgesupport files mark 11 Foundation methods and 1 AppKit method
@@ -224,7 +227,16 @@ for (let changed = true; changed; ) {
 const variadic = new Set<string>();
 /** `selector\0class\0index`; class is empty for a method a protocol declares. */
 const arrays = new Set<string>();
+/** Class names, not categories: the annotation precedes `@interface Name :` or `@interface Name <`. */
+const mainThreadClasses = new Set<string>();
 for (const { where, text } of headers) {
+  if (where.startsWith("AppKit.framework/")) {
+    for (const m of text.matchAll(
+      /\bNS_SWIFT_UI_ACTOR\b[^@;{}]*@interface[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*[:<\n]/g,
+    )) {
+      mainThreadClasses.add(m[1]);
+    }
+  }
   // Either the `@interface`/`@protocol` line a declaration belongs to (a
   // category names its class first), or a method declaration: it starts a
   // line with - or + and runs to the next `;`, possibly across lines.
@@ -438,9 +450,9 @@ const source = `//! What the macOS SDK headers say about methods that their type
 //! which the runtime encodes as a bare \`@?\`; and the protocols Foundation,
 //! AppKit, QuartzCore, Metal and MetalKit declare without registering on
 //! the generating machine (plus the ones bun:appkit adopts itself), with
-//! their method descriptions. Generated from the SDK headers and the
-//! BridgeSupport metadata by \`bun scripts/appkit-sdk-methods.ts\`; do not
-//! edit by hand.
+//! their method descriptions; and the classes AppKit marks for the main
+//! thread only. Generated from the SDK headers and the BridgeSupport
+//! metadata by \`bun scripts/appkit-sdk-methods.ts\`; do not edit by hand.
 
 use core::ffi::CStr;
 
@@ -476,9 +488,20 @@ ${blockRows}];
 #[rustfmt::skip]
 pub(super) const PROTOCOLS: &[Protocol] = &[
 ${protocolRowsText}];
+
+/// The AppKit classes declared \`NS_SWIFT_UI_ACTOR\`, sorted by name.
+#[rustfmt::skip]
+pub(super) const MAIN_THREAD_CLASSES: &[&CStr] = &[
+${[...mainThreadClasses]
+  .sort()
+  .map(name => `    c"${name}",\n`)
+  .join("")}];
 `;
+if (!mainThreadClasses.has("NSResponder") || !mainThreadClasses.has("NSCell")) {
+  throw new Error(`NS_SWIFT_UI_ACTOR classes not found in the AppKit headers (got ${mainThreadClasses.size})`);
+}
 
 console.error(
-  `${variadic.size} variadic methods, ${arrays.size} array parameters, ${blocks.size} block parameters, ${protocolRows.length} unregistered protocols from ${headers.length} headers in ${frameworks.length} frameworks`,
+  `${variadic.size} variadic methods, ${arrays.size} array parameters, ${blocks.size} block parameters, ${protocolRows.length} unregistered protocols, ${mainThreadClasses.size} main-thread classes from ${headers.length} headers in ${frameworks.length} frameworks`,
 );
 stamped(OUT, source);

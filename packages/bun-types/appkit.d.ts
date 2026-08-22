@@ -18,11 +18,14 @@
  * event loop inside AppKit's, owns the application lifecycle, and provides
  * {@link MetalView} and {@link gpu}.
  *
- * Everything runs on the main JavaScript thread. While windows are open Bun's
- * event loop keeps running as usual: timers, `fetch`, sockets, workers and
- * subprocesses all continue to work. The process exits when the last window
- * closes and nothing else keeps the event loop alive (set
- * {@link App.keepAlive `app.keepAlive`} to stay running with no windows).
+ * The app, windows, views, menus, {@link MetalView} and {@link gpu} run on
+ * the process's main JavaScript thread, as AppKit requires; the `objc`
+ * bridge also works in a `Worker` for everything that is not AppKit UI (see
+ * {@link ObjC}). While windows are open Bun's event loop keeps running as
+ * usual: timers, `fetch`, sockets, workers and subprocesses all continue to
+ * work. The process exits when the last window closes and nothing else keeps
+ * the event loop alive (set {@link App.keepAlive `app.keepAlive`} to stay
+ * running with no windows).
  *
  * While AppKit runs a tracking loop (an open menu, a window being live-resized)
  * timers and I/O pause and resume when the gesture ends; a long synchronous
@@ -2877,14 +2880,14 @@ declare module "bun:appkit" {
    * encoding when nothing else declares it; or, for a method that answers
    * the same every time (`isFlipped`, `acceptsFirstResponder`), that answer.
    *
-   * The function runs on the main thread, synchronously, inside whatever sent
-   * the message (AppKit dispatching an event, or your own bridged call), with
-   * the receiving object's handle as `this` and the arguments converted the
-   * way message results are (objects as {@link ObjCObject}, never unboxed).
-   * What it returns is converted the way message arguments are for the
-   * method's return type. If it throws, or returns something that does not
-   * fit, that is reported as an uncaught JavaScript error and the sender gets
-   * `0` / `NO` / `nil`.
+   * The function runs on the thread that defined the class, synchronously,
+   * inside whatever sent the message (AppKit dispatching an event, or your
+   * own bridged call), with the receiving object's handle as `this` and the
+   * arguments converted the way message results are (objects as
+   * {@link ObjCObject}, never unboxed). What it returns is converted the way
+   * message arguments are for the method's return type. If it throws, or
+   * returns something that does not fit, that is reported as an uncaught
+   * JavaScript error and the sender gets `0` / `NO` / `nil`.
    *
    * A constant (`isFlipped: true`, `tag: 7`, `menu: null`) becomes a native
    * method that returns it without calling into JavaScript, so it costs
@@ -2915,12 +2918,19 @@ declare module "bun:appkit" {
   /** What {@link ObjC.defineClass} takes. */
   export interface ObjCClassDefinition {
     /**
-     * The Objective-C class name (letters, digits, `_`). Must not be taken;
-     * omitted, one is generated. The class is then also reachable as
-     * `objc.classes[name]`.
+     * The Objective-C class name (letters, digits, `_`); omitted, one is
+     * generated. On the main thread the class is registered under this name,
+     * which must not be taken, and is then also `objc.classes[name]`; on any
+     * other thread it is registered as `name_<n>` (`n` numbering the threads
+     * that use the bridge), so the plain name is always the main thread's
+     * and `String(cls)` says which a `Worker` got.
      */
     name?: string;
-    /** The class to extend, by name or handle. Default `NSObject`. */
+    /**
+     * The class to extend, by name or handle. Default `NSObject`. A class
+     * another thread defined with `defineClass` cannot be extended, nor, off
+     * the main thread, one AppKit keeps to the main thread.
+     */
     superclass?: string | ObjCClass | ObjCObject;
     /**
      * Protocols the class adopts, by name (`"NSTableViewDataSource"`,
@@ -3264,11 +3274,19 @@ declare module "bun:appkit" {
      * Define an Objective-C class whose instance methods are JavaScript
      * functions, for delegates, data sources, targets and subclass
      * overrides. Returns the class; make instances with `.new()` or
-     * `.alloc().init…()` like any other. AppKit calls the methods on the
-     * main thread from inside event dispatch (or from inside your own call
-     * that triggered them, such as `reloadData()`); a message from another
-     * thread is not delivered, reads as `0` / `nil` there, and is reported
-     * as an uncaught error.
+     * `.alloc().init…()` like any other. The methods run on the thread that
+     * called `defineClass` (AppKit calls them on the main thread from inside
+     * event dispatch, or from inside your own call that triggered them, such
+     * as `reloadData()`); a message that arrives on any other thread is not
+     * delivered, reads as `0` / `nil` there, and is reported as an uncaught
+     * error on the defining thread. A `Worker` has no run loop, so there
+     * only messages sent synchronously inside the Worker's own calls ever
+     * arrive on its thread. The class, its functions and what they close
+     * over are registered for the whole process and never freed, once per
+     * thread that runs the definition (see `name` for how a Worker's is
+     * named): define classes at module scope, and not in a Worker spawned
+     * per task. Once a Worker exits its classes' methods answer `0` / `nil`
+     * everywhere.
      *
      * Each method's type encoding is, in order: its `types`; what a listed
      * protocol declares for the selector; what the superclass implements for
@@ -3285,9 +3303,7 @@ declare module "bun:appkit" {
      * declared `assign` instead (`NSXMLParser.delegate`,
      * `NSComboBox.dataSource`, `NSCache.delegate`, `NSTextFinder.client`
      * and the like) the bridge has the receiver hold what you set until you
-     * set another value or `null`, so those never dangle either. The class,
-     * its functions and whatever they close over live for the rest of the
-     * process, so define classes once at module scope.
+     * set another value or `null`, so those never dangle either.
      *
      * @example
      * ```ts
@@ -3318,7 +3334,9 @@ declare module "bun:appkit" {
      * `action:` method calls `fn` with the sender. Set the control's action
      * to `"action:"`. `NSControl` and `NSMenuItem` do not retain their
      * target: keep the returned handle referenced while it should fire. The
-     * object keeps `fn` alive and lets it go when it deallocates.
+     * object keeps `fn` alive and lets it go when it deallocates. Every
+     * target, on every thread, is an instance of the same one class; `fn`
+     * runs only on the thread that called `target()`.
      *
      * @example
      * ```ts
@@ -3347,16 +3365,22 @@ declare module "bun:appkit" {
      * match its block parameter exactly, as in C: a mismatch is undefined
      * behaviour, not an error.
      *
-     * `fn` runs on the main thread inside whatever calls the block, with the
-     * arguments converted the way message results are; a `BOOL *` argument
-     * (an enumeration's `stop`) arrives as an {@link ObjCOut}. Its return
-     * value is converted for the block's return type. A throw, or a value
-     * that does not fit, is reported as an uncaught error and the caller
-     * gets `0` / `NO` / `nil` (and every `BOOL *` set, so an enumeration
-     * ends). A call on another thread returns zero without running `fn`
-     * and is reported as an uncaught error on the main thread. The block
-     * keeps `fn` alive while anything retains it. The returned handle
-     * cannot be sent messages, only passed, released, or called with
+     * `fn` runs on the thread that made the block, inside whatever calls
+     * it, with the arguments converted the way message results are; a
+     * `BOOL *` argument (an enumeration's `stop`) arrives as an
+     * {@link ObjCOut}. Its return value is converted for the block's return
+     * type. A throw, or a value that does not fit, is reported as an
+     * uncaught error and the caller gets `0` / `NO` / `nil` (and every
+     * `BOOL *` set, so an enumeration ends). A call on any other thread (a
+     * background queue, or the main thread for a block a `Worker` made)
+     * returns zero without running `fn` and is reported as an uncaught
+     * error on the block's thread. A `Worker` has no run loop and is no
+     * queue, so a block made there runs `fn` only when called synchronously
+     * inside the Worker's own send (enumerations, comparators, predicates);
+     * completion handlers, timers and operation-queue blocks never reach
+     * it. The block keeps `fn` alive while anything retains it, until its
+     * thread exits. The returned handle cannot be sent messages, only
+     * passed, released, or called with
      * {@link ObjCObject.invoke `.invoke(...args)`}.
      *
      * @example
@@ -3412,11 +3436,28 @@ declare module "bun:appkit" {
    * selector of the frameworks `bun:appkit` loads, under Apple's own names,
    * and so also everything those classes do not cover. It does not need the
    * app to be running.
-   * Main thread only, like the rest of the module: the Objective-C runtime
-   * itself is thread-safe, but the bridge keeps its handles, defined classes,
-   * blocks and autorelease pools on the main thread's JavaScript heap and
-   * event loop, so in a `Worker` every call throws (`objc.sel()`,
-   * `objc.enums` and `objc.NSNotFound`, which touch no object, work anywhere).
+   *
+   * Foundation and the parts of AppKit that are not user interface work in
+   * a `Worker` as on the main thread: each thread has its own handles (the
+   * same object is a different {@link ObjCObject} in each, `===` within
+   * one), its own autorelease pool around every call, and its own defined
+   * classes and blocks, whose functions run only on that thread and, a
+   * Worker having no run loop, only when called synchronously inside its
+   * own sends. Off the main thread the bridge refuses the receiver (never
+   * the arguments) of a message when its class is, or inherits, one the
+   * AppKit headers mark main-thread-only (`NSResponder` and so every view,
+   * control, window, controller and the application; `NSCell`, `NSAlert`,
+   * `NSToolbar`, `NSTouchBar`, `NSTableColumn`, `NSDocument`, gesture
+   * recognizers, collection-view layouts, print panels, …) or `NSMenu`,
+   * `NSMenuItem`, `NSStatusBar`, `NSStatusItem`, `NSNib`, `NSStoryboard` or
+   * `NSDockTile`: sending to it, allocating it or subclassing it is an
+   * `ERR_INVALID_STATE` error naming the class, except for `class`,
+   * `isKindOfClass:`, `respondsToSelector:`, `description` and the other
+   * `NSObject` introspection messages. {@link app}, {@link Window}, the
+   * views, {@link MetalView} and {@link gpu} throw there too. When a
+   * `Worker` exits, the blocks and classes it defined stay valid for
+   * whoever still holds them but run nothing: a call answers `0` / `NO` /
+   * `nil`, and the first one says so on stderr.
    *
    * Where a method takes a block, pass a function (for the methods whose
    * block type the bridge knows) or {@link ObjC.block `objc.block(fn, types)`};

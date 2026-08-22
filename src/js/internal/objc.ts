@@ -62,6 +62,7 @@ type Binding = {
     types: (string | undefined)[],
     functions: Function[],
   ): NativeObjCClass;
+  objcTargetClass(): NativeObjCClass;
   objcAttach(object: unknown, table: Record<string, Function>): void;
   objcBlock(fn: Function, types: string): NativeObjCObject;
 };
@@ -627,7 +628,7 @@ function defineClass(definition: ClassDefinition): object {
   return fromNative(binding.objcDefineClass(name, superclassHandle, protocols, selectors, types, bodies)) as object;
 }
 
-/** The class behind objc.target(): `action:` looks its function up on the instance. */
+/** The one class behind every thread's objc.target(): `action:` looks its function up on the instance. */
 let targetClass: { new: () => object } | undefined;
 
 const objc = {
@@ -662,7 +663,7 @@ const objc = {
   defineClass,
   target(fn: (sender: object | null) => unknown): object {
     if (typeof fn !== "function") throw typeError("objc.target(fn): fn must be a function");
-    targetClass ??= defineClass({ methods: { "action:": { types: "v@:@", fn() {} } } }) as { new: () => object };
+    targetClass ??= fromNative(binding.objcTargetClass()) as { new: () => object };
     const target = targetClass.new();
     binding.objcAttach(target, { "action:": fn });
     return target;

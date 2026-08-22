@@ -7,11 +7,19 @@ pub enum Error {
     /// A framework or symbol could not be loaded; `.0` is the dlerror text or `symbol <name>`.
     #[error("AppKit could not be loaded: {0}")]
     Load(String),
-    /// Called from a thread other than the process main thread.
+    /// The application, a view or `gpu` was used from a thread other than the process main thread.
     #[error(
-        "bun:appkit works on the process's main thread only, not in a Worker: AppKit requires it, and the objc bridge keeps its objects, classes and callbacks with the main thread's JavaScript heap"
+        "bun:appkit's app, windows, views and gpu work on the process's main thread only, not in a Worker: AppKit requires it (the objc bridge reaches Foundation and other non-UI classes from any thread)"
     )]
     WrongThread,
+    /// A class AppKit lets only the main thread use was messaged, allocated
+    /// or subclassed elsewhere; `kind` names the ancestor that makes it one,
+    /// unless `class` is that ancestor.
+    #[error(
+        "objc: {class}{} can only be used on the process's main thread, not in a Worker: AppKit keeps this class to the main thread (as it does windows, views, cells, controllers, the application, menus, alerts, panels, toolbars and the status bar); elsewhere it only answers class, isKindOfClass:, respondsToSelector:, description and the like",
+        .kind.as_ref().map(|k| format!(" (a kind of {k})")).unwrap_or_default()
+    )]
+    MainThreadOnly { class: String, kind: Option<String> },
     /// `-[NSApplication setActivationPolicy:]` answered NO.
     #[error("the activation policy cannot be changed to \"{}\" now", .0.name())]
     ActivationPolicyRefused(crate::app::ActivationPolicy),
@@ -144,12 +152,12 @@ pub enum Error {
     /// A block type encoding that does not parse or has no invoke shim; `what` says which.
     #[error("objc: block type encoding {types:?} {what}")]
     BlockSignature { types: String, what: String },
-    /// `.0` (`block v@?@`, `-[Class selector]`) was called on another thread,
-    /// where the script function behind it cannot run.
+    /// `.0` (`block v@?@`, `-[Class selector]`) was called on a thread other
+    /// than the one whose script function it runs.
     #[error(
-        "objc: {0} was called on another thread; its JavaScript function only runs on the main thread, so the caller received 0 / NO / nil"
+        "objc: {0} was called on another thread; its JavaScript function only runs on the thread that created it, so the caller received 0 / NO / nil"
     )]
-    CalledOffMainThread(String),
+    CalledOnOtherThread(String),
     /// An `init…` message took ownership of this object; only the object it returned is usable.
     #[error("this object was consumed by init; use the object init returned")]
     Consumed,
