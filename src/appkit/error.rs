@@ -1,5 +1,4 @@
 use crate::Named;
-use crate::view::Kind;
 
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 
@@ -9,46 +8,10 @@ pub enum Error {
     #[error("AppKit could not be loaded: {0}")]
     Load(String),
     /// Called from a thread other than the process main thread.
-    #[error("AppKit objects can only be used from the main thread")]
-    WrongThread,
-    /// `kind` does not use this property.
-    #[error("{} does not support this property", .0.name())]
-    UnknownProp(Kind),
-    /// Children were added to a view kind that has none.
-    #[error("{} cannot have children", .0.name())]
-    NotAContainer(Kind),
-    /// A single-child container already has its child.
-    #[error("{} takes a single child; remove the current one first", .0.name())]
-    AlreadyHasChild(Kind),
-    #[error("view already has a parent; call remove() first")]
-    ChildHasParent,
-    #[error("a view cannot contain itself or one of its ancestors")]
-    WouldCycle,
-    #[error("view is not a child of this container")]
-    NotAChild,
-    /// firstBaseline/lastBaseline on a vertical stack.
-    #[error("firstBaseline/lastBaseline alignment only applies to a horizontal stack")]
-    BaselineAlignOnVerticalStack,
-    #[error("invalid color {0:?}")]
-    BadColor(String),
-    /// Not one of the standard action selectors [`crate::ActionSelector`] lists.
     #[error(
-        "{0:?} is not a supported menu action selector; expected a standard one such as \"copy:\", \"performClose:\" or \"toggleFullScreen:\""
+        "bun:appkit works on the process's main thread only, not in a Worker: AppKit requires it, and the objc bridge keeps its objects, classes and callbacks with the main thread's JavaScript heap"
     )]
-    BadSelector(String),
-    /// No SF Symbol with this name.
-    #[error("no system symbol named {0:?}")]
-    UnknownSymbol(String),
-    /// The file does not exist or is not an image AppKit can decode; `.0` is the path.
-    #[error("could not load image file {0:?}")]
-    BadImageFile(String),
-    #[error("unrecognized image data")]
-    BadImageData,
-    #[error("window is closed")]
-    WindowClosed,
-    /// `-[NSWindow setFrameAutosaveName:]` answered NO.
-    #[error("another window already uses restoreName {0:?}")]
-    RestoreNameInUse(String),
+    WrongThread,
     /// `-[NSApplication setActivationPolicy:]` answered NO.
     #[error("the activation policy cannot be changed to \"{}\" now", .0.name())]
     ActivationPolicyRefused(crate::app::ActivationPolicy),
@@ -116,6 +79,35 @@ pub enum Error {
     /// `objc_getClass` knows no class by this name.
     #[error("objc: no class named {0:?}")]
     NoClass(String),
+    /// A class cannot be defined under this name: another class has it, or it contains NUL.
+    #[error("objc: cannot define a class named {0:?}: the name is taken or not a valid identifier")]
+    ClassName(String),
+    /// `objc_getProtocol` knows no protocol by this name.
+    #[error("objc: no protocol named {0:?} is registered by the loaded frameworks")]
+    NoProtocol(String),
+    /// `dlsym` finds no exported global by this name in any loaded image.
+    #[error(
+        "objc: no constant named {0:?} is exported by AppKit, Foundation or any other library loaded in the process"
+    )]
+    NoSymbol(String),
+    /// The exported global by this name is a function, whose code reading it as a constant would copy.
+    #[error("objc: {0} is a function, not a constant; call it through bun:ffi")]
+    NotAConstant(String),
+    /// The exported global read as `id` does not hold an Objective-C object.
+    #[error(
+        "objc: the constant {0} does not hold an Objective-C object; pass its C type, as in objc.constant({0:?}, {{ type: \"d\" }}) for a double or {{ type: \"{{CGRect=dddd}}\" }} for a struct"
+    )]
+    NotAnObject(String),
+    /// A script class adopts `protocol` but neither defines nor inherits
+    /// these methods it marks `@required`.
+    #[error(
+        "objc: class {class} adopts {protocol} but does not define {missing}, which the protocol requires"
+    )]
+    RequiredMethods {
+        class: String,
+        protocol: String,
+        missing: String,
+    },
     /// The receiver does not respond to `sel`; `class` names its class and
     /// `instance` picks `-` over `+`.
     #[error("{}[{class} {sel}]: unrecognized selector", if *.instance { '-' } else { '+' })]
@@ -139,9 +131,25 @@ pub enum Error {
         expected: String,
         got: String,
     },
+    /// What a script method returned cannot be encoded as the type the method declares.
+    #[error("{method}: must return {expected}, got {got}")]
+    ReturnType {
+        method: String,
+        expected: String,
+        got: String,
+    },
     /// The method's signature uses something the dynamic bridge cannot marshal yet.
     #[error("{method}: {what}")]
     UnsupportedSignature { method: String, what: String },
+    /// A block type encoding that does not parse or has no invoke shim; `what` says which.
+    #[error("objc: block type encoding {types:?} {what}")]
+    BlockSignature { types: String, what: String },
+    /// `.0` (`block v@?@`, `-[Class selector]`) was called on another thread,
+    /// where the script function behind it cannot run.
+    #[error(
+        "objc: {0} was called on another thread; its JavaScript function only runs on the main thread, so the caller received 0 / NO / nil"
+    )]
+    CalledOffMainThread(String),
     /// An `init…` message took ownership of this object; only the object it returned is usable.
     #[error("this object was consumed by init; use the object init returned")]
     Consumed,
@@ -150,4 +158,15 @@ pub enum Error {
     NotInitialized,
     #[error("ObjCObject has been released")]
     ObjectReleased,
+    /// An Objective-C exception raised inside a bridged send. `name` and
+    /// `reason` are the `NSException`'s (the class name and `-description`
+    /// for anything else thrown), `user_info` its `userInfo` printed, and
+    /// `object` what was thrown, unless that was `nil`.
+    #[error("{name}: {reason}")]
+    Exception {
+        name: String,
+        reason: String,
+        user_info: Option<String>,
+        object: Option<crate::DynObject>,
+    },
 }

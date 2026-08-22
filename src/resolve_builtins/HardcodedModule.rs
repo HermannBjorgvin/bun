@@ -13,8 +13,6 @@ pub enum HardcodedModule {
     BunApp,
     #[strum(serialize = "bun:appkit")]
     BunAppkit,
-    #[strum(serialize = "bun:appkit/react")]
-    BunAppkitReact,
     #[strum(serialize = "bun:ffi")]
     BunFfi,
     #[strum(serialize = "bun:jsc")]
@@ -213,7 +211,6 @@ bun_core::comptime_string_map! {
         b"bun" => HardcodedModule::Bun,
         b"bun:app" => HardcodedModule::BunApp,
         b"bun:appkit" => HardcodedModule::BunAppkit,
-        b"bun:appkit/react" => HardcodedModule::BunAppkitReact,
         b"bun:ffi" => HardcodedModule::BunFfi,
         b"bun:jsc" => HardcodedModule::BunJsc,
         b"bun:main" => HardcodedModule::BunMain,
@@ -724,8 +721,6 @@ const BUN_EXTRA_ALIAS_KVS: &[AliasKv] = &[
     // their name lists the same way.
     #[cfg(target_os = "macos")]
     entry!("bun:appkit"),
-    #[cfg(target_os = "macos")]
-    entry!("bun:appkit/react"),
     entry!("bun:ffi"),
     entry!("bun:jsc"),
     entry!("bun:main"),

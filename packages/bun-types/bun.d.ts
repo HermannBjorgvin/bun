@@ -8831,8 +8831,8 @@ declare module "bun" {
   /**
    * Native macOS windows and controls (AppKit) from JavaScript, without a
    * web view. The same namespace as `import * as AppKit from "bun:appkit"`;
-   * see that module for the full API and `bun:appkit/react` for the React
-   * renderer. AppKit is loaded the first time this property is read.
+   * see that module for the full API. AppKit is loaded the first time this
+   * property is read.
    *
    * @example
    * ```ts

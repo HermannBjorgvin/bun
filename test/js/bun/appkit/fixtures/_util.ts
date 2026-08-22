@@ -20,17 +20,13 @@ export async function run(body: () => unknown | Promise<unknown>): Promise<void>
   }
 }
 
-/** Resolves once `cond()` is truthy; rejects with `what` after `timeoutMs`. Polls on a 5 ms timer. */
-export function waitFor(cond: () => unknown, what: string, timeoutMs = 1000): Promise<void> {
+/** Resolves once `cond()` gives (or resolves to) a truthy value; rejects with `what` after `timeoutMs`. Polls on a 5 ms timer. */
+export async function waitFor(cond: () => unknown, what: string, timeoutMs = 1000): Promise<void> {
   const deadline = performance.now() + timeoutMs;
-  return new Promise((resolve, reject) => {
-    const poll = () => {
-      if (cond()) return resolve();
-      if (performance.now() > deadline) return reject(new Error(`timed out waiting for ${what}`));
-      setTimeout(poll, 5);
-    };
-    poll();
-  });
+  while (!(await cond())) {
+    if (performance.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
 }
 
 export const tick = (): Promise<void> => new Promise(resolve => setImmediate(resolve));

@@ -1,29 +1,31 @@
 #!/usr/bin/env bun
-// How much of AppKit / Metal does Bun.AppKit reach?
+// How much of AppKit / Metal does Bun.AppKit reach, and how?
 //
-// Diffs the macOS SDK headers against the binding tables in src/appkit/objc
-// and prints, per Objective-C class we bind: selectors declared in the SDK
-// header (own declarations incl. categories; properties count as getter +
-// setter), selectors bound and compiled, selectors transcribed but commented
-// out, and which Rust modules use the class. Then a framework-level summary:
-// classes bound vs classes declared.
+// Three layers, three numbers. The `objc` bridge reaches every class and
+// selector of the frameworks it loads by name, so its reach is what the macOS
+// SDK headers declare (counted here) plus the enumerations and constants in
+// src/js/internal/appkit_enums.ts. The curated elements in src/js/bun/appkit.ts
+// are built on the bridge; this lists them and the AppKit classes they make.
+// What is compiled in natively is the typed binding tables in src/appkit/objc
+// (the app lifecycle, the Metal view, `gpu`, and the bridge's own machinery);
+// those are diffed against the SDK per class: selectors declared in the header
+// (own declarations incl. categories; properties count as getter + setter),
+// selectors bound, selectors transcribed but commented out, and which Rust
+// modules use the class.
 //
 //   bun scripts/appkit-coverage.ts            # markdown to stdout
 //   bun scripts/appkit-coverage.ts --json     # machine-readable
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { BINDING_TABLES as FRAMEWORKS, treeCounts } from "./appkit-tree-counts";
 
 const SDK =
   process.env.SDKROOT ??
   "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
-const FRAMEWORKS: Record<string, string[]> = {
-  "src/appkit/objc/appkit.rs": ["AppKit", "QuartzCore"],
-  "src/appkit/objc/foundation.rs": ["Foundation"],
-  "src/appkit/objc/metal.rs": ["Metal", "MetalKit"],
-};
 const root = join(import.meta.dir, "..");
 const json = process.argv.includes("--json");
+const tree = treeCounts(root);
 
 // ───────────────────────────── SDK side ─────────────────────────────
 
@@ -133,46 +135,20 @@ type Bound = {
   commented: Set<string>;
   usedBy: Set<string>;
 };
-const bound = new Map<string, Bound>(); // rust name -> binding
+const bound = new Map<string, Bound>( // rust name -> binding
+  [...tree.bound].map(([rust, b]) => [rust, { ...b, usedBy: new Set(b.parked ? ["(commented out)"] : []) }]),
+);
 
-for (const file of Object.keys(FRAMEWORKS)) {
-  const text = readFileSync(join(root, file), "utf8");
-  for (const m of text.matchAll(
-    /^(\/\/ )?objc_class!\((?:pub(?:\([a-z]+\))? )?struct ([A-Za-z0-9_]+)(?:: [A-Za-z0-9_]+)? = "([A-Za-z0-9_]+)"\);/gm,
-  )) {
-    const [, commentedOut, rust, objc] = m;
-    // Protocol-typed Metal objects bind as NSObject; use the Rust name (which is the protocol name).
-    bound.set(rust, {
-      rust,
-      objc: objc === "NSObject" && rust !== "NSObject" ? rust : objc,
-      file,
-      active: new Set(),
-      commented: new Set(),
-      usedBy: new Set(),
-    });
-    if (commentedOut) bound.get(rust)!.usedBy.add("(commented out)");
-  }
-  // objc_methods! { impl X { ... }} blocks, possibly commented out line by line
-  for (const block of text.matchAll(/^(?:\/\/ )?objc_methods! \{ impl ([A-Za-z0-9_]+) \{([\s\S]*?)^(?:\/\/ )?\}\}/gm)) {
-    const [, rust, body] = block;
-    const b = bound.get(rust);
-    if (!b) continue;
-    for (const line of body.split("\n")) {
-      const sel = line.match(/=\s*"([^"]+)";\s*$/)?.[1];
-      if (!sel) continue;
-      (line.trim().startsWith("//") ? b.commented : b.active).add(sel);
-    }
-  }
-}
-
-// Which crate modules use each bound class (a rough "surfaces in JS through…").
-const users = [
-  ...readdirSync(join(root, "src/appkit"))
-    .filter(f => f.endsWith(".rs"))
-    .map(f => "src/appkit/" + f),
-  ...readdirSync(join(root, "src/appkit/view")).map(f => "src/appkit/view/" + f),
-  ...readdirSync(join(root, "src/appkit/gpu")).map(f => "src/appkit/gpu/" + f),
-];
+// Which crate modules use each bound class.
+const users = ["src/appkit", "src/appkit/gpu", "src/appkit/objc"].flatMap(dir =>
+  readdirSync(join(root, dir))
+    .filter(
+      f =>
+        f.endsWith(".rs") &&
+        !(dir === "src/appkit/objc" && f in { "appkit.rs": 1, "foundation.rs": 1, "metal.rs": 1, "sdk.rs": 1 }),
+    )
+    .map(f => `${dir}/${f}`),
+);
 for (const file of users) {
   const text = readFileSync(join(root, file), "utf8");
   for (const b of bound.values()) {
@@ -238,13 +214,28 @@ const viewClasses = [...sdk.entries()]
   .filter(([n, d]) => !d.isProtocol && d.framework === "AppKit" && inherits(n, "NSView"))
   .map(([n]) => n);
 const boundViews = viewClasses.filter(n => [...bound.values()].some(b => b.objc === n && b.active.size > 0));
-// The React host component table lists every element name once: `  Name: appkit.Name,`.
-const jsElements = [
-  ...readFileSync(join(root, "src/js/bun/appkit.react.ts"), "utf8").matchAll(/^\s*([A-Z][A-Za-z]+): appkit\.\1,$/gm),
-].map(m => m[1]);
+const jsElements = tree.elements;
+const bridgedClasses = tree.bridgedClasses;
+const bridgedAppKit = bridgedClasses.filter(n => sdk.get(n)?.framework === "AppKit");
+const bridge = {
+  frameworks: summary.map(s => s.framework),
+  classes: summary.reduce((n, s) => n + s.sdkClasses, 0),
+  protocols: summary.reduce((n, s) => n + s.sdkProtocols, 0),
+  selectors: summary.reduce((n, s) => n + s.declaredSelectors, 0),
+  enumTypes: tree.enumTypes,
+  enumMembers: tree.enumMembers,
+  looseConstants: tree.looseConstants,
+  typedConstants: tree.typedConstants,
+};
 
 if (json) {
-  console.log(JSON.stringify({ summary, rows, viewClasses: viewClasses.length, boundViews, jsElements }, null, 2));
+  console.log(
+    JSON.stringify(
+      { summary, rows, bridge, viewClasses: viewClasses.length, boundViews, jsElements, bridgedClasses, bridgedAppKit },
+      null,
+      2,
+    ),
+  );
   process.exit(0);
 }
 
@@ -254,15 +245,17 @@ console.log(
   `SDK: ${SDK.split("/").slice(-1)[0]}  ·  generated ${new Date().toISOString().slice(0, 10)} by scripts/appkit-coverage.ts\n`,
 );
 console.log(`## Headline\n`);
-console.log(`- JavaScript elements: **${jsElements.length}** (${jsElements.join(", ")}).`);
 console.log(
-  `- AppKit \`NSView\` subclasses reachable through them: **${boundViews.length} of ${viewClasses.length}** in the SDK (${boundViews.join(", ")}).`,
+  `- The \`objc\` bridge reaches by name every class and selector the loaded frameworks register: the SDK headers for ${bridge.frameworks.join(", ")} declare **${bridge.classes} classes, ${bridge.protocols} protocols and ${bridge.selectors} selectors**; \`objc.enums\` knows **${bridge.enumTypes} enumerations (${bridge.enumMembers} members)** and ${bridge.looseConstants} loose constants of Foundation and AppKit, \`objc.constants\` any exported global (${bridge.typedConstants} typed as numbers or structs, the rest as objects).`,
 );
 console.log(
-  `- \`NSView\` subclasses without a JavaScript element: ${viewClasses.filter(n => !boundViews.includes(n)).join(", ")}.`,
+  `- Curated JavaScript elements written on the bridge: **${jsElements.length}** (${jsElements.join(", ")}), built out of **${bridgedAppKit.length} AppKit classes** (${bridgedAppKit.join(", ")}).`,
 );
 console.log(
-  `- Beyond this table, the \`objc\` export is a dynamic bridge: every class and selector of these frameworks is reachable from JS by name (\`objc.classes.NSAlert\`, \`view.native.setWantsLayer_(true)\`). The rows below count only the static bindings the curated layer compiles in; a curated prop is still a binding line plus a prop.\n`,
+  `- \`NSView\` subclasses in the SDK: ${viewClasses.length}; with a curated element or used by one: ${viewClasses.filter(n => bridgedAppKit.includes(n) || boundViews.includes(n)).length}. Every other one is an \`objc.classes.X\` away.`,
+);
+console.log(
+  `- Compiled in natively (the rows below): the typed bindings the app lifecycle, the event-loop integration, \`MetalView\`, \`gpu\` and the bridge's own machinery use. A curated prop is not a binding line any more; it is a send through the bridge.\n`,
 );
 console.log("## By framework\n");
 console.log(

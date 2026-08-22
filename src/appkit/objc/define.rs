@@ -1,9 +1,10 @@
 //! Defining Objective-C classes at run time: plain method-override subclasses,
-//! and delegate classes whose instances carry an `owner` ivar pointing at a
-//! reference-counted Rust handler `H`. Only [`super::delegate`] builds
-//! classes; the builders are private to `objc` because registering an IMP
-//! whose Rust signature differs from what AppKit calls it with is undefined
-//! behaviour the type system cannot see.
+//! delegate classes whose instances carry an `owner` ivar pointing at a
+//! reference-counted Rust handler `H`, and the bare [`Declarations`] that
+//! [`super::script`] builds script-defined classes on. The builders are
+//! private to `objc` because registering an IMP whose Rust signature differs
+//! from what AppKit calls it with is undefined behaviour the type system
+//! cannot see.
 
 use core::cell::RefCell;
 use core::ffi::{CStr, c_char, c_void};
@@ -12,7 +13,7 @@ use core::ptr::{self, NonNull};
 use std::rc::Rc;
 
 use super::foundation::NSObject;
-use super::{Class, ClassType, Encode, Id, Obj, Object, Sel, Subclass, rt, sel};
+use super::{Class, ClassType, Encode, Id, Obj, Object, Sel, rt, sel};
 
 // ─────────────────────────── method type encodings ───────────────────────────
 
@@ -60,17 +61,6 @@ macro_rules! method_imps {
 }
 method_imps!((), (A), (A, B), (A, B, C));
 
-/// Protocols no loaded framework registers a `Protocol` object for (nothing
-/// in MetalKit names `@protocol(MTKViewDelegate)`), transcribed from the
-/// header so their IMPs are still checked.
-const UNREGISTERED_PROTOCOLS: &[(&CStr, &[(&CStr, &str)])] = &[(
-    c"MTKViewDelegate",
-    &[
-        (c"drawInMTKView:", "v@:@"),
-        (c"mtkView:drawableSizeWillChange:", "v@:@{CGSize=dd}"),
-    ],
-)];
-
 thread_local! {
     /// Mismatches found while registering classes, for [`super::verify_bindings`].
     static PROBLEMS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -86,46 +76,111 @@ fn problem(message: String) {
     PROBLEMS.with(|p| p.borrow_mut().push(message));
 }
 
-/// What the methods added to a class under construction are checked
-/// against: the protocols it adopts, then its superclass chain.
-struct Declarations {
+/// A class under construction, and what the methods added to it are
+/// checked against: the protocols it adopts, then its superclass chain.
+pub(super) struct Declarations {
     cls: Class,
     superclass: Class,
-    protocols: Vec<NonNull<c_void>>,
-    transcribed: Vec<&'static [(&'static CStr, &'static str)]>,
+    protocols: Vec<(String, NonNull<c_void>)>,
 }
 
 impl Declarations {
-    /// Adopts `name`: the runtime's `Protocol` object when a loaded framework
-    /// registers one, else the transcription above; neither is a problem
-    /// [`super::verify_bindings`] reports.
+    /// Starts a subclass of `superclass` named `name`; `None` when the name
+    /// is taken.
+    pub(super) fn new(superclass: Class, name: &CStr) -> Option<Declarations> {
+        // SAFETY: valid superclass and NUL-terminated name.
+        let cls = unsafe { (rt().objc_allocateClassPair)(superclass.as_obj(), name.as_ptr(), 0) };
+        Some(Declarations {
+            cls: Class(NonNull::new(cls)?),
+            superclass,
+            protocols: Vec::new(),
+        })
+    }
+
+    /// Adopts `name` (see [`super::Runtime::protocol`]); an unknown one is
+    /// a problem [`super::verify_bindings`] reports.
     fn adopt(&mut self, name: &CStr) {
-        if let Some(p) = rt().protocol(name) {
-            // SAFETY: cls is under construction; p is a live Protocol.
-            unsafe { (rt().class_addProtocol)(self.cls.as_obj(), p.as_ptr()) };
-            self.protocols.push(p);
-        } else if let Some((_, table)) = UNREGISTERED_PROTOCOLS.iter().find(|(n, _)| *n == name) {
-            self.transcribed.push(table);
-        } else {
+        if !self.try_adopt(name) {
             problem(format!(
                 "protocol {name:?} is not registered by any loaded framework"
             ));
         }
     }
 
-    /// The encoding an adopted protocol or the superclass declares for `sel`.
-    fn declared(&self, sel: Sel) -> Option<String> {
+    /// [`adopt`](Self::adopt), but `false` rather than a problem for a
+    /// protocol nothing declares.
+    pub(super) fn try_adopt(&mut self, name: &CStr) -> bool {
+        let Some(p) = rt().protocol(name) else {
+            return false;
+        };
+        // SAFETY: cls is under construction; p is a live Protocol.
+        unsafe { (rt().class_addProtocol)(self.cls.as_obj(), p.as_ptr()) };
+        self.protocols
+            .push((name.to_string_lossy().into_owned(), p));
+        true
+    }
+
+    /// Each adopted protocol's name with the instance methods it requires
+    /// (not those of protocols it incorporates in turn).
+    pub(super) fn required(&self) -> Vec<(&str, Vec<Sel>)> {
         self.protocols
             .iter()
-            .find_map(|&p| rt().protocol_method_types(p, sel))
-            .or_else(|| {
-                let name = rt().sel_name(sel);
-                self.transcribed
-                    .iter()
-                    .flat_map(|t| t.iter())
-                    .find(|(s, _)| s.to_bytes() == name.as_bytes())
-                    .map(|(_, types)| (*types).to_owned())
-            })
+            .map(|(name, p)| (name.as_str(), rt().protocol_required_methods(*p)))
+            .collect()
+    }
+
+    /// Whether the superclass chain implements instance method `sel`.
+    pub(super) fn inherits(&self, sel: Sel) -> bool {
+        rt().class_method_types(self.superclass, sel, false)
+            .is_some()
+    }
+
+    /// The encoding the Foundation, AppKit, QuartzCore and Metal protocols
+    /// (going by their name's prefix; the runtime holds thousands of private
+    /// ones besides) declare for `sel`, for a method no adopted protocol or
+    /// superclass declares: `None` when none does or `default` is among
+    /// their declarations, theirs when they all agree (frame offsets
+    /// aside), and `Err` listing them when they disagree.
+    pub(super) fn declared_by_any_protocol(
+        &self,
+        sel: Sel,
+        default: &str,
+    ) -> Result<Option<String>, Vec<(String, String)>> {
+        let public = |name: &str| {
+            ["NS", "CA", "MTL", "MTK"]
+                .iter()
+                .any(|p| name.starts_with(p))
+        };
+        let normal = |types: &String| super::normalize_encoding(types);
+        let mut found: Vec<(String, String)> = rt()
+            .protocols_declaring(sel)
+            .into_iter()
+            .filter(|(name, _)| public(name))
+            .collect();
+        let Some(first) = found.first().map(|(_, types)| normal(types)) else {
+            return Ok(None);
+        };
+        if found.iter().any(|(_, types)| normal(types) == default) {
+            return Ok(None);
+        }
+        if found.iter().all(|(_, types)| normal(types) == first) {
+            return Ok(found.pop().map(|(_, types)| types));
+        }
+        // One protocol to name per distinct encoding.
+        found.sort_by_cached_key(|(name, types)| (normal(types), name.clone()));
+        found.dedup_by(|a, b| normal(&a.1) == normal(&b.1));
+        // Shown without the frame offsets, the way a `types` string is written.
+        for (_, types) in &mut found {
+            types.retain(|c| !c.is_ascii_digit());
+        }
+        Err(found)
+    }
+
+    /// The encoding an adopted protocol or the superclass declares for `sel`.
+    pub(super) fn declared(&self, sel: Sel) -> Option<String> {
+        self.protocols
+            .iter()
+            .find_map(|&(_, p)| rt().protocol_method_types(p, sel))
             .or_else(|| rt().class_method_types(self.superclass, sel, false))
     }
 
@@ -133,7 +188,7 @@ impl Declarations {
     /// `imp`'s signature is what the adopted protocol or superclass declares
     /// for `sel` on both architectures (checked when either declares it;
     /// selectors of our own, like `onAction:`, are unchecked).
-    unsafe fn add_method<T, F: MethodImp<T>>(&self, sel: Sel, imp: F) {
+    pub(super) unsafe fn add_method<T, F: MethodImp<T>>(&self, sel: Sel, imp: F) {
         let (func, mut types) = imp.erase();
         if let Some(declared) = self.declared(sel)
             && super::normalize_encoding(&declared) != super::normalize_encoding(&types)
@@ -144,25 +199,66 @@ impl Declarations {
             ));
         }
         types.push('\0');
-        // SAFETY: cls is under construction; types is NUL-terminated and the
-        // runtime copies it.
-        let ok = unsafe {
-            (rt().class_addMethod)(
-                self.cls.as_obj(),
-                sel,
-                func,
-                types.as_ptr().cast::<c_char>(),
-            )
-        };
+        // SAFETY: forwarded contract; `types` describes `func` and is NUL-terminated.
+        unsafe { self.add_raw(sel, func, types.as_ptr().cast::<c_char>()) };
+    }
+
+    /// # Safety
+    /// `imp` behaves as a method of NUL-terminated type `types` when the
+    /// runtime calls it for `sel`.
+    pub(super) unsafe fn add_raw(&self, sel: Sel, imp: *const c_void, types: *const c_char) {
+        // SAFETY: cls is under construction; the runtime copies `types`.
+        let ok = unsafe { (rt().class_addMethod)(self.cls.as_obj(), sel, imp, types) };
         assert!(ok.get(), "duplicate method");
     }
+
+    /// Adds a pointer-sized ivar zeroed at `alloc`; its offset is read back
+    /// with [`ivar_offset`] once the class is registered.
+    pub(super) fn add_pointer_ivar(&self, name: &CStr) {
+        let align = core::mem::align_of::<*mut c_void>().trailing_zeros() as u8;
+        // SAFETY: cls is under construction; "^v" encodes `void *`.
+        let ok = unsafe {
+            (rt().class_addIvar)(
+                self.cls.as_obj(),
+                name.as_ptr(),
+                core::mem::size_of::<*mut c_void>(),
+                align,
+                c"^v".as_ptr(),
+            )
+        };
+        assert!(ok.get(), "duplicate ivar");
+    }
+
+    /// Registers the class: from here on it can be instantiated and never goes away.
+    pub(super) fn register(self) -> Class {
+        // SAFETY: cls is complete.
+        unsafe { (rt().objc_registerClassPair)(self.cls.as_obj()) };
+        self.cls
+    }
+
+    /// Throws the unregistered class away.
+    pub(super) fn dispose(self) {
+        // SAFETY: cls was allocated by `new` and never registered.
+        unsafe { (rt().objc_disposeClassPair)(self.cls.as_obj()) };
+    }
+}
+
+/// The byte offset of ivar `name` in instances of `cls` or a superclass.
+pub(super) fn ivar_offset(cls: Class, name: &CStr) -> Option<isize> {
+    // SAFETY: a registered class and a NUL-terminated name.
+    let ivar = unsafe { (rt().class_getInstanceVariable)(cls.as_obj(), name.as_ptr()) };
+    if ivar.is_null() {
+        return None;
+    }
+    // SAFETY: valid Ivar handle.
+    Some(unsafe { (rt().ivar_getOffset)(ivar) })
 }
 
 // ─────────────────────────────── builders ─────────────────────────────────────
 
 /// A subclass of `T`'s class under construction. Finish with
-/// [`register`](Self::register) for a plain subclass, or [`owned`](Self::owned)
-/// then `register` for one whose instances back a [`Delegate<H>`].
+/// [`owned`](Self::owned) then `register` for one whose instances back a
+/// [`Delegate<H>`].
 pub(super) struct ClassBuilder<T> {
     decls: Declarations,
     _t: PhantomData<fn() -> T>,
@@ -172,56 +268,20 @@ impl<T: ClassType> ClassBuilder<T> {
     /// Starts a subclass of `T`'s class named `name`. A second definition of
     /// the same name is a programming error.
     pub(super) fn new(name: &CStr) -> Self {
-        // SAFETY: valid superclass and NUL-terminated name.
-        let cls = unsafe { (rt().objc_allocateClassPair)(T::class().as_obj(), name.as_ptr(), 0) };
         ClassBuilder {
-            decls: Declarations {
-                cls: Class(
-                    NonNull::new(cls).unwrap_or_else(|| panic!("class {name:?} defined twice")),
-                ),
-                superclass: T::class(),
-                protocols: Vec::new(),
-                transcribed: Vec::new(),
-            },
+            decls: Declarations::new(T::class(), name)
+                .unwrap_or_else(|| panic!("class {name:?} defined twice")),
             _t: PhantomData,
         }
     }
 
-    /// Overrides (or adds) instance method `sel`.
-    ///
-    /// # Safety
-    /// See [`Declarations::add_method`].
-    pub(super) unsafe fn method<F: MethodImp<Obj>>(self, sel: Sel, imp: F) -> Self {
-        // SAFETY: forwarded contract.
-        unsafe { self.decls.add_method(sel, imp) };
-        self
-    }
-
     /// Adds the `owner` ivar: instances will back a [`Delegate<H>`].
     pub(super) fn owned<H: ?Sized>(self) -> OwnedClassBuilder<H> {
-        let align = core::mem::align_of::<*mut c_void>().trailing_zeros() as u8;
-        // SAFETY: cls is under construction; "^v" encodes `void *`.
-        let ok = unsafe {
-            (rt().class_addIvar)(
-                self.decls.cls.as_obj(),
-                c"owner".as_ptr(),
-                core::mem::size_of::<*mut c_void>(),
-                align,
-                c"^v".as_ptr(),
-            )
-        };
-        assert!(ok.get(), "duplicate ivar");
+        self.decls.add_pointer_ivar(c"owner");
         OwnedClassBuilder {
             decls: self.decls,
             _h: PhantomData,
         }
-    }
-
-    /// Registers a plain subclass: method overrides only, no owner.
-    pub(super) fn register(self) -> Subclass<T> {
-        // SAFETY: cls is complete.
-        unsafe { (rt().objc_registerClassPair)(self.decls.cls.as_obj()) };
-        Subclass::from_registered(self.decls.cls)
     }
 }
 
@@ -253,17 +313,10 @@ impl<H: ?Sized> OwnedClassBuilder<H> {
     }
 
     pub(super) fn register(self) -> DelegateClass<H> {
-        let cls = self.decls.cls;
-        // SAFETY: cls is complete.
-        unsafe { (rt().objc_registerClassPair)(cls.as_obj()) };
-        // SAFETY: cls is registered and `owned()` added the ivar.
-        let ivar = unsafe { (rt().class_getInstanceVariable)(cls.as_obj(), c"owner".as_ptr()) };
-        assert!(!ivar.is_null(), "owner ivar missing");
-        // SAFETY: valid Ivar handle.
-        let owner_offset = unsafe { (rt().ivar_getOffset)(ivar) };
+        let cls = self.decls.register();
         DelegateClass {
             cls,
-            owner_offset,
+            owner_offset: ivar_offset(cls, c"owner").expect("owner ivar missing"),
             _h: PhantomData,
         }
     }

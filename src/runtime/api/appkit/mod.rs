@@ -1,9 +1,11 @@
-//! Natives behind `bun:appkit` (`Bun.AppKit`): the `AppKitView`,
-//! `AppKitWindow` and `AppKitApp` classes wrap `bun_appkit`, which does the
-//! AppKit work, and `gpu` plus the `Gpu*` classes wrap its Metal layer.
-//! Everything else about the API lives in `src/js/bun/appkit.ts`. On other
-//! platforms the classes exist so the generated bindings link, but the module
-//! throws before any of them can be constructed.
+//! Natives behind `bun:appkit` (`Bun.AppKit`), all wrapping `bun_appkit`:
+//! `ObjCObject`/`ObjCClass`/`ObjCSelector` and the `objc*` functions are the
+//! Objective-C bridge (`src/js/internal/objc.ts`) that windows, menus and
+//! views are built with in `src/js/bun/appkit.ts`; `AppKitApp` is the NSApplication lifecycle and the
+//! event-loop integration; `AppKitView` is the Metal view; `gpu` plus the
+//! `Gpu*` classes are the Metal layer. On other platforms the classes exist
+//! so the generated bindings link, but the module throws before any of them
+//! can be constructed.
 
 #[cfg(target_os = "macos")]
 mod app;
@@ -17,8 +19,6 @@ mod objc;
 mod slots;
 #[cfg(target_os = "macos")]
 mod view;
-#[cfg(target_os = "macos")]
-mod window;
 
 #[cfg(target_os = "macos")]
 pub use self::gpu::{
@@ -28,31 +28,34 @@ pub use self::gpu::{
 #[cfg(target_os = "macos")]
 pub use self::objc::{ObjCClass, ObjCObject, ObjCSelector};
 #[cfg(target_os = "macos")]
-pub use self::{app::AppKitApp, view::AppKitView, window::AppKitWindow};
+pub use self::{app::AppKitApp, view::AppKitView};
 #[cfg(not(target_os = "macos"))]
 pub use unsupported::{
-    AppKitApp, AppKitGpu, AppKitView, AppKitWindow, GpuBuffer, GpuComputePipeline, GpuDepthStencil,
-    GpuFrame, GpuFunction, GpuLibrary, GpuRenderPipeline, GpuSampler, GpuTexture, ObjCClass,
-    ObjCObject, ObjCSelector,
+    AppKitApp, AppKitGpu, AppKitView, GpuBuffer, GpuComputePipeline, GpuDepthStencil, GpuFrame,
+    GpuFunction, GpuLibrary, GpuRenderPipeline, GpuSampler, GpuTexture, ObjCClass, ObjCObject,
+    ObjCSelector,
 };
 
 use bun_jsc::{JSGlobalObject, JSValue};
 
-/// `$rust("appkit.rs", "createBinding")`: `{ AppKitView, AppKitWindow, app, gpu, Gpu*,
-/// ObjCObject, ObjCClass, ObjCSelector, objcLookupClass, objcJs, objcNs, objcSame }` for
-/// `src/js/bun/appkit.ts`. Loads nothing; AppKit starts on `app.start()`,
-/// Metal on the first `gpu` call that needs the device, and Foundation on the
-/// first `objc*` call.
+/// `$rust("appkit.rs", "createObjcBinding")`: `{ ObjCObject, ObjCClass,
+/// ObjCSelector, objc* }` for `src/js/internal/objc.ts`. Loads nothing;
+/// Foundation loads on the first `objc*` call that needs it.
+#[cfg(target_os = "macos")]
+pub fn create_objc_binding(global: &JSGlobalObject) -> JSValue {
+    let binding = JSValue::create_empty_object_with_null_prototype(global);
+    objc::install(global, binding);
+    binding
+}
+
+/// `$rust("appkit.rs", "createBinding")`: `{ AppKitView, app, gpu, Gpu* }`
+/// for `src/js/bun/appkit.ts`. Loads nothing; AppKit starts on
+/// `app.start()` and Metal on the first `gpu` call that needs the device.
 #[cfg(target_os = "macos")]
 pub fn create_binding(global: &JSGlobalObject) -> JSValue {
     use bun_jsc::JsClass as _;
     let binding = JSValue::create_empty_object_with_null_prototype(global);
     binding.put(global, b"AppKitView", AppKitView::get_constructor(global));
-    binding.put(
-        global,
-        b"AppKitWindow",
-        AppKitWindow::get_constructor(global),
-    );
     binding.put(global, b"app", AppKitApp::create(global));
     binding.put(global, b"gpu", AppKitGpu::create(global));
     binding.put(global, b"GpuBuffer", GpuBuffer::get_constructor(global));
@@ -76,8 +79,12 @@ pub fn create_binding(global: &JSGlobalObject) -> JSValue {
         GpuDepthStencil::get_constructor(global),
     );
     binding.put(global, b"GpuFrame", GpuFrame::get_constructor(global));
-    objc::install(global, binding);
     binding
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn create_objc_binding(_global: &JSGlobalObject) -> JSValue {
+    JSValue::UNDEFINED
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -131,31 +138,8 @@ mod unsupported {
     stub!(
         #[bun_jsc::JsClass]
         AppKitView {
-            methods: [
-                set,
-                get,
-                insert_child,
-                remove_child,
-                click,
-                snapshot,
-                draw,
-                release
-            ],
-            getters: [
-                get_frame,
-                get_drawable_size,
-                get_released,
-                get_on_action,
-                get_on_change,
-                get_on_submit,
-                get_on_focus,
-                get_on_blur,
-                get_on_select,
-                get_on_activate,
-                get_on_frame,
-                get_on_resize,
-                get_native
-            ]
+            methods: [set, draw],
+            getters: [get_drawable_size, get_on_frame, get_on_resize, get_native]
         }
     );
 
@@ -170,55 +154,15 @@ mod unsupported {
     }
 
     stub!(
-        #[bun_jsc::JsClass]
-        AppKitWindow {
-            methods: [
-                set,
-                get,
-                set_content,
-                show,
-                hide,
-                center,
-                focus,
-                close,
-                snapshot
-            ],
-            getters: [
-                get_closed,
-                get_visible,
-                get_key,
-                get_on_close,
-                get_should_close,
-                get_on_resize,
-                get_on_move,
-                get_on_focus,
-                get_on_blur,
-                get_native
-            ]
-        }
-    );
-
-    impl AppKitWindow {
-        pub fn constructor(
-            global: &JSGlobalObject,
-            _frame: &CallFrame,
-            _this: JSValue,
-        ) -> JsResult<Box<AppKitWindow>> {
-            Err(unavailable(global))
-        }
-    }
-
-    stub!(
         #[bun_jsc::JsClass(no_constructor)]
         AppKitApp {
             methods: [start, quit, activate, hide, set, testing],
             getters: [
                 get_is_dark,
                 get_has_display,
-                get_live_views,
                 get_on_before_quit,
-                get_on_reopen,
-                get_on_menu
+                get_on_close_all,
+                get_on_reopen
             ]
         }
     );
@@ -388,7 +332,7 @@ mod unsupported {
         #[bun_jsc::JsClass]
         ObjCObject {
             methods: [msg_send, release, to_string],
-            getters: [get_class_name, get_is_class, get_address, get_released]
+            getters: [get_class_name, get_address, get_released]
         }
     );
 

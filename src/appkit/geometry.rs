@@ -30,42 +30,6 @@ impl Rect {
     }
 }
 
-/// `NSEdgeInsets`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Insets {
-    pub top: f64,
-    pub left: f64,
-    pub bottom: f64,
-    pub right: f64,
-}
-
-impl Insets {
-    pub const fn uniform(v: f64) -> Insets {
-        Insets {
-            top: v,
-            left: v,
-            bottom: v,
-            right: v,
-        }
-    }
-}
-
-/// A finite length greater than zero.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-pub struct Positive(f64);
-
-impl Positive {
-    pub fn new(v: f64) -> Option<Positive> {
-        (v.is_finite() && v > 0.0).then_some(Positive(v))
-    }
-
-    #[inline]
-    pub fn get(self) -> f64 {
-        self.0
-    }
-}
-
 /// `NSRange`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

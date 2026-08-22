@@ -1,4 +1,4 @@
-import { app, Button, Text, VStack, Window } from "bun:appkit";
+import { app, Button, objc, Text, VStack, Window } from "bun:appkit";
 import { appKitInternals } from "bun:internal-for-testing";
 import { emit, run, waitFor } from "./_util";
 
@@ -9,15 +9,19 @@ await run(async () => {
   win.show();
   Bun.gc(true);
   const baseline = appKitInternals.liveViews();
+  // Zeroing weak references to every NSView made below: once the View
+  // objects are collected nothing may keep the NSViews themselves.
+  const natives = objc.classes.NSHashTable.weakObjectsHashTable();
 
   (() => {
     const loose: unknown[] = [];
     for (let i = 0; i < 300; i++) {
-      loose.push(
-        i % 3 === 0 ? new Text({ text: `t${i}` }) : i % 3 === 1 ? new Button({ title: `b${i}` }) : new VStack(),
-      );
+      const view =
+        i % 3 === 0 ? new Text({ text: `t${i}` }) : i % 3 === 1 ? new Button({ title: `b${i}` }) : new VStack();
+      natives.addObject_(view.native);
+      loose.push(view);
     }
-    emit({ step: "created", live: appKitInternals.liveViews(), baseline });
+    emit({ step: "created", live: appKitInternals.liveViews(), baseline, natives: natives.allObjects().count() });
   })();
 
   let after = appKitInternals.liveViews();
@@ -30,7 +34,17 @@ await run(async () => {
     "views to be collected",
     1500,
   ).catch(() => {});
-  emit({ step: "collected", baseline, after });
+  let nativesLeft = natives.allObjects().count();
+  await waitFor(
+    () => {
+      Bun.gc(true);
+      nativesLeft = natives.allObjects().count();
+      return nativesLeft <= Math.max(after - baseline, 0);
+    },
+    "the NSViews to be deallocated",
+    3000,
+  ).catch(() => {});
+  emit({ step: "collected", baseline, after, nativesLeft });
 
   win.close();
 });

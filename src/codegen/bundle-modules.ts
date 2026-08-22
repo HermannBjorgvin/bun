@@ -84,7 +84,8 @@ const bunRepoRoot = path.join(CMAKE_BUILD_ROOT, "..", "..");
 const targetPlatform = process.env.TARGET_PLATFORM ?? process.platform;
 const platformOnlyModules: Record<string, string> = {
   "bun/appkit.ts": "darwin",
-  "bun/appkit.react.ts": "darwin",
+  "internal/appkit_enums.ts": "darwin",
+  "internal/objc.ts": "darwin",
 };
 
 // Preprocess builtins

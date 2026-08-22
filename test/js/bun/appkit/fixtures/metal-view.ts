@@ -53,6 +53,33 @@ await run(async () => {
   await tick();
   emit({ step: "cleared", count: frames.length });
 
+  // A view pass takes `clear` as a colour string too; a bad one is refused
+  // before anything is encoded. preferredFPS reads the MTKView.
+  {
+    const passes: Record<string, unknown> = {};
+    view.onFrame = frame => {
+      for (const clear of ["white", "rgba(255, 0, 0, 0.5)", "nope", 7]) {
+        try {
+          frame.renderPass(view, { clear: clear as string }).end();
+          passes[String(clear)] = "ok";
+        } catch (e) {
+          passes[String(clear)] = { message: String((e as Error)?.message), code: (e as { code?: unknown })?.code };
+        }
+      }
+    };
+    view.draw();
+    view.onFrame = undefined;
+    const native = view.native as unknown as {
+      preferredFramesPerSecond(): number;
+      setPreferredFramesPerSecond_(v: number): void;
+    };
+    view.preferredFPS = 1000;
+    const clamped = [view.preferredFPS, native.preferredFramesPerSecond()];
+    native.setPreferredFramesPerSecond_(24);
+    emit({ step: "string clear", passes, clamped, live: view.preferredFPS });
+    view.preferredFPS = null as never;
+  }
+
   // renderPass(view) is refused outside the view's own onFrame.
   {
     let outside: { message: string; code: unknown } | "ok" = "ok";

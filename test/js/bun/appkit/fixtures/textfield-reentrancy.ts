@@ -1,6 +1,6 @@
 // A window's first text field has keyboard focus once the window is shown,
 // with or without a display, so anything that ends its editing fires onBlur.
-import { app, Button, HStack, Text, TextField, VStack, Window, ZStack } from "bun:appkit";
+import { app, Button, HStack, objc, Text, TextField, VStack, Window, ZStack } from "bun:appkit";
 import { emit, run, tick } from "./_util";
 
 const kinds = (views: readonly unknown[]) => views.map(v => (v as object).constructor.name);
@@ -36,6 +36,58 @@ await run(async () => {
       children: kinds(stack.children),
       spacing: stack.spacing,
       value: field.value,
+    });
+    win.close();
+  }
+
+  // The same, through a delegate the script defines and installs on
+  // `.native` itself: it runs synchronously inside the container's call
+  // rather than after it, so the container refuses (an error, not a crash)
+  // while the field, which is not mid-call, accepts.
+  {
+    const log: string[] = [];
+    const errors: string[] = [];
+    process.on("uncaughtException", e => errors.push(String((e as Error).message)));
+    const stack = new VStack();
+    const field = new TextField({ placeholder: "focused" });
+    const Delegate = objc.defineClass({
+      protocols: ["NSTextFieldDelegate"],
+      methods: {
+        "controlTextDidEndEditing:"() {
+          log.push("delegate");
+          field.value = "edited from delegate";
+          log.push(`field ok`);
+          stack.append(new Text({ text: "added from delegate" }));
+          log.push("stack ok");
+        },
+      },
+    }) as any;
+    const delegate = Delegate.new();
+    (field.native as any).setDelegate_(delegate);
+    stack.append(field, new Button({ title: "other" }));
+    const win = new Window({ width: 300, height: 200, content: stack });
+    win.show();
+    await tick();
+    stack.removeChild(field);
+    log.push("removed");
+    await tick();
+    // A bridge target on a curated button's `.native` that changes the button from inside click().
+    const button = new Button({ title: "before" });
+    stack.append(button);
+    const target = objc.target(() => {
+      button.title = `${button.title} clicked`;
+      log.push(button.title);
+    });
+    (button.native as any).setTarget_(target);
+    (button.native as any).setAction_("action:");
+    button.click();
+    emit({
+      step: "bridge delegate while editing",
+      log,
+      errors,
+      children: kinds(stack.children),
+      value: field.value,
+      title: button.title,
     });
     win.close();
   }

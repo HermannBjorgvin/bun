@@ -1,16 +1,312 @@
 //! `ObjCObject` / `ObjCClass` / `ObjCSelector` and the `objc*` binding
 //! functions: the JavaScript face of `bun_appkit::dynamic`, which sends any
-//! selector to any object or class. `src/js/bun/appkit.ts` wraps these in the
-//! `objc` proxy layer (selector name mangling, `objc.classes`, `.native`).
+//! selector to any object or class. `src/js/internal/objc.ts` wraps these in
+//! the `objc` proxy layer (selector name mangling, `objc.classes`, handles).
 
-use bun_appkit::dynamic::{self, Plain, Receiver};
-use bun_appkit::{DynClass, DynObject};
-use bun_jsc::{CallFrame, JSFunction, JSGlobalObject, JSValue, JsClass, JsResult};
+use core::cell::{Cell, RefCell};
+use core::mem::ManuallyDrop;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
-use super::conv::{self, JsStr};
+use bun_appkit::dynamic::{self, Enc, Plain, Receiver, Reply};
+use bun_appkit::handoff::{self, Post};
+use bun_appkit::script::{self, Call, ClassSpec, MethodSpec};
+use bun_appkit::{DynClass, DynObject, DynValue, View, block};
+use bun_jsc::ConcurrentTask::ConcurrentTask;
+use bun_jsc::ManagedTask::ManagedTask;
+use bun_jsc::virtual_machine::VirtualMachine;
+use bun_jsc::{
+    CallFrame, GlobalRef, JSBigInt, JSFunction, JSGlobalObject, JSUint8Array, JSValue, JsClass,
+    JsResult, LoopKind, Posted, Strong, VmHandle, Weak,
+};
+
+use super::conv::{self, JsStr, Slot};
+
+thread_local! {
+    /// What the collector has finalized whose native half is still to be
+    /// dropped; see [`drop_later`]. Never dropped as a whole.
+    static RELEASED: RefCell<ManuallyDrop<Released>> = const {
+        RefCell::new(ManuallyDrop::new(Released {
+            objects: Vec::new(),
+            views: Vec::new(),
+        }))
+    };
+    /// What `internal/objc.ts` hands over once; see [`Hooks`]. Never dropped: it
+    /// lives as long as the module.
+    static HOOKS: RefCell<Option<ManuallyDrop<Hooks>>> = const { RefCell::new(None) };
+    /// The live wrapper of each object or class by address, so one object is
+    /// one JavaScript object for as long as the script can reach it. Nothing
+    /// that allocates on the JavaScript heap may run while this is borrowed:
+    /// a collection would finalize wrappers, which come back here.
+    static HANDLES: RefCell<HashMap<usize, Weak<()>>> = RefCell::new(HashMap::new());
+}
+
+/// The script side's half of the bridge, from `objcSetHooks`.
+struct Hooks {
+    /// The global object that loaded the module.
+    global: GlobalRef,
+    /// Applies a script-class method or block function to its receiver and
+    /// arguments (turning the raw wrappers into the proxied handles scripts
+    /// see).
+    dispatch: Strong,
+    /// An array a send pushes (argument index, value) pairs onto for what
+    /// the method left in its out-parameters; the script side moves each
+    /// into the `{ value }` object it passed and empties the array.
+    outs: Strong,
+}
+
+fn hooks<R>(global: &JSGlobalObject, f: impl FnOnce(&Hooks) -> R) -> JsResult<R> {
+    HOOKS.with_borrow(|hooks| match hooks {
+        Some(hooks) => Ok(f(hooks)),
+        None => Err(global.throw_type_error(format_args!("objcSetHooks() was never called"))),
+    })
+}
+
+/// The wrapper already handed out for `address` while it is alive (and, for
+/// an object, not released by the script), which counts as one more
+/// acquisition of it when `acquired`; otherwise `make`'s, remembered.
+fn canonical(
+    global: &JSGlobalObject,
+    address: usize,
+    acquired: bool,
+    make: impl FnOnce() -> JSValue,
+) -> JSValue {
+    let existing = HANDLES.with_borrow(|handles| handles.get(&address).and_then(Weak::get));
+    if let Some(existing) = existing {
+        let usable = match existing.as_class_ref::<ObjCObject>() {
+            Some(o) if o.object.is_released() => false,
+            Some(o) => {
+                if acquired {
+                    o.acquisitions.set(o.acquisitions.get().saturating_add(1));
+                }
+                true
+            }
+            None => true,
+        };
+        if usable {
+            return existing;
+        }
+    }
+    let value = make();
+    let weak = Weak::create_passive(value, global);
+    HANDLES.with_borrow_mut(|handles| handles.insert(address, weak));
+    value
+}
+
+/// Drops `address`'s entry once the wrapper it names has been collected (a
+/// newer wrapper for the same address keeps it).
+fn forget(address: usize) {
+    HANDLES.with_borrow_mut(|handles| {
+        if handles
+            .get(&address)
+            .is_some_and(|weak| weak.get().is_none())
+        {
+            handles.remove(&address);
+        }
+    });
+}
+
+/// The main thread's VM, for [`post`] to reach from other threads.
+static VM: OnceLock<VmHandle> = OnceLock::new();
+
+/// What `bun_appkit` learns on another thread, brought to this one: a task
+/// on the event loop that frees handed-over values or reports the call.
+fn post(post: Post) {
+    let Some(vm) = VM.get() else {
+        return;
+    };
+    fn posted(post: *mut Post) -> JsResult<()> {
+        // SAFETY: what the enclosing function boxed for this one task.
+        match *unsafe { bun_core::heap::take(post) } {
+            Post::FreeDeferred => handoff::free_deferred(),
+            Post::WrongThread(what) => {
+                let global = VirtualMachine::get().global();
+                let err = conv::throw(global, bun_appkit::Error::CalledOffMainThread(what));
+                let _ = bun_jsc::task::report_error_or_terminate(global, err);
+            }
+        }
+        Ok(())
+    }
+    let task = ConcurrentTask::create(ManagedTask::new_owned(
+        bun_core::heap::into_raw(Box::new(post)),
+        posted,
+    ));
+    if let Posted::Refused(task) = vm.post(LoopKind::Regular, task) {
+        // SAFETY: refused, so still ours; this frees the boxed `Post` too.
+        unsafe { ConcurrentTask::release_refused(task) };
+    }
+}
+
+/// Applies `function` to `receiver` (or `undefined`) and `args` through the
+/// dispatch function. `None` when it threw, which the event loop reported.
+fn dispatch(
+    global: &JSGlobalObject,
+    function: JSValue,
+    receiver: JSValue,
+    args: JSValue,
+) -> JsResult<Option<JSValue>> {
+    let dispatch = hooks(global, |hooks| hooks.dispatch.get())?;
+    let result = global.bun_vm().event_loop_mut().run_callback_with_result(
+        dispatch,
+        global,
+        JSValue::UNDEFINED,
+        &[function, receiver, args],
+    );
+    Ok((!result.is_empty()).then_some(result))
+}
+
+/// `returned` converted for a `ret`-typed return slot of `method`; a misfit
+/// is the script's error, reported like a throw from the function itself,
+/// and reads as `None` just as a throw does.
+fn returned(
+    global: &JSGlobalObject,
+    method: &str,
+    ret: &Enc,
+    returned: JsResult<Option<JSValue>>,
+) -> Option<DynValue> {
+    let converted = returned.and_then(|returned| match returned {
+        // Whatever a void function returns is dropped, as JavaScript does.
+        Some(_) if *ret == Enc::Void => Ok(Some(DynValue::Void)),
+        Some(value) => conv::dyn_value(global, method, Slot::Return, ret, value).map(Some),
+        None => Ok(None),
+    });
+    match converted {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = bun_jsc::task::report_error_or_terminate(global, err);
+            None
+        }
+    }
+}
+
+/// How a block or script-class method reaches its function: `args`
+/// converted the way results are (an out-parameter as a `{ value }` cell),
+/// the function applied to `receiver`, its result converted for `ret`, and
+/// the cells read back for `params`' out-parameters.
+fn call_js(
+    global: &JSGlobalObject,
+    function: JSValue,
+    receiver: JSValue,
+    method: &str,
+    args: Vec<DynValue>,
+    params: &[Enc],
+    ret: &Enc,
+) -> Reply {
+    // Each converted argument is in the array, and so reachable, as soon as
+    // it exists; the cells are read back out of the array after the call.
+    let args =
+        JSValue::create_array_from_iter(global, args.into_iter().zip(params), |(arg, enc)| {
+            let value = conv::lent_to_js(global, arg)?;
+            Ok(match enc {
+                Enc::Out(_) => {
+                    let cell = JSValue::create_empty_object(global, 1);
+                    cell.put(global, b"value", value);
+                    cell
+                }
+                _ => value,
+            })
+        });
+    let args = match args {
+        Ok(args) => args,
+        Err(err) => {
+            return Reply {
+                value: returned(global, method, ret, Err(err)),
+                outs: Vec::new(),
+            };
+        }
+    };
+    let value = returned(
+        global,
+        method,
+        ret,
+        dispatch(global, function, receiver, args),
+    );
+    let read_outs = || -> JsResult<Vec<(usize, DynValue)>> {
+        let mut read = Vec::new();
+        for (index, enc) in params.iter().enumerate() {
+            let Enc::Out(pointee) = enc else {
+                continue;
+            };
+            let cell = args.get_index(global, index as u32)?;
+            if let Some(value) = cell.get(global, "value")? {
+                let slot = Slot::Arg(index);
+                read.push((
+                    index,
+                    conv::dyn_value(global, method, slot, &pointee.enc(), value)?,
+                ));
+            }
+        }
+        Ok(read)
+    };
+    let outs = read_outs().unwrap_or_else(|err| {
+        // A `value` that does not convert (or a getter that throws) counts
+        // as the function throwing.
+        let _ = bun_jsc::task::report_error_or_terminate(global, err);
+        Vec::new()
+    });
+    args.ensure_still_alive();
+    Reply { value, outs }
+}
 
 fn selector_arg(global: &JSGlobalObject, value: JSValue, what: &str) -> JsResult<conv::Utf8> {
     Ok(JsStr::new(global, value, format_args!("{what} selector"))?.to_utf8())
+}
+
+/// The native half of a wrapper the collector has finalized. Dropping it
+/// gives an Objective-C reference back (an object's last release runs its
+/// `dealloc`; a view lets go of its delegate), which can send messages
+/// that script-defined methods answer, and JavaScript cannot run inside a
+/// collection. So finalizers queue it here and it is dropped on the next
+/// event loop turn, or at the top of the next send, instead.
+pub(super) enum Finalized {
+    Object(DynObject),
+    View(View),
+}
+
+#[derive(Default)]
+struct Released {
+    objects: Vec<DynObject>,
+    views: Vec<View>,
+}
+
+impl Released {
+    fn is_empty(&self) -> bool {
+        self.objects.is_empty() && self.views.is_empty()
+    }
+}
+
+/// Queues `item` to be dropped outside the collection; see [`Finalized`].
+pub(super) fn drop_later(item: Finalized) {
+    let first = RELEASED.with_borrow_mut(|queue| {
+        let first = queue.is_empty();
+        match item {
+            Finalized::Object(object) => queue.objects.push(object),
+            Finalized::View(view) => queue.views.push(view),
+        }
+        first
+    });
+    if first {
+        fn release(_: *mut u8) -> JsResult<()> {
+            release_finalized();
+            Ok(())
+        }
+        static TAG: u8 = 0;
+        VirtualMachine::get()
+            .event_loop_mut()
+            .enqueue_task(ManagedTask::new(
+                core::ptr::from_ref(&TAG).cast_mut(),
+                release,
+            ));
+    }
+}
+
+/// Drops what the collector has finalized since this last ran; see
+/// [`Finalized`].
+fn release_finalized() {
+    let released = RELEASED.with_borrow_mut(|queue| core::mem::take(&mut **queue));
+    if !released.is_empty() {
+        dynamic::drop_pooled(released);
+    }
 }
 
 /// Looks the method up, converts `args` by its signature, sends, and converts
@@ -21,33 +317,71 @@ fn send(
     frame: &CallFrame,
     what: &str,
 ) -> JsResult<JSValue> {
+    // Here rather than only on the next event-loop turn, so a loop of sends
+    // that never yields cannot pile up what the collector already let go.
+    release_finalized();
     let args = frame.arguments();
     let sel = selector_arg(global, frame.argument(0), what)?;
     let args = args.get(1..).unwrap_or_default();
     let sig = conv::check(global, dynamic::signature(receiver, &sel))?;
-    if args.len() != sig.args.len() {
+    send_as(global, receiver, &sig, args)
+}
+
+/// Converts `args` by `sig`, sends (or calls the block), and converts the
+/// result back.
+fn send_as(
+    global: &JSGlobalObject,
+    receiver: Receiver<'_>,
+    sig: &dynamic::Signature,
+    args: &[JSValue],
+) -> JsResult<JSValue> {
+    // Out-parameters at the end may be left off: each is passed as NULL.
+    let complete = args.len() == sig.args.len()
+        || (args.len() < sig.args.len()
+            && sig.args[args.len()..]
+                .iter()
+                .all(|enc| matches!(enc, Enc::Out(_))));
+    if !complete {
         return Err(conv::throw(
             global,
-            &bun_appkit::Error::ArgCount {
+            bun_appkit::Error::ArgCount {
                 method: sig.method().to_owned(),
                 expected: sig.args.len(),
                 got: args.len(),
             },
         ));
     }
-    let mut values = Vec::with_capacity(args.len());
-    for (index, (enc, value)) in sig.args.iter().zip(args).enumerate() {
-        values.push(conv::dyn_arg(global, &sig, index, enc, *value)?);
+    let mut values = Vec::with_capacity(sig.args.len());
+    for (index, enc) in sig.args.iter().enumerate() {
+        values.push(match args.get(index) {
+            Some(value) => conv::dyn_arg(global, sig, index, enc, *value)?,
+            None => DynValue::Nil,
+        });
     }
-    let result = conv::check(global, dynamic::invoke(receiver, &sig, &values))?;
-    conv::dyn_to_js(global, result)
+    let result = conv::check(global, dynamic::invoke(receiver, sig, &mut values))?;
+    let result = conv::dyn_to_js(global, result)?;
+    if values.iter().any(|v| matches!(v, DynValue::Out(Some(_)))) {
+        let outs = hooks(global, |hooks| hooks.outs.get())?;
+        for (index, value) in values.into_iter().enumerate() {
+            if let DynValue::Out(Some(out)) = value {
+                outs.push(global, JSValue::js_number(index as f64))?;
+                outs.push(global, conv::dyn_to_js(global, *out)?)?;
+            }
+        }
+    }
+    Ok(result)
 }
 
-/// One retained Objective-C object. `appkit.ts` wraps it in a Proxy that
+/// One retained Objective-C object. `internal/objc.ts` wraps it in a Proxy that
 /// turns property access into bound `msgSend` calls.
 #[bun_jsc::JsClass]
 pub struct ObjCObject {
     object: DynObject,
+    /// How many times the bridge has handed this object to the script as a
+    /// result (a send's, `objc.ns()`, an out-parameter) and not had it given
+    /// back with `release()`. One retain backs them all; it goes with the
+    /// last of them, or when the wrapper is collected.
+    acquisitions: Cell<u32>,
 }
 
 impl ObjCObject {
@@ -55,12 +389,51 @@ impl ObjCObject {
         Err(_global.throw_illegal_constructor())
     }
 
+    /// The object's one wrapper (a class object's is an [`ObjCClass`]),
+    /// counting one more acquisition of it.
     pub(super) fn wrap(global: &JSGlobalObject, object: DynObject) -> JSValue {
-        JsClass::to_js(ObjCObject { object }, global)
+        ObjCObject::wrap_as(global, object, true)
+    }
+
+    /// The object's one wrapper for the duration of a callback (its receiver
+    /// or an argument): the caller's reference, not an acquisition.
+    pub(super) fn lend(global: &JSGlobalObject, object: DynObject) -> JSValue {
+        ObjCObject::wrap_as(global, object, false)
+    }
+
+    fn wrap_as(global: &JSGlobalObject, object: DynObject, acquired: bool) -> JSValue {
+        if let Some(class) = object.as_class() {
+            return ObjCClass::wrap(global, class);
+        }
+        let address = object.address();
+        let make = || {
+            JsClass::to_js(
+                ObjCObject {
+                    object,
+                    acquisitions: Cell::new(1),
+                },
+                global,
+            )
+        };
+        match address {
+            // An `alloc` awaiting its `init…` stands for no object yet.
+            0 => make(),
+            _ => canonical(global, address, acquired, make),
+        }
     }
 
     pub(super) fn object(&self) -> &DynObject {
         &self.object
+    }
+
+    /// See [`Finalized`]: the reference goes back later, not from here.
+    pub fn finalize(self: Box<Self>) {
+        if self.object.address() != 0 {
+            forget(self.object.address());
+        }
+        if !self.object.is_released() {
+            drop_later(Finalized::Object(self.object));
+        }
     }
 
     /// `msgSend(selector, ...args)`.
@@ -78,17 +451,18 @@ impl ObjCObject {
         conv::str_to_js(global, &name)
     }
 
-    pub fn get_is_class(&self, _global: &JSGlobalObject) -> JsResult<JSValue> {
-        Ok(JSValue::js_boolean(self.object.is_class()))
-    }
-
     pub fn get_address(&self, global: &JSGlobalObject) -> JsResult<JSValue> {
         JSValue::from_uint64_no_truncate(global, self.object.address() as u64)
     }
 
-    /// Drops the reference now; every later send throws. Idempotent.
+    /// Gives one acquisition back; with the last one goes the reference,
+    /// and every later send throws. Idempotent after that.
     pub fn release(&self, _global: &JSGlobalObject, _frame: &CallFrame) -> JsResult<JSValue> {
-        self.object.release();
+        let left = self.acquisitions.get().saturating_sub(1);
+        self.acquisitions.set(left);
+        if left == 0 {
+            self.object.release();
+        }
         Ok(JSValue::UNDEFINED)
     }
 
@@ -114,8 +488,11 @@ impl ObjCClass {
         Err(_global.throw_illegal_constructor())
     }
 
+    /// The class's one wrapper.
     pub(super) fn wrap(global: &JSGlobalObject, class: DynClass) -> JSValue {
-        JsClass::to_js(ObjCClass { class }, global)
+        canonical(global, class.address(), false, || {
+            JsClass::to_js(ObjCClass { class }, global)
+        })
     }
 
     pub(super) fn class(&self) -> DynClass {
@@ -203,7 +580,11 @@ fn plain_to_js(global: &JSGlobalObject, plain: Plain) -> JsResult<JSValue> {
         Plain::Null => Ok(JSValue::NULL),
         Plain::String(text) => conv::utf16_to_js(global, &text),
         Plain::Number(n) => Ok(JSValue::js_number(n)),
+        Plain::Integer(n) => conv::i64_to_js(global, n),
+        Plain::Unsigned(n) => conv::u64_to_js(global, n),
         Plain::Boolean(b) => Ok(JSValue::js_boolean(b)),
+        Plain::Data(bytes) => JSUint8Array::from_bytes(global, bytes.into_boxed_slice()),
+        Plain::Date(milliseconds) => Ok(JSValue::from_date_number(global, milliseconds)),
         Plain::Array(items) => JSValue::create_array_from_iter(global, items.into_iter(), |item| {
             plain_to_js(global, item)
         }),
@@ -228,26 +609,415 @@ fn objc_ns(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
     }
 }
 
-/// The address a live wrapper (or its proxy) holds; a released handle or an
-/// unsent `alloc` has none to compare.
-fn address_of(value: JSValue) -> Option<usize> {
-    if let Some(o) = conv::objc_object(value) {
-        return (!o.object.is_released() && o.object.address() != 0).then(|| o.object.address());
-    }
-    conv::objc_class(value).map(|c| c.class.address())
-}
-
-/// `objcSame(a, b)`: whether two live wrappers (or their proxies) name the same object.
+/// `objcAcquire(handle)`: the same handle, counted as handed out once more
+/// (what a result that produces the object does).
 #[bun_jsc::host_fn]
-fn objc_same(_global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
-    let (a, b) = (address_of(frame.argument(0)), address_of(frame.argument(1)));
-    Ok(JSValue::js_boolean(
-        matches!((a, b), (Some(a), Some(b)) if a == b),
-    ))
+fn objc_acquire(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let Some(handle) = conv::objc_object(frame.argument(0)) else {
+        return Err(global.throw_type_error(format_args!("objcAcquire: not an ObjCObject")));
+    };
+    let object = conv::check(global, handle.object().try_clone())?;
+    Ok(ObjCObject::wrap(global, object))
 }
 
-/// Adds the classes and functions above to the `createBinding` object.
+/// `objcLookupProtocol(name)`: the `Protocol` object as a handle, or a TypeError naming it.
+#[bun_jsc::host_fn]
+fn objc_lookup_protocol(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let name = JsStr::new(global, frame.argument(0), format_args!("protocol name"))?.to_utf8();
+    let protocol = conv::check(global, dynamic::lookup_protocol(&name))?;
+    Ok(ObjCObject::wrap(global, protocol))
+}
+
+// ─────────────────────────── script-defined classes ───────────────────────────
+
+/// The functions behind one script-defined class, in definition order.
+/// Never dropped: the class is registered for the life of the process.
+struct JsMethods {
+    global: GlobalRef,
+    functions: Vec<Strong>,
+}
+
+/// What `objc.target()` and friends attach to one instance: an object whose
+/// own function-valued properties, named by selector, take precedence over
+/// the class's functions. Dropped when the instance deallocates.
+struct JsInstance {
+    table: Strong,
+}
+
+impl script::Methods for JsMethods {
+    fn call(&self, call: Call<'_>) -> Reply {
+        let global = &*self.global;
+        let per_instance = || -> JsResult<Option<JSValue>> {
+            match call
+                .instance
+                .and_then(|data| data.downcast_ref::<JsInstance>())
+            {
+                Some(instance) => Ok(instance
+                    .table
+                    .get()
+                    .get(global, call.selector)?
+                    .filter(|f| f.is_callable())),
+                None => Ok(None),
+            }
+        };
+        let function = match per_instance() {
+            Ok(function) => function.unwrap_or_else(|| self.functions[call.index].get()),
+            Err(err) => {
+                return Reply {
+                    value: returned(global, call.method, call.ret, Err(err)),
+                    outs: Vec::new(),
+                };
+            }
+        };
+        let receiver = ObjCObject::lend(global, call.receiver);
+        call_js(
+            global,
+            function,
+            receiver,
+            call.method,
+            call.args,
+            call.params,
+            call.ret,
+        )
+    }
+
+    fn report(&self, err: bun_appkit::Error) {
+        let global = &*self.global;
+        let _ = bun_jsc::task::report_error_or_terminate(global, conv::throw(global, err));
+    }
+}
+
+/// The function behind one block. Dropped when the block's last reference
+/// is released.
+pub(super) struct JsBlock {
+    global: GlobalRef,
+    function: Strong,
+}
+
+impl JsBlock {
+    /// A heap block of type `types` that calls `function`, as a handle's object.
+    pub(super) fn make(
+        global: &JSGlobalObject,
+        function: JSValue,
+        types: &str,
+    ) -> bun_appkit::Result<bun_appkit::DynObject> {
+        let handler = Box::new(JsBlock {
+            global: GlobalRef::new(global),
+            function: Strong::create(function, global),
+        });
+        block::make(types, handler)
+    }
+}
+
+impl block::BlockFn for JsBlock {
+    fn call(&self, call: block::Call<'_>) -> Reply {
+        call_js(
+            &self.global,
+            self.function.get(),
+            JSValue::UNDEFINED,
+            call.method,
+            call.args,
+            call.params,
+            call.ret,
+        )
+    }
+
+    fn report(&self, err: bun_appkit::Error) {
+        let global = &*self.global;
+        let _ = bun_jsc::task::report_error_or_terminate(global, conv::throw(global, err));
+    }
+}
+
+fn string_list(global: &JSGlobalObject, value: JSValue, what: &str) -> JsResult<Vec<String>> {
+    let mut out = Vec::new();
+    if value.is_undefined_or_null() {
+        return Ok(out);
+    }
+    let mut iter = value.array_iterator(global)?;
+    while let Some(item) = iter.next()? {
+        out.push(
+            JsStr::new(global, item, format_args!("{what}"))?
+                .to_utf8()
+                .into_string(),
+        );
+    }
+    Ok(out)
+}
+
+/// `objcSetHooks(dispatch, outs)`, once, from `internal/objc.ts`: see [`Hooks`].
+#[bun_jsc::host_fn]
+fn objc_set_hooks(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let (dispatch, outs) = (frame.argument(0), frame.argument(1));
+    if !dispatch.is_callable() || !outs.is_array() {
+        return Err(global.throw_type_error(format_args!(
+            "objcSetHooks: expected a function and an array"
+        )));
+    }
+    // The hooks, the handle table and the script classes are this thread's,
+    // and their values belong to the global that loaded the module. When the
+    // thread's own global has been replaced (bun test --isolate) the module
+    // loads again under the new one and takes them over: the old global is
+    // done, its wrappers are forgotten (each object gets a fresh one on next
+    // sight) and its hooks dropped. Any other second global on the thread (a
+    // ShadowRealm) would mix its objects into a live module's, so it is
+    // refused before it can change anything.
+    let other = HOOKS.with_borrow(|slot| {
+        slot.as_ref()
+            .is_some_and(|hooks| !core::ptr::eq::<JSGlobalObject>(&*hooks.global, global))
+    });
+    if other && !core::ptr::eq::<JSGlobalObject>(VirtualMachine::get().global(), global) {
+        return Err(conv::throw(
+            global,
+            bun_appkit::Error::InvalidState(
+                "bun:appkit is loaded by this thread's main global object; another global object on the same thread (a ShadowRealm) cannot use it",
+            ),
+        ));
+    }
+    let old = HOOKS.with_borrow_mut(|slot| {
+        slot.replace(ManuallyDrop::new(Hooks {
+            global: GlobalRef::new(global),
+            dispatch: Strong::create(dispatch, global),
+            outs: Strong::create(outs, global),
+        }))
+    });
+    if let Some(old) = old {
+        drop(ManuallyDrop::into_inner(old));
+        if other {
+            let stale = HANDLES.with_borrow_mut(core::mem::take);
+            drop(stale);
+        }
+    }
+    Ok(JSValue::UNDEFINED)
+}
+
+/// A defined method's constant result as `bun:appkit` lets it through: a
+/// boolean, a number, a bigint or null.
+fn constant_body(global: &JSGlobalObject, value: JSValue, selector: &str) -> JsResult<DynValue> {
+    Ok(if value.is_undefined_or_null() {
+        DynValue::Nil
+    } else if value.is_boolean() {
+        DynValue::Bool(value.as_boolean())
+    } else if value.is_number() {
+        let n = value.as_number();
+        if n.fract() == 0.0 && n.abs() <= MAX_SAFE_INTEGER {
+            DynValue::I64(n as i64)
+        } else {
+            DynValue::F64(n)
+        }
+    } else if let Some(big) = JSBigInt::from_js(value)
+        && value.is_big_int_in_int64_range(i64::MIN, i64::MAX)
+    {
+        DynValue::I64(big.to_int64())
+    } else if value.is_big_int() && value.is_big_int_in_uint64_range(0, u64::MAX) {
+        DynValue::U64(value.to_uint64_no_truncate())
+    } else {
+        return Err(global.throw_type_error(format_args!(
+            "objc.defineClass(): method {selector} must be a function or a constant (a boolean, a number or null)"
+        )));
+    })
+}
+
+const MAX_SAFE_INTEGER: f64 = 9007199254740991.0;
+
+/// `objcDefineClass(name, superclass, protocols, selectors, types, bodies)`:
+/// registers the class and returns it. `bun:appkit` has already shaped the
+/// arguments; `types[i]` is `undefined` where the encoding is to be looked
+/// up, and `bodies[i]` is the method's function or its constant result.
+#[bun_jsc::host_fn]
+fn objc_define_class(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let name = match frame.argument(0) {
+        n if n.is_undefined_or_null() => String::new(),
+        n => JsStr::new(global, n, format_args!("objc.defineClass(): name"))?
+            .to_utf8()
+            .into_string(),
+    };
+    let superclass = frame.argument(1);
+    let superclass = conv::objc_class(superclass)
+        .map(ObjCClass::class)
+        .or_else(|| conv::objc_object(superclass).and_then(|o| o.object.as_class()));
+    let Some(superclass) = superclass else {
+        return Err(global.throw_type_error(format_args!(
+            "objc.defineClass(): superclass must be a class name or a class handle"
+        )));
+    };
+    let protocols = string_list(global, frame.argument(2), "objc.defineClass(): protocols")?;
+    let selectors = string_list(
+        global,
+        frame.argument(3),
+        "objc.defineClass(): method names",
+    )?;
+    let (types, functions) = (frame.argument(4), frame.argument(5));
+    if !types.is_array() || !functions.is_array() {
+        return Err(global.throw_type_error(format_args!("objcDefineClass: bad arguments")));
+    }
+    let mut methods = Vec::with_capacity(selectors.len());
+    let mut retained = Vec::with_capacity(selectors.len());
+    for (i, selector) in selectors.into_iter().enumerate() {
+        let types = match types.get_index(global, i as u32)? {
+            t if t.is_undefined_or_null() => None,
+            t => Some(
+                JsStr::new(
+                    global,
+                    t,
+                    format_args!("objc.defineClass(): types of {selector}"),
+                )?
+                .to_utf8()
+                .into_string(),
+            ),
+        };
+        let body = functions.get_index(global, i as u32)?;
+        let constant = if body.is_callable() {
+            retained.push(Strong::create(body, global));
+            None
+        } else {
+            Some(constant_body(global, body, &selector)?)
+        };
+        methods.push(MethodSpec {
+            selector,
+            types,
+            constant,
+        });
+    }
+    let spec = ClassSpec {
+        name,
+        superclass,
+        protocols,
+        methods,
+    };
+    let handler = Box::new(JsMethods {
+        global: GlobalRef::new(global),
+        functions: retained,
+    });
+    let class = conv::check(global, script::define_class(&spec, handler))?;
+    Ok(ObjCClass::wrap(global, class))
+}
+
+/// `objcBlock(fn, types)`: a block of that type encoding whose body is `fn`.
+#[bun_jsc::host_fn]
+fn objc_block(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let (function, types) = (frame.argument(0), frame.argument(1));
+    if !function.is_callable() {
+        return Err(
+            global.throw_type_error(format_args!("objc.block(fn, types): fn must be a function"))
+        );
+    }
+    let types = JsStr::new(global, types, format_args!("objc.block(fn, types): types"))?.to_utf8();
+    let block = conv::check(global, JsBlock::make(global, function, &types))?;
+    Ok(ObjCObject::wrap(global, block))
+}
+
+/// `objcAttach(handle, table)`: per-instance functions for a script-class
+/// instance, kept alive by the instance from now until it deallocates.
+#[bun_jsc::host_fn]
+fn objc_attach(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let (Some(wrapper), table) = (conv::objc_object(frame.argument(0)), frame.argument(1)) else {
+        return Err(global.throw_type_error(format_args!("objcAttach: expected an ObjCObject")));
+    };
+    if !table.is_object() {
+        return Err(
+            global.throw_type_error(format_args!("objcAttach: expected an object of functions"))
+        );
+    }
+    let data = Box::new(JsInstance {
+        table: Strong::create(table, global),
+    });
+    conv::check(global, script::attach(wrapper.object(), data))?;
+    Ok(JSValue::UNDEFINED)
+}
+
+/// The receiver a wrapper (or its proxy) stands for; a TypeError for anything else.
+fn with_receiver<R>(
+    global: &JSGlobalObject,
+    value: JSValue,
+    what: &str,
+    f: impl FnOnce(Receiver<'_>) -> bun_appkit::Result<R>,
+) -> JsResult<R> {
+    if let Some(o) = conv::objc_object(value) {
+        return conv::check(global, f(Receiver::Object(&o.object)));
+    }
+    if let Some(c) = conv::objc_class(value) {
+        return conv::check(global, f(Receiver::Class(&c.class)));
+    }
+    Err(global.throw_type_error(format_args!("{what}: expected an ObjCObject or ObjCClass")))
+}
+
+/// `objcResponds(handle, selector)`: `respondsToSelector:` without sending
+/// anything to a proxy or an unsent `alloc`.
+#[bun_jsc::host_fn]
+fn objc_responds(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let sel = selector_arg(global, frame.argument(1), "objcResponds():")?;
+    let responds = with_receiver(global, frame.argument(0), "objcResponds()", |r| {
+        r.responds_to(&sel)
+    })?;
+    Ok(JSValue::js_boolean(responds))
+}
+
+/// `objcMethodNames(handle)`: the selectors the receiver's classes implement, for `ownKeys`.
+#[bun_jsc::host_fn]
+fn objc_method_names(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let names = with_receiver(global, frame.argument(0), "objcMethodNames()", |r| {
+        r.method_names()
+    })?;
+    JSValue::create_array_from_iter(global, names.into_iter(), |name| {
+        conv::str_to_js(global, &name)
+    })
+}
+
+/// `objcIsBlock(handle)`: whether the object is a block.
+#[bun_jsc::host_fn]
+fn objc_is_block(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let is = match conv::objc_object(frame.argument(0)) {
+        Some(o) => conv::check(global, Receiver::Object(&o.object).is_block())?,
+        None => false,
+    };
+    Ok(JSValue::js_boolean(is))
+}
+
+/// `objcInvokeBlock(handle, ...args)`: calls the block with `args`, typed
+/// by the signature it was compiled with.
+#[bun_jsc::host_fn]
+fn objc_invoke_block(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let Some(block) = conv::objc_object(frame.argument(0)) else {
+        return Err(
+            global.throw_type_error(format_args!("objcInvokeBlock: expected an ObjCObject"))
+        );
+    };
+    release_finalized();
+    let sig = conv::check(global, dynamic::block_signature(&block.object))?;
+    let args = frame.arguments();
+    send_as(
+        global,
+        Receiver::Object(&block.object),
+        &sig,
+        args.get(1..).unwrap_or_default(),
+    )
+}
+
+/// `objcConstant(name, types)`: the exported global `name` read as `types`.
+#[bun_jsc::host_fn]
+fn objc_constant(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
+    let name = JsStr::new(
+        global,
+        frame.argument(0),
+        format_args!("objc.constant(): name"),
+    )?;
+    let types = JsStr::new(
+        global,
+        frame.argument(1),
+        format_args!("objc.constant(): type"),
+    )?;
+    let value = conv::check(global, dynamic::constant(&name.to_utf8(), &types.to_utf8()))?;
+    conv::dyn_to_js(global, value)
+}
+
+/// Adds the classes and functions above to the `createObjcBinding` object; from
+/// here on Objective-C exceptions inside sends are errors, and what
+/// `bun_appkit` hears of on other threads comes to this one.
 pub(super) fn install(global: &JSGlobalObject, binding: JSValue) {
+    dynamic::catch_exceptions_with(dynamic::Bun__NSInvocation__tryInvoke);
+    if handoff::post_with(post) {
+        let _ = VM.set(global.bun_vm().handle());
+    }
     binding.put(global, b"ObjCObject", ObjCObject::get_constructor(global));
     binding.put(global, b"ObjCClass", ObjCClass::get_constructor(global));
     binding.put(
@@ -255,11 +1025,21 @@ pub(super) fn install(global: &JSGlobalObject, binding: JSValue) {
         b"ObjCSelector",
         ObjCSelector::get_constructor(global),
     );
-    let functions: [(&str, bun_jsc::JSHostFn, u32); 4] = [
+    let functions: [(&str, bun_jsc::JSHostFn, u32); 14] = [
         ("objcLookupClass", __jsc_host_objc_lookup_class, 1),
+        ("objcLookupProtocol", __jsc_host_objc_lookup_protocol, 1),
         ("objcJs", __jsc_host_objc_js, 1),
         ("objcNs", __jsc_host_objc_ns, 1),
-        ("objcSame", __jsc_host_objc_same, 2),
+        ("objcAcquire", __jsc_host_objc_acquire, 1),
+        ("objcResponds", __jsc_host_objc_responds, 2),
+        ("objcMethodNames", __jsc_host_objc_method_names, 1),
+        ("objcConstant", __jsc_host_objc_constant, 2),
+        ("objcIsBlock", __jsc_host_objc_is_block, 1),
+        ("objcInvokeBlock", __jsc_host_objc_invoke_block, 1),
+        ("objcSetHooks", __jsc_host_objc_set_hooks, 2),
+        ("objcDefineClass", __jsc_host_objc_define_class, 6),
+        ("objcAttach", __jsc_host_objc_attach, 2),
+        ("objcBlock", __jsc_host_objc_block, 2),
     ];
     for (name, host_fn, arity) in functions {
         binding.put(

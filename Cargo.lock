@@ -167,6 +167,7 @@ dependencies = [
 name = "bun_appkit"
 version = "0.0.0"
 dependencies = [
+ "bun_collections",
  "bun_core",
  "bun_uws_sys",
  "libc",

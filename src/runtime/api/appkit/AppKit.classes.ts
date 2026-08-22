@@ -1,6 +1,6 @@
 import { define } from "../../../codegen/class-definitions";
 
-// Event slots: JS assigns the handler (`native.onAction = fn`), the native side
+// Event slots: JS assigns the handler (`native.onFrame = fn`), the native side
 // reads it back through the cached WriteBarrier, and the collector visits it.
 function slots(...names: string[]) {
   const proto: Record<string, { getter: string; cache: true; writable: true }> = {};
@@ -50,7 +50,6 @@ export default [
   objcClass("ObjCObject", {
     msgSend: fn("msgSend", 1),
     className: { getter: "getClassName" },
-    isClass: { getter: "getIsClass" },
     address: { getter: "getAddress" },
     release: fn("release", 0),
     released: { getter: "getReleased" },
@@ -76,53 +75,10 @@ export default [
     rustPath: "crate::api::appkit::AppKitView",
     proto: {
       set: { fn: "set", length: 2 },
-      get: { fn: "get", length: 1 },
-      insertChild: { fn: "insertChild", length: 2 },
-      removeChild: { fn: "removeChild", length: 1 },
-      click: { fn: "click", length: 0 },
-      snapshot: { fn: "snapshot", length: 0 },
-      frame: { getter: "getFrame" },
       draw: { fn: "draw", length: 0 },
       drawableSize: { getter: "getDrawableSize" },
-      release: { fn: "release", length: 0 },
-      released: { getter: "getReleased" },
       native: { getter: "getNative" },
-      ...slots(
-        "onAction",
-        "onChange",
-        "onSubmit",
-        "onFocus",
-        "onBlur",
-        "onSelect",
-        "onActivate",
-        "onFrame",
-        "onResize",
-      ),
-    },
-  }),
-  define({
-    name: "AppKitWindow",
-    construct: true,
-    constructNeedsThis: true,
-    finalize: true,
-    configurable: false,
-    klass: {},
-    rustPath: "crate::api::appkit::AppKitWindow",
-    proto: {
-      set: { fn: "set", length: 2 },
-      get: { fn: "get", length: 1 },
-      setContent: { fn: "setContent", length: 1 },
-      show: { fn: "show", length: 0 },
-      hide: { fn: "hide", length: 0 },
-      center: { fn: "center", length: 0 },
-      focus: { fn: "focus", length: 0 },
-      close: { fn: "close", length: 0 },
-      snapshot: { fn: "snapshot", length: 0 },
-      closed: { getter: "getClosed" },
-      visible: { getter: "getVisible" },
-      key: { getter: "getKey" },
-      native: { getter: "getNative" },
-      ...slots("onClose", "shouldClose", "onResize", "onMove", "onFocus", "onBlur"),
+      ...slots("onFrame", "onResize"),
     },
   }),
   define({
@@ -141,9 +97,8 @@ export default [
       set: { fn: "set", length: 2 },
       isDark: { getter: "getIsDark" },
       hasDisplay: { getter: "getHasDisplay" },
-      liveViews: { getter: "getLiveViews" },
       testing: { fn: "testing", length: 3 },
-      ...slots("onBeforeQuit", "onReopen", "onMenu"),
+      ...slots("onBeforeQuit", "onCloseAll", "onReopen"),
     },
   }),
   define({

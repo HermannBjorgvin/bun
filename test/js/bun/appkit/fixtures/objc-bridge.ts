@@ -18,6 +18,8 @@ function tryCall(f: () => unknown): Thrown {
   }
 }
 
+const nativeTag = (value: unknown) => Object.prototype.toString.call(value);
+
 function attempt(name: string, f: () => unknown) {
   emit({ step: name, ...tryCall(f) });
 }
@@ -120,6 +122,10 @@ await run(async () => {
     // NSNotFound is NSIntegerMax, past 2^53, so it arrives as a bigint and goes back in as one.
     notFound: String(NSString.stringWithString_("hello").rangeOfString_("x").location),
     notFoundType: typeof NSString.stringWithString_("hello").rangeOfString_("x").location,
+    notFoundRange: NSString.stringWithString_("hello").rangeOfString_("x").location === objc.NSNotFound,
+    notFoundIndex: list.indexOfObject_("absent") === objc.NSNotFound,
+    foundIndex: list.indexOfObject_(s),
+    notFoundConstant: [typeof objc.NSNotFound, String(objc.NSNotFound)],
     substring: String(NSString.stringWithString_("hello world").substringWithRange_({ location: 0, length: 5 })),
     bigRange: String(
       objc.classes.NSValue.valueWithRange_({ location: 9223372036854775807n, length: 2 }).rangeValue().location,
@@ -200,9 +206,126 @@ await run(async () => {
     sameStrings: objc.same("a" as any, "a" as any),
   });
   win.close();
-  attempt("native after close", () => win.native);
-  // The handle taken before the close still holds the NSWindow.
+  // The handle, whether taken before the close or after it, still holds the NSWindow.
+  emit({ step: "native after close", same: win.native === native });
   emit({ step: "handle after close", title: String(native.title()) });
+
+  // An NSWindow made through the bridge would by default release itself on
+  // close, a second time after the handle's own release; the bridge turns
+  // that off, so the handle outlives close().
+  const NSWindow = objc.classes.NSWindow;
+  const rawWindow = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    { x: 0, y: 0, width: 120, height: 80 },
+    1,
+    2,
+    true,
+  );
+  const newWindow = NSWindow.new();
+  // A panel AppKit owns is left as it is (panels already default to NO).
+  const sharedPanel = objc.classes.NSColorPanel.sharedColorPanel();
+  const releasedWhenClosed = [
+    rawWindow.isReleasedWhenClosed(),
+    newWindow.isReleasedWhenClosed(),
+    sharedPanel.isReleasedWhenClosed(),
+  ];
+  rawWindow.setTitle_("raw");
+  newWindow.setTitle_("new");
+  rawWindow.close();
+  newWindow.close();
+  Bun.gc(true);
+  emit({
+    step: "bridge window",
+    releasedWhenClosed,
+    titlesAfterClose: [String(rawWindow.title()), String(newWindow.title())],
+    frameWidthAfterClose: rawWindow.frame().size.width,
+  });
+  rawWindow.release();
+  newWindow.release();
+
+  // NSProxy receivers: NSUndoManager's invocation-target proxy records the
+  // first message it is sent, so the bridge must not probe it with
+  // respondsToSelector: first. The recorded call replays on undo().
+  const undo = objc.classes.NSUndoManager.alloc().init();
+  undo.setGroupsByEvent_(false);
+  const undoTarget = NSMutableArray.new();
+  undo.beginUndoGrouping();
+  const proxy = undo.prepareWithInvocationTarget_(undoTarget);
+  const recorded = proxy.addObject_("undone");
+  // Answered by NSProxy itself, not forwarded.
+  const isProxy = [undo.prepareWithInvocationTarget_(undoTarget).isProxy(), undoTarget.isProxy()];
+  // This proxy answers methodSignatureForSelector: with its target's, so a
+  // selector the target lacks is nil there and a TypeError here.
+  const proxyTypo = tryCall(() => undo.prepareWithInvocationTarget_(undoTarget).definitelyNotASelector_(1));
+  undo.endUndoGrouping();
+  const countBeforeUndo = undoTarget.count();
+  undo.undo();
+  emit({
+    step: "proxy",
+    isProxy,
+    recorded: typeof recorded,
+    untouchedBeforeUndo: countBeforeUndo === 0,
+    replayed: objc.js(undoTarget),
+    jsLeavesProxy: nativeTag(objc.js(proxy)),
+    stringifies: typeof String(proxy),
+    typo: { threw: proxyTypo.threw, isTypeError: proxyTypo.threw && proxyTypo.isTypeError },
+  });
+
+  // An exception raised inside a method comes back as an Error carrying the
+  // NSException's name, reason, userInfo and the exception object itself, and
+  // the process carries on.
+  const caught = (f: () => unknown) => {
+    try {
+      f();
+      return { threw: false };
+    } catch (e) {
+      const err = e as Error & { code?: string; userInfo?: string; exception?: any };
+      if (err?.code === "ERR_APPKIT_UNAVAILABLE") throw err;
+      return {
+        threw: true,
+        isError: err instanceof Error && !(err instanceof TypeError),
+        code: err.code,
+        name: err.name,
+        message: err.message,
+        stack: typeof err.stack,
+        userInfo: err.userInfo,
+        exceptionName: err.exception === undefined ? undefined : String(err.exception.name()),
+      };
+    }
+  };
+  const empty = objc.classes.NSArray.array();
+  emit({ step: "exception range", ...caught(() => empty.objectAtIndex_(3)), countAfter: empty.count() });
+  emit({
+    step: "exception nil object",
+    ...caught(() => objc.classes.NSMutableDictionary.new().setObject_forKey_(null, "k")),
+  });
+  emit({
+    step: "exception userInfo",
+    ...caught(() =>
+      objc.classes.NSException.exceptionWithName_reason_userInfo_("BunFixtureException", "because", {
+        detail: 42,
+      }).raise(),
+    ),
+  });
+  // Foundation allows an exception without a name; the Error takes the class name then.
+  emit({
+    step: "exception nil name",
+    ...caught(() => objc.classes.NSException.exceptionWithName_reason_userInfo_(null, null, null).raise()),
+  });
+  // The receiver of an init that raises stays consumed: init owned it by then.
+  const uninitialized = NSString.alloc();
+  emit({
+    step: "exception init",
+    ...caught(() => uninitialized.initWithString_(null)),
+    consumedAfter: tryCall(() => uninitialized.length()).threw,
+  });
+  // Raised by the proxy's forwardInvocation: (no undo group is open), so it
+  // comes out of the one message the proxy is sent.
+  const countBeforeRaise = undoTarget.count();
+  emit({
+    step: "exception proxy",
+    ...caught(() => undo.prepareWithInvocationTarget_(undoTarget).addObject_("outside a group")),
+    untouched: undoTarget.count() === countBeforeRaise,
+  });
 
   attempt("unknown class", () => objc.classes.NSDefinitelyNotAClass);
   attempt("unrecognized selector", () => s.definitelyNotASelector_(1));
@@ -212,6 +335,7 @@ await run(async () => {
   attempt("wrong arg count msgSend", () => s.msgSend("compare:"));
   attempt("msgSend works", () => s.msgSend("compare:", "hi"));
   attempt("block arg", () => list.enumerateObjectsUsingBlock_(() => {}));
+  attempt("block arg number", () => list.enumerateObjectsUsingBlock_(3));
   attempt("pointer arg", () => NSData.dataWithBytes_length_("x", 1));
   attempt("fractional index", () => list.removeObjectAtIndex_(1.5));
   attempt("negative unsigned", () => list.removeObjectAtIndex_(-1));
@@ -223,17 +347,40 @@ await run(async () => {
   attempt("bad sel", () => objc.sel(""));
   attempt("retainCount refused", () => plain.retainCount());
   attempt("retain refused", () => plain.msgSend("retain"));
-  // Variadic selectors read arguments nobody passed; they are refused by name.
+  attempt("autorelease pool refused", () => objc.classes.NSAutoreleasePool.alloc().init());
+  // performSelector: is typed to return an object even when the performed
+  // method returns a BOOL or nothing; it is refused rather than retain garbage.
+  attempt("performSelector refused", () => s.performSelector_("length"));
+  attempt("performSelector withObject refused", () => s.performSelector_withObject_("isEqual:", s));
+  attempt("performSelector afterDelay allowed", () =>
+    plain.performSelector_withObject_afterDelay_("description", null, 1000),
+  );
+  objc.classes.NSObject.cancelPreviousPerformRequestsWithTarget_(plain);
+  // Variadic methods read arguments nobody passed; the ones the SDK declares
+  // are refused, on the declaring class and its subclasses.
   attempt("variadic format", () => NSString.stringWithFormat_("%@ %s"));
-  attempt("variadic objects", () => NSMutableArray.arrayWithObjects_(s));
-  attempt("variadic append", () => s.stringByAppendingFormat_("%@"));
+  attempt("variadic subclass", () => NSMutableArray.arrayWithObjects_(s));
+  attempt("variadic instance", () => s.stringByAppendingFormat_("%@"));
   attempt("variadic init", () => NSString.alloc().initWithFormat_("%@"));
+  attempt("variadic appkit", () =>
+    objc.classes.NSGradient.alloc().initWithColorsAndLocations_(objc.classes.NSColor.redColor()),
+  );
+  attempt("variadic unconventional name", () => objc.classes.NSCoder.new().encodeValuesOfObjCTypes_("i"));
+  attempt("variadic core image", () =>
+    objc.classes.CIFilter.filterWithName_keysAndValues_("CIGaussianBlur", "inputRadius"),
+  );
   attempt("va_list", () => objc.classes.NSException.raise_format_arguments_("x", "%@", "y"));
   attempt("object arguments:", () =>
     String(objc.classes.NSExpression.expressionForFunction_arguments_("sum:", []).function()),
   );
   attempt("non-variadic format", () =>
     String(objc.classes.NSPredicate.predicateWithFormat_argumentArray_("SELF == %@", ["a"]).predicateFormat()),
+  );
+  // `format:` here is an int; only the (class, selector) pairs from the headers count.
+  attempt("non-variadic format int", () =>
+    objc.classes.CIImageAccumulator.imageAccumulatorWithExtent_format_({ x: 0, y: 0, width: 4, height: 4 }, 0) === null
+      ? "nil"
+      : "accumulator",
   );
   attempt("init on class", () => NSString.init());
   attempt("init on class msgSend", () => NSMutableArray.msgSend("init"));
@@ -269,7 +416,7 @@ await run(async () => {
     ),
   );
   attempt("null-proto object for id", () => objc.ns(Object.create(null)).count());
-  attempt("date for id", () => list.addObject_(new Date(0)));
+  attempt("map for id", () => list.addObject_(new Map()));
   attempt("NUL in char*", () => NSString.stringWithUTF8String_("a\u0000b"));
   attempt("NUL in SEL", () => list.respondsToSelector_("a\u0000b"));
   attempt("2^60 for Q", () => list.removeObjectAtIndex_(2 ** 60));

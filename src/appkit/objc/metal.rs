@@ -1130,7 +1130,8 @@ objc_methods! { impl MTLBlitCommandEncoder {
 
 // ───────────────────────────── on screen ────────────────────────────────────
 
-/// A `CGColorSpaceRef` this crate holds one reference to, like [`super::CGColor`].
+/// A `CGColorSpaceRef` this crate holds one reference to: `CFRetain`ed on
+/// receipt and released on drop like the object wrappers.
 pub(crate) struct CGColorSpace(NonNull<c_void>);
 
 impl Drop for CGColorSpace {
@@ -1188,8 +1189,7 @@ objc_methods! { impl MTKView {
     pub fn set_framebuffer_only(&self, flag: bool) = "setFramebufferOnly:";
     // pub fn set_presents_with_transaction(&self, flag: bool) = "setPresentsWithTransaction:";
     pub fn set_color_pixel_format(&self, format: PixelFormat) = "setColorPixelFormat:";
-    /// Raw `MTLPixelFormat`.
-    pub fn color_pixel_format(&self) -> usize = "colorPixelFormat";
+    // pub fn color_pixel_format(&self) -> usize = "colorPixelFormat";
     /// `PixelFormat::Invalid` (the default) means no depth texture.
     pub fn set_depth_stencil_pixel_format(&self, format: PixelFormat) = "setDepthStencilPixelFormat:";
     // pub fn depth_stencil_pixel_format(&self) -> usize = "depthStencilPixelFormat";

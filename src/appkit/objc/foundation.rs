@@ -2,6 +2,7 @@
 //! makes them sound. The only raw calls here are the CFString ones in
 //! [`NSString::from_str`] / [`NSString::to_utf16`].
 
+use core::ffi::CStr;
 use core::ptr;
 
 use super::{Bool, CChars, Id, Object, Ptr, Sel, objc_class, objc_global, objc_methods, rt};
@@ -15,16 +16,6 @@ objc_methods! { impl NSObject {
     /// Declared nonnull; nil from a misbehaving override reads as `None` rather than a crash.
     pub fn description(&self) -> Option<NSString> = "description";
 }}
-
-impl NSObject {
-    /// For IMPs that must return an object to AppKit: retains once more and
-    /// autoreleases, so the pointer outlives this wrapper's drop by one pool.
-    pub(crate) fn autorelease_return(&self) -> super::Obj {
-        // SAFETY: self is live; the extra reference taken here is the one the
-        // autorelease pool releases later.
-        unsafe { (rt().objc_autorelease)((rt().objc_retain)(self.as_obj())) }
-    }
-}
 
 pub(crate) trait Upcast: Object {
     /// View any object as `NSObject`.
@@ -148,28 +139,16 @@ impl From<&str> for NSString {
 
 objc_class!(pub struct NSArray: NSObject = "NSArray");
 objc_methods! { impl NSArray {
-    pub fn empty() -> NSArray = "array";
+    // pub fn empty() -> NSArray = "array";
     pub fn count(&self) -> usize = "count";
     /// Raises NSRangeException out of range; callers bounds-check first.
     fn object_at(&self, index: usize) -> NSObject = "objectAtIndex:";
-    /// `NSNotFound` when absent.
-    fn index_of(&self, object: &NSObject) -> usize = "indexOfObject:";
+    // /// `NSNotFound` when absent.
+    // fn index_of(&self, object: &NSObject) -> usize = "indexOfObject:";
     pub fn copy(&self) -> Retained<NSArray> = "copy";
 }}
 
-/// `NSNotFound`.
-const NS_NOT_FOUND: usize = isize::MAX as usize;
-
 impl NSArray {
-    pub(crate) fn get(&self, index: usize) -> Option<NSObject> {
-        (index < self.count()).then(|| self.object_at(index))
-    }
-
-    pub(crate) fn position(&self, object: &NSObject) -> Option<usize> {
-        let i = self.index_of(object);
-        (i != NS_NOT_FOUND).then_some(i)
-    }
-
     /// Iterates a snapshot (`-copy` is an O(1) retain on immutable arrays),
     /// so the loop body may mutate a live array such as `-windows` or
     /// `-constraints`.
@@ -208,6 +187,8 @@ objc_class!(pub struct NSDate: NSObject = "NSDate");
 objc_methods! { impl NSDate {
     pub fn distant_past() -> NSDate = "distantPast";
     pub fn distant_future() -> NSDate = "distantFuture";
+    pub fn with_seconds_since_1970(seconds: f64) -> NSDate = "dateWithTimeIntervalSince1970:";
+    pub fn seconds_since_1970(&self) -> f64 = "timeIntervalSince1970";
     // pub fn seconds_from_now(seconds: f64) -> NSDate = "dateWithTimeIntervalSinceNow:";
 }}
 
@@ -235,57 +216,26 @@ impl NSData {
     }
 }
 
-objc_class!(pub struct NSIndexSet: NSObject = "NSIndexSet");
-objc_methods! { impl NSIndexSet {
-    pub fn count(&self) -> usize = "count";
-    /// `NSNotFound` when empty.
-    fn first_index(&self) -> usize = "firstIndex";
-    /// `NSNotFound` past the last.
-    fn index_greater_than(&self, index: usize) -> usize = "indexGreaterThanIndex:";
-    // pub fn contains(&self, index: usize) -> bool = "containsIndex:";
-}}
-
-impl NSIndexSet {
-    pub(crate) fn to_vec(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(self.count());
-        let mut i = self.first_index();
-        while i != NS_NOT_FOUND {
-            out.push(i);
-            i = self.index_greater_than(i);
-        }
-        out
-    }
-}
-
-objc_class!(pub struct NSMutableIndexSet: NSIndexSet = "NSMutableIndexSet");
-objc_methods! { impl NSMutableIndexSet {
-    pub fn new() -> Retained<NSMutableIndexSet> = "new";
-    pub fn add(&self, index: usize) = "addIndex:";
-}}
-
-impl NSMutableIndexSet {
-    pub(crate) fn from_slice(indexes: &[usize]) -> NSMutableIndexSet {
-        let set = NSMutableIndexSet::new();
-        for &i in indexes {
-            set.add(i);
-        }
-        set
-    }
-}
-
 objc_class!(pub struct NSNumber: NSObject = "NSNumber");
 objc_methods! { impl NSNumber {
     pub fn with_f64(value: f64) -> NSNumber = "numberWithDouble:";
     pub fn with_i64(value: i64) -> NSNumber = "numberWithLongLong:";
     /// The two results are the shared `kCFBooleanTrue` / `kCFBooleanFalse`.
     pub fn with_bool(value: bool) -> NSNumber = "numberWithBool:";
+    pub fn with_u64(value: u64) -> NSNumber = "numberWithUnsignedLongLong:";
     pub fn f64_value(&self) -> f64 = "doubleValue";
+    pub fn i64_value(&self) -> i64 = "longLongValue";
+    pub fn u64_value(&self) -> u64 = "unsignedLongLongValue";
+    /// The C type the number was made from, as one `@encode` character.
+    pub(crate) fn objc_type(&self) -> CChars = "objCType";
 }}
 
 // ───────────────────────────── invocations ─────────────────────────────────
 
 objc_class!(pub struct NSMethodSignature: NSObject = "NSMethodSignature");
 objc_methods! { impl NSMethodSignature {
+    /// nil (or raises) for an encoding it cannot parse.
+    pub(crate) fn with_objc_types(types: &CStr) -> Option<NSMethodSignature> = "signatureWithObjCTypes:";
     /// Counts `self` and `_cmd`.
     pub fn number_of_arguments(&self) -> usize = "numberOfArguments";
     /// Raises out of range; callers stay below `number_of_arguments`.
@@ -303,21 +253,29 @@ objc_methods! { impl NSInvocation {
     pub fn invoke_with_target(&self, target: &NSObject) = "invokeWithTarget:";
     /// Writes `methodReturnLength` bytes to `location`.
     pub(super) fn get_return_value_raw(&self, location: Ptr) = "getReturnValue:";
+    /// Copies the argument at `index` out to `location`, sized by the signature's type there.
+    pub(super) fn get_argument_raw(&self, location: Ptr, index: isize) = "getArgument:atIndex:";
+    /// Copies `methodReturnLength` bytes in from `location`.
+    pub(super) fn set_return_value_raw(&self, location: Ptr) = "setReturnValue:";
+    pub(super) fn selector(&self) -> Option<Sel> = "selector";
+    pub(super) fn method_signature(&self) -> NSMethodSignature = "methodSignature";
 }}
 objc_class!(pub struct NSProcessInfo: NSObject = "NSProcessInfo");
 objc_methods! { impl NSProcessInfo {
     pub fn process_info() -> NSProcessInfo = "processInfo";
-    pub fn process_name(&self) -> NSString = "processName";
+    // pub fn process_name(&self) -> NSString = "processName";
     /// `options` is `NSActivityOptions`; keep the returned token alive for as long as the activity lasts.
     pub fn begin_activity(&self, options: u64, reason: &NSString) -> NSObject = "beginActivityWithOptions:reason:";
     pub fn end_activity(&self, activity: &NSObject) = "endActivity:";
 }}
 
-// objc_class!(pub struct NSException: NSObject = "NSException");
-// objc_methods! { impl NSException {
-//     pub fn name(&self) -> NSString = "name";
-//     pub fn reason(&self) -> Option<NSString> = "reason";
-// }}
+objc_class!(pub struct NSException: NSObject = "NSException");
+objc_methods! { impl NSException {
+    /// Declared nonnull, but `exceptionWithName:nil` makes one without.
+    pub fn name(&self) -> Option<NSString> = "name";
+    pub fn reason(&self) -> Option<NSString> = "reason";
+    pub fn user_info(&self) -> Option<NSDictionary> = "userInfo";
+}}
 
 objc_class!(pub struct NSError: NSObject = "NSError");
 objc_methods! { impl NSError {
@@ -325,9 +283,3 @@ objc_methods! { impl NSError {
     // pub fn code(&self) -> isize = "code";
     // pub fn domain(&self) -> NSString = "domain";
 }}
-
-// objc_class!(pub struct NSURL: NSObject = "NSURL");
-// objc_methods! { impl NSURL {
-// pub fn file_url(path: &NSString) -> NSURL = "fileURLWithPath:";
-// pub fn path(&self) -> Option<NSString> = "path";
-// }}

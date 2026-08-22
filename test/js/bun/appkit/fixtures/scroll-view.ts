@@ -30,7 +30,7 @@ await run(async () => {
   await waitFor(() => wide.frame.width > 2 * scroll.frame.width, "both again");
   emit({ step: "both again", ...widths() });
 
-  // VStack takes top/bottom as aliases of leading/trailing; baseline alignment is HStack-only.
+  // VStack takes top/bottom as aliases of leading/trailing (and reads them back as those); baseline alignment is HStack-only.
   const stack = new VStack();
   stack.align = "bottom";
   let threw: unknown = false;

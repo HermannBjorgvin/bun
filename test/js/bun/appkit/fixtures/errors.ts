@@ -1,4 +1,4 @@
-import { app, Button, Image, Slider, Text, View, VStack, Window } from "bun:appkit";
+import { app, Button, Image, MetalView, Slider, Switch, Text, View, VStack, Window } from "bun:appkit";
 import { emit, run } from "./_util";
 
 function attempt(name: string, f: () => unknown) {
@@ -30,7 +30,9 @@ await run(() => {
 
   attempt("slider.value=string", () => ((slider as any).value = "loud"));
   attempt("text.lineLimit=object", () => ((text as any).lineLimit = { no: true }));
-  attempt("button.kind=bogus", () => ((button as any).kind = "bogus"));
+  attempt("button.bezelStyle=bogus", () => ((button as any).bezelStyle = "bogus"));
+  attempt("button.width=string", () => ((button as any).width = "wide"));
+  attempt("switch.hidden=string", () => new Switch({ hidden: "no" } as any));
   attempt("text.background=badcolor", () => (text.background = "not a colour"));
   attempt("text.background=rgb(nan)", () => (text.background = "rgb(nan,0,0)"));
   attempt("slider.step=-1", () => (slider.step = -1));
@@ -63,7 +65,7 @@ await run(() => {
   attempt("valid props", () => {
     slider.value = 3;
     text.lineLimit = 2;
-    button.kind = "primary";
+    button.bezelStyle = "toolbar";
     text.background = "#ff000080";
   });
 
@@ -93,6 +95,18 @@ await run(() => {
   const before5 = app.windows.length;
   attempt("window width 3e9", () => new Window({ width: 3e9, visible: false }));
   emit({ step: "window width 3e9 leak", leaked: app.windows.length - before5 });
+  // The NSWindow already exists when the content turns out unmountable (its
+  // handle was released): it is closed again, and an onClose given with it
+  // does not run for a window the caller never got.
+  const before6 = app.windows.length;
+  attempt("window released content", () => {
+    const dead = new Text({ text: "gone" });
+    const handle = dead.native as unknown as { release(): void };
+    handle.release();
+    handle.release();
+    new Window({ visible: false, content: dead, onClose: () => emit({ step: "window released content onClose" }) });
+  });
+  emit({ step: "window released content leak", leaked: app.windows.length - before6 });
   attempt("window x 1e15", () => {
     const w = new Window({ visible: false });
     try {
@@ -115,10 +129,11 @@ await run(() => {
     new Window({ restoreName: "bun-appkit-errors-test", visible: false }).close(),
   );
   const closed = new Window({ visible: false });
-  attempt("window create-only after create", () => ((closed as unknown as { resizable: boolean }).resizable = false));
+  attempt("window resizable=string", () => ((closed as any).resizable = "no"));
   closed.close();
   attempt("hide after close", () => closed.hide());
   attempt("title after close", () => (closed.title = "late"));
+  attempt("resizable after close", () => (closed.resizable = false));
   attempt("menu action without colon", () => (app.menu = [{ title: "X", items: [{ title: "Copy", action: "copy" }] }]));
   attempt(
     "menu action outside the standard list",
@@ -128,4 +143,38 @@ await run(() => {
     closed.content = new Text({ text: "late" });
   });
   emit({ step: "content after close state", content: closed.content === null });
+
+  // MetalView's colour is parsed before it reaches the MTKView, so every
+  // shape answers the same with or without a GPU.
+  const metal = new MetalView({ clearColor: "#0000ff", running: false });
+  attempt("metal.clearColor=number", () => ((metal as any).clearColor = 3));
+  attempt("metal.clearColor=bogus", () => (metal.clearColor = "bogus"));
+  attempt("metal.clearColor=rgb(nan)", () => (metal.clearColor = "rgb(nan, 0, 0)"));
+  const afterRejected = metal.clearColor;
+  attempt("metal.running=string", () => ((metal as any).running = "yes"));
+  attempt("metal.preferredFPS=string", () => ((metal as any).preferredFPS = "fast"));
+  attempt("metal.onFrame=number", () => ((metal as any).onFrame = 42));
+  const accepted: Record<string, unknown> = {};
+  for (const value of ["red", " windowBackground ", "rgba(0, 0, 255, 0.5)", "#fff", null]) {
+    metal.clearColor = value as string;
+    accepted[String(value)] = metal.clearColor;
+  }
+  metal.running = null as never;
+  metal.preferredFPS = 30;
+  emit({
+    step: "metal props",
+    afterRejected,
+    accepted,
+    running: metal.running,
+    preferredFPS: metal.preferredFPS,
+    onFrame: metal.onFrame,
+    unknown: (() => {
+      try {
+        new MetalView({ colour: "red" } as any);
+        return "constructed";
+      } catch (e) {
+        return String((e as Error).message);
+      }
+    })(),
+  });
 });

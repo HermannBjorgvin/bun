@@ -15,6 +15,7 @@ function attempt(name: string, f: () => unknown) {
       isTypeError: err instanceof TypeError,
       isRangeError: err instanceof RangeError,
       message: String(err?.message),
+      code: (err as { code?: unknown })?.code,
     });
   }
 }
@@ -131,6 +132,15 @@ await run(() => {
       step: "two vertex buffers",
       center: Array.from(px.subarray(((size / 2) * size + size / 2) * 4, ((size / 2) * size + size / 2) * 4 + 4)),
     });
+    // `clear` as a colour string clears like the array form.
+    {
+      const cornerAfter = (clear: string) => {
+        gpu.frame().renderPass({ color: target, clear }).end().commitAndWait();
+        return Array.from(target.readPixels().subarray(0, 4));
+      };
+      emit({ step: "string clear", red: cornerAfter("#ff0000"), white: cornerAfter("white") });
+      attempt("bad clear string", () => gpu.frame().renderPass({ color: target, clear: "nope" }));
+    }
     attempt("attribute described twice", () =>
       gpu.renderPipeline({
         vertex: lib2.function("vs_in"),

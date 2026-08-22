@@ -195,6 +195,26 @@ await run(async () => {
     emit({ step: "grow", centred, ratio, nested });
   }
 
+  // In a filling VStack a hidden child lets go of the stack's width and takes
+  // it back when shown, with one fill constraint again however often it is set.
+  {
+    const wide = new Text({ text: "a label wide enough to matter here" });
+    const short = new Text({ text: "short" });
+    const column = new VStack({ children: [wide, short] });
+    const widths = inWindow(column, { width: 320, height: 80 }, () => {
+      const shown = [wide.frame.width, short.frame.width];
+      const constraints = [column.native.constraints().count()];
+      short.hidden = true;
+      const whileHidden = wide.frame.width;
+      short.hidden = false;
+      short.hidden = false;
+      const reshown = [wide.frame.width, short.frame.width];
+      constraints.push(column.native.constraints().count());
+      return { shown, whileHidden, reshown, constraints };
+    });
+    emit({ step: "fill hidden", ...widths });
+  }
+
   // In a SplitView the pane with `grow` is the one that absorbs a resize.
   {
     const still = new VStack({ children: [new Text({ text: "left" })] });

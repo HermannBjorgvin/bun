@@ -8,9 +8,8 @@ describe.concurrent("node-module-module", () => {
   test("builtinModules exists", () => {
     expect(Array.isArray(builtinModules)).toBe(true);
     // "bun:wrap" is no longer listed: it is internal transpiler plumbing,
-    // not a requireable public module. "bun:appkit" and "bun:appkit/react"
-    // exist on macOS only.
-    expect(builtinModules).toHaveLength(process.platform === "darwin" ? 78 : 76);
+    // not a requireable public module. "bun:appkit" exists on macOS only.
+    expect(builtinModules).toHaveLength(process.platform === "darwin" ? 77 : 76);
   });
 
   test("isBuiltin() works", () => {

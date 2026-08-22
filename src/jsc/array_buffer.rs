@@ -378,7 +378,9 @@ impl ArrayBuffer {
                 // fat raw pointer — no need to round-trip through
                 // `from_raw_parts_mut(as_mut_ptr(), len)`.
                 let owned = unsafe { bun_core::heap::take(ptr::from_mut(bytes)) };
-                jsc::JSUint8Array::from_bytes(global, owned)
+                crate::HostReturn::or_pending_exception(jsc::JSUint8Array::from_bytes(
+                    global, owned,
+                ))
             }
             _ => unreachable!("Not implemented yet"),
         }

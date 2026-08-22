@@ -7,7 +7,6 @@ use std::rc::Rc;
 use bun_core::Timespec;
 use bun_uws_sys::Loop;
 
-use crate::menu::{self, MenuBar};
 use crate::objc::appkit::{NSApplication, NSRunningApplication, NSScreen};
 use crate::objc::foundation::{NSObject, NSProcessInfo, NSString};
 use crate::objc::{self, AppEvents, AutoreleasePool, Delegate};
@@ -63,10 +62,12 @@ pub struct LoopHooks {
 pub trait AppSink {
     /// The user asked to quit. Return false to veto.
     fn before_quit(&self) -> bool;
-    /// A quit that `before_quit` allowed and no window's `should_close`
-    /// refused; every window is closed by now. This runs inside AppKit event
-    /// dispatch, so record the request and end the process from
-    /// [`LoopHooks::exit_if_requested`].
+    /// A quit that `before_quit` allowed: ask every open window whether it
+    /// may close and close those that agree. Return false if one refused.
+    fn close_all(&self) -> bool;
+    /// A quit that `before_quit` allowed and no window refused; every window
+    /// is closed by now. This runs inside AppKit event dispatch, so record
+    /// the request and end the process from [`LoopHooks::exit_if_requested`].
     fn quit(&self);
     /// AppKit is terminating the process now (`applicationWillTerminate:`,
     /// after an accepted Quit menu item, Dock Quit or logout) and calls
@@ -75,24 +76,21 @@ pub trait AppSink {
     /// The Dock icon was clicked while the app was running; `has_visible_windows` as AppKit
     /// reports it.
     fn reopened(&self, has_visible_windows: bool);
-    /// A menu item built with [`menu::Action::Callback`] was chosen.
-    fn menu_item(&self, id: u32);
 }
 
 /// The process-wide application object. Lives for the rest of the process
-/// once [`App::start`] succeeds.
+/// once [`App::start`] succeeds. The menu bar is JavaScript's, built through
+/// the bridge once this has started.
 pub struct App {
     nsapp: NSApplication,
-    delegate: Delegate<dyn AppEvents>,
-    name: RefCell<String>,
+    _delegate: Delegate<dyn AppEvents>,
     sink: RefCell<Option<Rc<dyn AppSink>>>,
-    menu_bar: RefCell<MenuBar>,
     /// Inside our own `-[NSApplication run]` during start-up.
     launching: Cell<bool>,
     /// A quit got past every veto; later requests are no-ops.
     quitting: Cell<bool>,
-    /// The `NSProcessInfo` activity that keeps App Nap off while a window is
-    /// open or the embedder asked to stay responsive; see [`App::set_responsive`].
+    /// The `NSProcessInfo` activity that keeps App Nap off while the
+    /// embedder asks to stay responsive; see [`App::set_responsive`].
     activity: RefCell<Option<NSObject>>,
 }
 
@@ -106,8 +104,7 @@ impl App {
     /// `loop_` is this thread's usockets loop; its idle wait is routed through
     /// AppKit from now on, with `hooks` keeping the embedder's side of it
     /// running. `hooks` and `policy` only apply on the first call. Nothing is
-    /// activated: the first `Window::show`, `Window::focus` or
-    /// [`App::activate`] does that.
+    /// activated until [`App::activate`].
     pub fn start(
         loop_: &mut Loop,
         hooks: LoopHooks,
@@ -135,16 +132,10 @@ impl App {
         let delegate = Delegate::app(Box::new(Handler));
         nsapp.set_delegate(Some(delegate.as_nsobject()));
 
-        let name = process_name();
-        let menu_bar = MenuBar::standard(&nsapp, delegate.as_nsobject(), &name);
-        nsapp.set_main_menu(Some(menu_bar.nsmenu()));
-
         let app: &'static App = Box::leak(Box::new(App {
             nsapp,
-            delegate,
-            name: RefCell::new(name),
+            _delegate: delegate,
             sink: RefCell::new(None),
-            menu_bar: RefCell::new(menu_bar),
             launching: Cell::new(false),
             quitting: Cell::new(false),
             activity: RefCell::new(None),
@@ -153,7 +144,7 @@ impl App {
 
         if launched {
             run_loop::poll();
-        } else if app.has_display() {
+        } else if has_display() {
             // `-run` performs the launch sequence an unbundled process
             // otherwise never gets (menu bar activation, `isRunning`). The
             // delegate stops it from `applicationDidFinishLaunching:` so it
@@ -184,30 +175,6 @@ impl App {
         *self.sink.borrow_mut() = Some(Rc::from(sink));
     }
 
-    pub fn name(&self) -> String {
-        self.name.borrow().clone()
-    }
-
-    /// The name used in the default menus ("About <name>", "Quit <name>"). `None` restores the
-    /// process name.
-    pub fn set_name(&self, name: Option<&str>) {
-        *self.name.borrow_mut() = name.map_or_else(process_name, str::to_owned);
-        if !self.menu_bar.borrow().is_custom() {
-            self.set_menu(None);
-        }
-    }
-
-    /// Replaces the menu bar. `None` installs the standard App/Edit/View/Window menus.
-    pub fn set_menu(&self, spec: Option<&[menu::Menu]>) {
-        let delegate = self.delegate.as_nsobject();
-        let bar = match spec {
-            Some(menus) => MenuBar::custom(delegate, menus),
-            None => MenuBar::standard(&self.nsapp, delegate, &self.name.borrow()),
-        };
-        self.nsapp.set_main_menu(Some(bar.nsmenu()));
-        *self.menu_bar.borrow_mut() = bar;
-    }
-
     pub fn set_activation_policy(&self, policy: ActivationPolicy) -> Result<()> {
         if self.nsapp.set_activation_policy(policy.into()) {
             Ok(())
@@ -223,10 +190,6 @@ impl App {
 
     pub fn hide(&self) {
         self.nsapp.hide(None);
-    }
-
-    pub fn unhide(&self) {
-        self.nsapp.unhide(None);
     }
 
     /// Text on the Dock tile; empty clears it.
@@ -265,22 +228,19 @@ impl App {
     }
 
     /// The one entry point for Cmd-Q, the Quit menu item, the Dock's Quit, a
-    /// logout and `app.quit()`. The sink's `before_quit` can veto; then every
-    /// window this crate created that is still open (on screen, hidden or
-    /// minimized) is asked through its `should_close`, and those that agree
-    /// close. If none refused, the sink's `quit` is told to end the process
-    /// and this returns true; once that has happened further calls return
-    /// true without asking again.
+    /// logout and `app.quit()`. The sink's `before_quit` can veto; then its
+    /// `close_all` asks every open window and closes those that agree. If
+    /// none refused, the sink's `quit` is told to end the process and this
+    /// returns true; once that has happened further calls return true
+    /// without asking again.
     pub fn request_quit(&self) -> bool {
         if self.quitting.get() {
             return true;
         }
         let sink = self.sink();
-        if sink.as_ref().is_some_and(|sink| !sink.before_quit()) {
-            return false;
-        }
-        let _pool = AutoreleasePool::new();
-        if !crate::window::close_all() {
+        if let Some(sink) = &sink
+            && !(sink.before_quit() && sink.close_all())
+        {
             return false;
         }
         self.quitting.set(true);
@@ -288,11 +248,6 @@ impl App {
             sink.quit();
         }
         true
-    }
-
-    /// Whether a quit has been accepted and the process is on its way out.
-    pub fn is_quitting(&self) -> bool {
-        self.quitting.get()
     }
 
     /// `-[NSApplication terminate:]`, what the Quit menu item, the Dock and a
@@ -308,18 +263,11 @@ impl App {
         run_loop::after(seconds, f);
     }
 
-    /// Whether any screen is attached. False over ssh, in launchd daemons and
-    /// in sandboxes; windows still work there but are never composited.
-    pub fn has_display(&self) -> bool {
-        NSScreen::screens().count() > 0
-    }
-
-    /// [`App::has_display`] without starting the application: loads the
+    /// [`has_display`] without starting the application: loads the
     /// frameworks if needed and asks `NSScreen`.
     pub fn query_display() -> Result<bool> {
         objc::load()?;
-        let _pool = AutoreleasePool::new();
-        Ok(NSScreen::screens().count() > 0)
+        Ok(has_display())
     }
 
     /// Cloned out so no `RefCell` borrow is held while the sink runs JS.
@@ -328,11 +276,13 @@ impl App {
     }
 }
 
-/// `-[NSProcessInfo processName]`, the name AppKit itself falls back to.
-fn process_name() -> String {
-    NSProcessInfo::process_info()
-        .process_name()
-        .to_string_lossy()
+/// Whether any screen is attached. False over ssh, in launchd daemons and
+/// in sandboxes; windows still work there but are never composited. Views
+/// are built before `App::start` as often as after, so this asks AppKit
+/// directly rather than the app; the frameworks must be loaded.
+pub(crate) fn has_display() -> bool {
+    let _pool = AutoreleasePool::new();
+    NSScreen::screens().count() > 0
 }
 
 struct Handler;
@@ -362,12 +312,6 @@ impl AppEvents for Handler {
     fn reopened(&self, has_visible_windows: bool) {
         if let Some(sink) = App::get().and_then(App::sink) {
             sink.reopened(has_visible_windows);
-        }
-    }
-
-    fn menu_item(&self, id: u32) {
-        if let Some(sink) = App::get().and_then(App::sink) {
-            sink.menu_item(id);
         }
     }
 }

@@ -17,7 +17,11 @@
 //! `setTimeout` armed there still ends the wait on time. While AppKit runs a
 //! tracking loop of its own inside `sendEvent:` (an open menu, a live resize)
 //! the wake event just queues; Bun's timers and I/O resume when the gesture
-//! ends. Bun's loop is never re-entered from in here.
+//! ends. A nested loop that takes every event (a modal session begun from
+//! JavaScript running inside the wait) consumes the wake instead, so while a
+//! posted wake has not come back the deadline timer re-posts it every
+//! [`WAKE_RECHECK`] seconds, and the wait ends once that loop does. Bun's
+//! loop is never re-entered from in here.
 //!
 //! The loop sweeps this thread's allocator inline before calling `park_cb`,
 //! and hands it to the scavenger only after it returns, because all of the
@@ -65,6 +69,12 @@ const EVENTS_PER_PARK: u32 = 16;
 const NEVER: f64 = 1.0e12;
 /// Seconds; see [`Park::arm_within`].
 const REARM_SLACK: f64 = 0.000_25;
+/// Seconds between fresh wake events while a posted one has not come back
+/// to `pump` (see the module comment).
+const WAKE_RECHECK: Timespec = Timespec {
+    sec: 0,
+    nsec: 100_000_000,
+};
 
 struct Park {
     app: NSApplication,
@@ -253,6 +263,11 @@ unsafe extern "C" fn on_deadline(_timer: *mut c_void, _info: *mut c_void) {
     if let Some(park) = park() {
         park.armed.set(NEVER);
         if park.in_pump.get() {
+            // A wake posted earlier that `pump` has still not seen is either
+            // queued behind a tracking loop's narrower mask (another joins it
+            // and is skipped as stale later) or was consumed by a nested loop
+            // that takes every event; post afresh either way.
+            park.woke.set(false);
             wake();
         }
     }
@@ -264,9 +279,14 @@ unsafe extern "C" fn on_deadline(_timer: *mut c_void, _info: *mut c_void) {
 /// for; ask, and bring the deadline in to match.
 unsafe extern "C" fn before_waiting(_o: *mut c_void, _activity: usize, _info: *mut c_void) {
     let Some(park) = park() else { return };
-    // A wake already queued ends the wait as soon as AppKit dequeues it;
-    // re-arming for "now" until then would only spin a tracking loop.
-    if !park.in_pump.get() || park.woke.get() {
+    if !park.in_pump.get() {
+        return;
+    }
+    // A wake already posted ends the wait as soon as `pump` dequeues it;
+    // re-arming for "now" until then would only spin a tracking loop. But
+    // the loop about to sleep may have consumed it, so look again later.
+    if park.woke.get() {
+        park.arm_within(&WAKE_RECHECK);
         return;
     }
     if let Some(due) = (park.hooks.next_due)() {

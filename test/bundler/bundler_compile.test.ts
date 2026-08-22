@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { rmSync } from "fs";
-import { bunEnv, bunExe, isWindows, tempDir } from "harness";
+import { bunEnv, bunExe, isMacOS, isWindows, tempDir } from "harness";
 import { join } from "path";
 import { BundlerTestInput, itBundled as itBundledBase } from "./expectBundled";
 
@@ -662,6 +662,38 @@ describe("bundler", () => {
       `,
     },
     run: { stdout: "ok" },
+  });
+
+  // bun:appkit is a builtin on macOS only; a compiled executable carries it
+  // like bun:sqlite, and the Objective-C bridge works from it without the
+  // application started.
+  itBundled("compile/BunAppKitObjC", {
+    todo: !isMacOS,
+    compile: true,
+    files: {
+      "/entry.ts": `
+        import { objc } from "bun:appkit";
+        const { NSString, NSMutableArray } = objc.classes;
+        const list = NSMutableArray.new();
+        list.addObject_(NSString.stringWithString_("compiled"));
+        list.addObject_(objc.ns(42));
+        console.log(JSON.stringify(objc.js(list)), typeof Bun.AppKit.Window);
+      `,
+    },
+    run: { stdout: '["compiled",42] function' },
+  });
+  itBundled("compile/BunAppKitCrossTargetKeepsSpecifier", {
+    target: "bun",
+    outdir: "/out",
+    files: {
+      "/entry.ts": `
+        import { objc } from "bun:appkit";
+        console.log(typeof objc);
+      `,
+    },
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.js").toContain('"bun:appkit"');
+    },
   });
 
   const additionalOptionsIters: Array<{

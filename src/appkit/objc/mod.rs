@@ -33,15 +33,19 @@ use std::sync::OnceLock;
 use crate::error::{Error, Result};
 
 pub(crate) mod appkit;
+pub mod block;
 mod define;
 pub(crate) mod delegate;
 pub mod dynamic;
 pub(crate) mod foundation;
+pub mod handoff;
 pub(crate) mod metal;
+pub mod script;
+mod sdk;
 
 pub(crate) use define::Delegate;
 use define::{ClassBuilder, DelegateClass, This};
-pub(crate) use delegate::{AppEvents, ControlEvents, MetalViewEvents, WindowEvents};
+pub(crate) use delegate::{AppEvents, MetalViewEvents};
 pub use dynamic::{DynClass, DynObject, DynValue};
 pub use foundation::NsStr;
 
@@ -122,7 +126,6 @@ encode! {
     crate::geometry::Point => "{CGPoint=dd}",
     crate::geometry::Size => "{CGSize=dd}",
     crate::geometry::Rect => "{CGRect={CGPoint=dd}{CGSize=dd}}",
-    crate::geometry::Insets => "{NSEdgeInsets=dddd}",
     crate::geometry::Range => "{_NSRange=QQ}",
     crate::geometry::ClearColor => "{MTLClearColor=dddd}",
     crate::geometry::Origin3 => "{MTLOrigin=QQQ}",
@@ -409,7 +412,6 @@ plain_abi!(
     crate::geometry::Point,
     crate::geometry::Size,
     crate::geometry::Rect,
-    crate::geometry::Insets,
     crate::geometry::Range,
     crate::geometry::ClearColor,
     crate::geometry::Origin3,
@@ -432,32 +434,10 @@ macro_rules! enum_abi {
 }
 enum_abi!(
     isize => [
-        appkit::LayoutAttribute,
-        appkit::LayoutRelation,
         appkit::Orientation,
-        appkit::WindowOrderingMode,
-        appkit::TextAlignment,
-        appkit::StackDistribution,
-        appkit::SplitViewDividerStyle,
-        appkit::ControlStateValue,
-        appkit::SegmentDistribution,
-        appkit::WindowTitleVisibility,
         appkit::ActivationPolicy,
     ],
     usize => [
-        appkit::ImageScaling,
-        appkit::LineBreakMode,
-        appkit::BoxType,
-        appkit::TitlePosition,
-        appkit::BorderType,
-        appkit::BezelStyle,
-        appkit::CellImagePosition,
-        appkit::ProgressIndicatorStyle,
-        appkit::ControlSize,
-        appkit::ColumnAutoresizingStyle,
-        appkit::SegmentSwitchTracking,
-        appkit::BackingStoreType,
-        appkit::BitmapImageFileType,
         metal::PixelFormat,
         metal::PrimitiveType,
         metal::LoadAction,
@@ -609,6 +589,16 @@ unsafe impl Arg for Option<Sel> {
         self.map_or(ptr::null_mut(), |s| s.0.as_ptr())
     }
 }
+// SAFETY: SEL or NULL.
+unsafe impl Ret for Option<Sel> {
+    type Raw = *mut c_void;
+    const ENCODING: &'static str = <Sel as Encode>::ENCODING;
+    type Out = Option<Sel>;
+    #[inline]
+    unsafe fn from_raw(raw: *mut c_void, _: &'static str) -> Option<Sel> {
+        NonNull::new(raw).map(Sel)
+    }
+}
 // SAFETY: an object pointer, kept alive by the borrow for the call.
 unsafe impl<T: Object> Arg for &T {
     type Raw = Obj;
@@ -700,6 +690,17 @@ unsafe impl<T: Object> Ret for Retained<Option<T>> {
     }
 }
 
+/// A `const char *` parameter (`signatureWithObjCTypes:`).
+// SAFETY: passed as a pointer to a NUL-terminated string that outlives the call.
+unsafe impl Arg for &CStr {
+    type Raw = *const c_char;
+    const ENCODING: &'static str = "*";
+    #[inline]
+    fn to_raw(&self) -> *const c_char {
+        self.as_ptr()
+    }
+}
+
 /// A raw pointer for the few C-pointer parameters and returns (`-bytes`,
 /// `dataWithBytes:length:`). The field is private to this module, so typed
 /// code elsewhere cannot make one; the bindings that take or return it are
@@ -748,42 +749,6 @@ unsafe impl Ret for CChars {
                 .to_string_lossy()
                 .into_owned(),
         ))
-    }
-}
-
-/// A `CGColorRef` this crate holds one reference to. `-[NSColor CGColor]`
-/// hands back an object owned by the current autorelease pool, so it is
-/// `CFRetain`ed on receipt and released on drop like the object wrappers.
-pub(crate) struct CGColor(NonNull<c_void>);
-
-impl Drop for CGColor {
-    fn drop(&mut self) {
-        // SAFETY: we own the reference `from_raw` took.
-        unsafe { (rt().cf.CFRelease)(self.0.as_ptr()) };
-    }
-}
-// SAFETY: `CGColorRef` return, +0.
-unsafe impl Ret for CGColor {
-    type Raw = *const c_void;
-    const ENCODING: &'static str = "^{CGColor=}";
-    type Out = CGColor;
-    #[inline]
-    unsafe fn from_raw(raw: *const c_void, binding: &'static str) -> CGColor {
-        let Some(color) = NonNull::new(raw.cast_mut()) else {
-            nil_from_nonnull(binding, "+0")
-        };
-        // SAFETY: a live CF object just returned to us on this thread.
-        unsafe { (rt().cf.CFRetain)(color.as_ptr()) };
-        CGColor(color)
-    }
-}
-// SAFETY: a `CGColorRef` (kept alive by `self` for the call) or NULL.
-unsafe impl Arg for Option<CGColor> {
-    type Raw = *const c_void;
-    const ENCODING: &'static str = "^{CGColor=}";
-    #[inline]
-    fn to_raw(&self) -> *const c_void {
-        self.as_ref().map_or(ptr::null(), |c| c.0.as_ptr())
     }
 }
 
@@ -862,20 +827,40 @@ pub(crate) struct Runtime {
     sel_getName: unsafe extern "C" fn(Sel) -> *const c_char,
     objc_allocateClassPair: unsafe extern "C" fn(Obj, *const c_char, usize) -> Obj,
     objc_registerClassPair: unsafe extern "C" fn(Obj),
+    objc_disposeClassPair: unsafe extern "C" fn(Obj),
+    /// The IMP that enters the forwarding machinery (`forwardInvocation:`).
+    _objc_msgForward: *const c_void,
+    #[cfg(target_arch = "x86_64")]
+    _objc_msgForward_stret: *const c_void,
     class_addMethod: unsafe extern "C" fn(Obj, Sel, *const c_void, *const c_char) -> Bool,
     class_addIvar: unsafe extern "C" fn(Obj, *const c_char, usize, u8, *const c_char) -> Bool,
     class_addProtocol: unsafe extern "C" fn(Obj, Obj) -> Bool,
     class_getInstanceVariable: unsafe extern "C" fn(Obj, *const c_char) -> *mut c_void,
     class_getInstanceMethod: unsafe extern "C" fn(Obj, Sel) -> *mut c_void,
     class_getClassMethod: unsafe extern "C" fn(Obj, Sel) -> *mut c_void,
+    class_getMethodImplementation: unsafe extern "C" fn(Obj, Sel) -> *const c_void,
+    imp_implementationWithBlock: unsafe extern "C" fn(*const c_void) -> *const c_void,
     class_getSuperclass: unsafe extern "C" fn(Obj) -> Obj,
     class_getName: unsafe extern "C" fn(Obj) -> *const c_char,
     object_getClass: unsafe extern "C" fn(Obj) -> Obj,
     object_isClass: unsafe extern "C" fn(Obj) -> Bool,
     ivar_getOffset: unsafe extern "C" fn(*mut c_void) -> isize,
     method_getTypeEncoding: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    method_getName: unsafe extern "C" fn(*mut c_void) -> Sel,
+    class_copyMethodList: unsafe extern "C" fn(Obj, *mut u32) -> *mut *mut c_void,
     protocol_getMethodDescription: unsafe extern "C" fn(Obj, Sel, Bool, Bool) -> MethodDescription,
+    protocol_copyMethodDescriptionList:
+        unsafe extern "C" fn(Obj, Bool, Bool, *mut u32) -> *mut MethodDescription,
     objc_copyClassList: unsafe extern "C" fn(*mut u32) -> *mut Obj,
+    objc_copyProtocolList: unsafe extern "C" fn(*mut u32) -> *mut Obj,
+    protocol_getName: unsafe extern "C" fn(Obj) -> *const c_char,
+    objc_allocateProtocol: unsafe extern "C" fn(*const c_char) -> Obj,
+    objc_registerProtocol: unsafe extern "C" fn(Obj),
+    protocol_addMethodDescription: unsafe extern "C" fn(Obj, Sel, *const c_char, Bool, Bool),
+    protocol_addProtocol: unsafe extern "C" fn(Obj, Obj),
+    class_getProperty: unsafe extern "C" fn(Obj, *const c_char) -> *mut c_void,
+    property_getAttributes: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    objc_setAssociatedObject: unsafe extern "C" fn(Obj, *const c_void, Obj, usize),
     pub(crate) cf: CoreFoundation,
     /// The AppKit `dlopen` handle (which brings Foundation), for [`FrameworkGlobal`].
     frameworks: *mut c_void,
@@ -887,6 +872,7 @@ pub(crate) struct Runtime {
 pub(crate) struct CoreFoundation {
     pub CFRetain: unsafe extern "C" fn(*const c_void) -> *const c_void,
     pub CFRelease: unsafe extern "C" fn(*const c_void),
+    pub CFGetTypeID: unsafe extern "C" fn(*const c_void) -> usize,
     pub CFStringCreateWithBytes:
         unsafe extern "C" fn(*const c_void, *const u8, isize, u32, Bool) -> Obj,
     pub CFStringCreateWithCharacters: unsafe extern "C" fn(*const c_void, *const u16, isize) -> Obj,
@@ -1120,23 +1106,45 @@ impl Runtime {
                 sel_getName: sym!(objc, c"sel_getName"),
                 objc_allocateClassPair: sym!(objc, c"objc_allocateClassPair"),
                 objc_registerClassPair: sym!(objc, c"objc_registerClassPair"),
+                objc_disposeClassPair: sym!(objc, c"objc_disposeClassPair"),
+                _objc_msgForward: addr(objc, c"_objc_msgForward")?.cast_const(),
+                #[cfg(target_arch = "x86_64")]
+                _objc_msgForward_stret: addr(objc, c"_objc_msgForward_stret")?.cast_const(),
                 class_addMethod: sym!(objc, c"class_addMethod"),
                 class_addIvar: sym!(objc, c"class_addIvar"),
                 class_addProtocol: sym!(objc, c"class_addProtocol"),
                 class_getInstanceVariable: sym!(objc, c"class_getInstanceVariable"),
                 class_getInstanceMethod: sym!(objc, c"class_getInstanceMethod"),
                 class_getClassMethod: sym!(objc, c"class_getClassMethod"),
+                class_getMethodImplementation: sym!(objc, c"class_getMethodImplementation"),
+                imp_implementationWithBlock: sym!(objc, c"imp_implementationWithBlock"),
                 class_getSuperclass: sym!(objc, c"class_getSuperclass"),
                 class_getName: sym!(objc, c"class_getName"),
                 object_getClass: sym!(objc, c"object_getClass"),
                 object_isClass: sym!(objc, c"object_isClass"),
                 ivar_getOffset: sym!(objc, c"ivar_getOffset"),
                 method_getTypeEncoding: sym!(objc, c"method_getTypeEncoding"),
+                method_getName: sym!(objc, c"method_getName"),
+                class_copyMethodList: sym!(objc, c"class_copyMethodList"),
                 protocol_getMethodDescription: sym!(objc, c"protocol_getMethodDescription"),
+                protocol_copyMethodDescriptionList: sym!(
+                    objc,
+                    c"protocol_copyMethodDescriptionList"
+                ),
                 objc_copyClassList: sym!(objc, c"objc_copyClassList"),
+                objc_copyProtocolList: sym!(objc, c"objc_copyProtocolList"),
+                protocol_getName: sym!(objc, c"protocol_getName"),
+                objc_allocateProtocol: sym!(objc, c"objc_allocateProtocol"),
+                objc_registerProtocol: sym!(objc, c"objc_registerProtocol"),
+                protocol_addMethodDescription: sym!(objc, c"protocol_addMethodDescription"),
+                protocol_addProtocol: sym!(objc, c"protocol_addProtocol"),
+                class_getProperty: sym!(objc, c"class_getProperty"),
+                property_getAttributes: sym!(objc, c"property_getAttributes"),
+                objc_setAssociatedObject: sym!(objc, c"objc_setAssociatedObject"),
                 cf: CoreFoundation {
                     CFRetain: sym!(appkit, c"CFRetain"),
                     CFRelease: sym!(appkit, c"CFRelease"),
+                    CFGetTypeID: sym!(appkit, c"CFGetTypeID"),
                     CFStringCreateWithBytes: sym!(appkit, c"CFStringCreateWithBytes"),
                     CFStringCreateWithCharacters: sym!(appkit, c"CFStringCreateWithCharacters"),
                     CFStringGetLength: sym!(appkit, c"CFStringGetLength"),
@@ -1202,9 +1210,40 @@ impl Runtime {
             .into_owned()
     }
 
+    /// The `Protocol` object for `name`: the one a loaded framework
+    /// registered, else one registered here from [`sdk::PROTOCOLS`] (with
+    /// the protocols it incorporates) for a protocol the headers declare
+    /// but no framework's code names, which is what makes clang emit it.
     fn protocol(&self, name: &CStr) -> Option<NonNull<c_void>> {
         // SAFETY: NUL-terminated name.
-        NonNull::new(unsafe { (self.objc_getProtocol)(name.as_ptr()) })
+        if let Some(p) = NonNull::new(unsafe { (self.objc_getProtocol)(name.as_ptr()) }) {
+            return Some(p);
+        }
+        let at = sdk::PROTOCOLS.binary_search_by(|p| p.name.cmp(name)).ok()?;
+        let described = &sdk::PROTOCOLS[at];
+        // SAFETY: a fresh protocol under construction until registered; the
+        // names, selectors and type strings are static; an incorporated
+        // protocol is registered (by a framework or, recursively, here)
+        // before it is added.
+        unsafe {
+            let p = NonNull::new((self.objc_allocateProtocol)(name.as_ptr()))?;
+            for adopted in described.adopts {
+                if let Some(a) = self.protocol(adopted) {
+                    (self.protocol_addProtocol)(p.as_ptr(), a.as_ptr());
+                }
+            }
+            for &(sel, types, required, instance) in described.methods {
+                (self.protocol_addMethodDescription)(
+                    p.as_ptr(),
+                    register_sel(sel),
+                    types.as_ptr(),
+                    Bool::new(required),
+                    Bool::new(instance),
+                );
+            }
+            (self.objc_registerProtocol)(p.as_ptr());
+            Some(p)
+        }
     }
 
     /// The type encoding `protocol` declares for instance method `sel`
@@ -1224,23 +1263,203 @@ impl Runtime {
         })
     }
 
+    /// Every protocol any loaded image registers that declares instance
+    /// method `sel`, as (protocol name, type encoding).
+    fn protocols_declaring(&self, sel: Sel) -> Vec<(String, String)> {
+        let mut count: u32 = 0;
+        // SAFETY: the result is NULL or a malloc'd array of `count` live
+        // Protocol objects, ours to free; their names are static C strings.
+        unsafe {
+            let list = (self.objc_copyProtocolList)(&raw mut count);
+            if list.is_null() {
+                return Vec::new();
+            }
+            let found = core::slice::from_raw_parts(list, count as usize)
+                .iter()
+                .filter_map(|&p| {
+                    let types = self.protocol_method_types(NonNull::new(p)?, sel)?;
+                    let name = CStr::from_ptr((self.protocol_getName)(p))
+                        .to_string_lossy()
+                        .into_owned();
+                    Some((name, types))
+                })
+                .collect();
+            libc::free(list.cast());
+            found
+        }
+    }
+
+    /// The instance methods `protocol` itself marks `@required`.
+    fn protocol_required_methods(&self, protocol: NonNull<c_void>) -> Vec<Sel> {
+        let mut count: u32 = 0;
+        // SAFETY: a live Protocol; the result is NULL or a malloc'd array of
+        // `count` descriptions whose `name` is a registered selector, ours to free.
+        unsafe {
+            let list = (self.protocol_copyMethodDescriptionList)(
+                protocol.as_ptr(),
+                Bool::YES,
+                Bool::YES,
+                &raw mut count,
+            );
+            if list.is_null() {
+                return Vec::new();
+            }
+            let sels = core::slice::from_raw_parts(list, count as usize)
+                .iter()
+                .filter_map(|d| NonNull::new(d.name).map(Sel))
+                .collect();
+            libc::free(list.cast());
+            sels
+        }
+    }
+
+    /// The attribute string (`T@"<NSTextDelegate>",W,N,V_delegate`) of the
+    /// `@property` named `name` that `cls` or an ancestor declares.
+    fn property_attributes(&self, cls: Class, name: &CStr) -> Option<String> {
+        // SAFETY: a registered class and a NUL-terminated name; the result
+        // is NULL or a property whose attribute string is a static C string.
+        unsafe {
+            let property = (self.class_getProperty)(cls.as_obj(), name.as_ptr());
+            if property.is_null() {
+                return None;
+            }
+            let attributes = (self.property_getAttributes)(property);
+            (!attributes.is_null())
+                .then(|| CStr::from_ptr(attributes).to_string_lossy().into_owned())
+        }
+    }
+
+    /// Makes `owner` hold a reference to `value` under `key` until it is
+    /// given another value (or nil) for that key or deallocates.
+    ///
+    /// # Safety
+    /// `owner` is a live object and `value` is nil or a live object.
+    unsafe fn associate_retained(&self, owner: Obj, key: *const c_void, value: Obj) {
+        const OBJC_ASSOCIATION_RETAIN_NONATOMIC: usize = 1;
+        // SAFETY: per contract.
+        unsafe {
+            (self.objc_setAssociatedObject)(owner, key, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        }
+    }
+
+    /// Every class registered with the runtime right now, without messaging
+    /// any of them.
+    fn class_list(&self) -> Vec<Class> {
+        // SAFETY: `objc_copyClassList` returns NULL or a malloc'd array of
+        // `count` classes that we free after copying.
+        unsafe {
+            let mut count = 0u32;
+            let list = (self.objc_copyClassList)(&raw mut count);
+            if list.is_null() {
+                return Vec::new();
+            }
+            let out = (0..count as usize)
+                .filter_map(|i| NonNull::new(*list.add(i)).map(Class))
+                .collect();
+            libc::free(list.cast());
+            out
+        }
+    }
+
+    /// Whether `cls` is `ancestor` or has it up its superclass chain, read
+    /// from the runtime rather than asked with `isKindOfClass:` (a proxy
+    /// would forward that question to whatever it stands for).
+    fn class_inherits(&self, cls: Class, ancestor: Class) -> bool {
+        self.class_chain(cls).any(|c| c == ancestor)
+    }
+
+    /// `cls`'s superclass; `None` for a root class.
+    fn superclass(&self, cls: Class) -> Option<Class> {
+        // SAFETY: class_getSuperclass on a registered class; Nil ends the chain.
+        NonNull::new(unsafe { (self.class_getSuperclass)(cls.as_obj()) }).map(Class)
+    }
+
+    /// `cls`, its superclass, and so on up to the root.
+    fn class_chain(&self, cls: Class) -> impl Iterator<Item = Class> + '_ {
+        core::iter::successors(Some(cls), |c| self.superclass(*c))
+    }
+
+    /// The IMP a message `sel` to an instance of `cls` would run (the
+    /// forwarding trampoline when nothing implements it).
+    fn method_implementation(&self, cls: Class, sel: Sel) -> *const c_void {
+        // SAFETY: a registered class and selector.
+        unsafe { (self.class_getMethodImplementation)(cls.as_obj(), sel) }
+    }
+
+    /// The class of the object at `obj` (the metaclass, for a class object).
+    ///
+    /// # Safety
+    /// `obj` points at an object that has not finished deallocating.
+    unsafe fn class_of_raw(&self, obj: Obj) -> Class {
+        // SAFETY: per contract; such an object always has a class.
+        match NonNull::new(unsafe { (self.object_getClass)(obj) }) {
+            Some(c) => Class(c),
+            None => unreachable!("object without a class"),
+        }
+    }
+
+    /// The class of `obj` (the metaclass, for a class object).
+    fn class_of(&self, obj: &Id) -> Class {
+        // SAFETY: an `Id` is a live object.
+        unsafe { self.class_of_raw(obj.as_obj()) }
+    }
+
+    /// The exported global `name`: first in AppKit and what it links
+    /// (Foundation, CoreFoundation, CoreGraphics, QuartzCore, …), so those
+    /// win over a same-named symbol elsewhere, then in any image the process
+    /// has loaded (a framework brought in with `NSBundle`, say).
+    fn symbol(&self, name: &CStr) -> Option<NonNull<c_void>> {
+        // SAFETY: dlsym on the never-closed AppKit handle, then the global
+        // scope, with a NUL-terminated name.
+        NonNull::new(unsafe { libc::dlsym(self.frameworks, name.as_ptr()) })
+            .or_else(|| NonNull::new(unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }))
+    }
+
+    /// The names of the methods `cls` itself implements (not its superclasses).
+    fn method_names(&self, cls: Class) -> Vec<String> {
+        let mut count: u32 = 0;
+        // SAFETY: a registered class; the result is NULL or a malloc'd array
+        // of `count` Methods, ours to free, each with a registered selector.
+        unsafe {
+            let list = (self.class_copyMethodList)(cls.as_obj(), &raw mut count);
+            if list.is_null() {
+                return Vec::new();
+            }
+            let names = core::slice::from_raw_parts(list, count as usize)
+                .iter()
+                .map(|m| self.sel_name((self.method_getName)(*m)))
+                .collect();
+            libc::free(list.cast());
+            names
+        }
+    }
+
     /// The type encoding of `sel` as implemented by `cls` or a superclass
     /// (`class_method` picks `+` over `-`).
     fn class_method_types(&self, cls: Class, sel: Sel, class_method: bool) -> Option<String> {
-        // SAFETY: a live class and a registered selector; the encoding of a
-        // found Method is a static C string.
-        unsafe {
-            let m = if class_method {
+        // SAFETY: a live class and a registered selector.
+        let m = unsafe {
+            if class_method {
                 (self.class_getClassMethod)(cls.as_obj(), sel)
             } else {
                 (self.class_getInstanceMethod)(cls.as_obj(), sel)
-            };
-            (!m.is_null()).then(|| {
-                CStr::from_ptr((self.method_getTypeEncoding)(m))
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            }
+        };
+        if m.is_null() {
+            return None;
         }
+        // SAFETY: `m` is a Method. Its encoding is NULL (registered without
+        // one) or a C string that lives as long as the class does.
+        let types = unsafe { (self.method_getTypeEncoding)(m) };
+        if types.is_null() {
+            return Some(String::new());
+        }
+        // SAFETY: non-NULL, see above.
+        Some(
+            unsafe { CStr::from_ptr(types) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 
@@ -1340,13 +1559,13 @@ impl<T: Object> FrameworkGlobal<T> {
     #[inline]
     pub(crate) fn get(&'static self) -> T {
         let id = self.value.get_or_init(|| {
-            // SAFETY: dlsym on the live AppKit handle; the symbol is a
-            // `T *const` variable, so read one pointer through it and retain
-            // the object it names.
+            let p = rt()
+                .symbol(self.name)
+                .unwrap_or_else(|| panic!("{} not found", self.name.to_string_lossy()));
+            // SAFETY: the symbol is a `T *const` variable, so read one pointer
+            // through it and retain the object it names.
             unsafe {
-                let p = libc::dlsym(rt().frameworks, self.name.as_ptr());
-                assert!(!p.is_null(), "{} not found", self.name.to_string_lossy());
-                Id::retain(*p.cast::<Obj>())
+                Id::retain(*p.as_ptr().cast::<Obj>())
                     .unwrap_or_else(|| panic!("{} is nil", self.name.to_string_lossy()))
             }
         });
@@ -1484,6 +1703,8 @@ pub(crate) fn verify_bindings() -> Result<Vec<String>> {
     metal()?;
     delegate::register_all();
     let mut problems = define::take_registration_problems();
+    block::verify(&mut problems);
+    dynamic::verify_struct_layouts(&mut problems);
     for b in bindings() {
         let c_sel = std::ffi::CString::new(b.selector).expect("selector literal");
         let sel = register_sel(&c_sel);
@@ -1527,32 +1748,10 @@ pub(crate) fn verify_bindings() -> Result<Vec<String>> {
 /// any of them a message.
 fn concrete_subclasses(cls: Class) -> Vec<Class> {
     static ALL: OnceLock<Vec<Class>> = OnceLock::new();
-    let all = ALL.get_or_init(|| {
-        // SAFETY: `objc_copyClassList` returns a malloc'd array of `count`
-        // classes that we free after copying.
-        unsafe {
-            let mut count = 0u32;
-            let list = (rt().objc_copyClassList)(&raw mut count);
-            let out = (0..count as usize)
-                .filter_map(|i| NonNull::new(*list.add(i)).map(Class))
-                .collect();
-            libc::free(list.cast());
-            out
-        }
-    });
+    let all = ALL.get_or_init(|| rt().class_list());
     all.iter()
         .copied()
-        .filter(|&candidate| {
-            let mut c = candidate;
-            loop {
-                // SAFETY: class_getSuperclass on a registered class; Nil ends the chain.
-                match NonNull::new(unsafe { (rt().class_getSuperclass)(c.as_obj()) }) {
-                    Some(sup) if sup == cls.0 => return true,
-                    Some(sup) => c = Class(sup),
-                    None => return false,
-                }
-            }
-        })
+        .filter(|&candidate| candidate != cls && rt().class_inherits(candidate, cls))
         .collect()
 }
 
@@ -1761,43 +1960,4 @@ pub(crate) fn alloc<T: ClassType>() -> Allocated<T> {
     let id =
         unsafe { Id::from_retained(rt().send::<Obj, _>(T::class().as_obj(), sel!("alloc"), ())) };
     Allocated(id.expect("+alloc returned nil"), PhantomData)
-}
-
-/// A class registered at run time whose superclass is `T`'s class, so `T`'s
-/// initialisers and methods apply to its instances.
-pub(crate) struct Subclass<T>(Class, PhantomData<fn() -> T>);
-
-impl<T> Clone for Subclass<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for Subclass<T> {}
-
-impl<T> Subclass<T> {
-    /// `cls` was allocated with `T::class()` as its superclass and registered.
-    const fn from_registered(cls: Class) -> Subclass<T> {
-        Subclass(cls, PhantomData)
-    }
-}
-
-/// `[cls alloc]`, typed as the bound superclass.
-pub(crate) fn alloc_subclass<T: ClassType>(cls: Subclass<T>) -> Allocated<T> {
-    // SAFETY: +alloc on a registered class returns a +1 instance; `Subclass<T>`
-    // proves `T`'s methods apply.
-    let id = unsafe { Id::from_retained(rt().send::<Obj, _>(cls.0.as_obj(), sel!("alloc"), ())) };
-    Allocated(id.expect("+alloc returned nil"), PhantomData)
-}
-
-/// Runs `f` on a borrowed object pointer received from AppKit (a delegate
-/// argument) wrapped as `T`, without taking ownership.
-///
-/// # Safety
-/// `obj` is nil or a live instance of (a subclass of) `T`'s class for the
-/// duration of `f`.
-pub(crate) unsafe fn with_borrowed<T: Object, R>(obj: Obj, f: impl FnOnce(Option<&T>) -> R) -> R {
-    // SAFETY: per contract; we retain for the wrapper's lifetime and release
-    // on drop.
-    let wrapped = unsafe { Id::retain(obj).map(|id| T::from_id(id)) };
-    f(wrapped.as_ref())
 }

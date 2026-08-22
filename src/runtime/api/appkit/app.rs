@@ -1,12 +1,10 @@
-//! The `AppKitApp` singleton and the per-thread state the window and view
-//! wrappers share: whether AppKit is up, and the keep-alive that holds the
-//! process open while windows are.
+//! The `AppKitApp` singleton and its per-thread state: whether AppKit is up,
+//! and the keep-alive that holds the process open while windows are.
 
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use bun_appkit::app::LoopHooks;
-use bun_appkit::menu::{Action, ActionSelector, Entry, Item, Menu, Modifiers};
 use bun_appkit::{ActivationPolicy, App, AppSink};
 use bun_core::Timespec;
 use bun_io::KeepAlive;
@@ -52,27 +50,12 @@ fn sync_keep_alive(state: &State) {
     }
 }
 
-/// One open window's claim on the process keep-alive; released on drop.
-pub(super) struct OpenWindow(());
-
-impl OpenWindow {
-    pub(super) fn new() -> OpenWindow {
-        STATE.with(|state| {
-            state.windows.set(state.windows.get() + 1);
-            sync_keep_alive(state);
-        });
-        OpenWindow(())
-    }
-}
-
-impl Drop for OpenWindow {
-    fn drop(&mut self) {
-        STATE.with(|state| {
-            debug_assert!(state.windows.get() > 0);
-            state.windows.set(state.windows.get() - 1);
-            sync_keep_alive(state);
-        });
-    }
+/// `bun:appkit` reports how many of its windows are open.
+fn set_windows(count: usize) {
+    STATE.with(|state| {
+        state.windows.set(count);
+        sync_keep_alive(state);
+    });
 }
 
 fn set_keep_flag(on: bool) {
@@ -141,6 +124,10 @@ impl AppSink for Events {
         self.slots.allows(js::on_before_quit_get_cached, &[])
     }
 
+    fn close_all(&self) -> bool {
+        self.slots.allows(js::on_close_all_get_cached, &[])
+    }
+
     fn quit(&self) {
         STATE.with(|state| {
             state.quit_requested.set(true);
@@ -159,14 +146,9 @@ impl AppSink for Events {
             &[JSValue::js_boolean(has_visible_windows)],
         );
     }
-
-    fn menu_item(&self, id: u32) {
-        self.slots
-            .call(js::on_menu_get_cached, &[JSValue::js_number(f64::from(id))]);
-    }
 }
 
-/// `app` in `bun:appkit`: NSApplication lifecycle, Dock badge and menu bar.
+/// `app` in `bun:appkit`: NSApplication lifecycle and Dock badge.
 #[bun_jsc::JsClass(no_constructor)]
 pub struct AppKitApp {
     slots: Rc<JsSlots>,
@@ -185,7 +167,8 @@ impl AppKitApp {
     }
 
     /// Brings AppKit up with `policy` (default `"regular"`) and routes its events to this
-    /// object's slots. A second call is a no-op.
+    /// object's slots. A second call only re-routes the events (the module
+    /// loaded again under a replaced global object finds AppKit already up).
     pub fn start(&self, global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
         let arg = frame.argument(0);
         let policy = if arg.is_undefined_or_null() {
@@ -193,19 +176,22 @@ impl AppKitApp {
         } else {
             conv::activation_policy(global, arg)?
         };
-        if App::get().is_none() {
-            let loop_ = global.bun_vm().uws_loop_mut();
-            let hooks = LoopHooks {
-                next_due,
-                outermost,
-                exit_if_requested,
-            };
-            let app = conv::check(global, App::start(loop_, hooks, policy))?;
-            app.set_sink(Box::new(Events {
-                slots: Rc::clone(&self.slots),
-            }));
-            STATE.with(sync_keep_alive);
-        }
+        let app = match App::get() {
+            Some(app) => app,
+            None => {
+                let loop_ = global.bun_vm().uws_loop_mut();
+                let hooks = LoopHooks {
+                    next_due,
+                    outermost,
+                    exit_if_requested,
+                };
+                conv::check(global, App::start(loop_, hooks, policy))?
+            }
+        };
+        app.set_sink(Box::new(Events {
+            slots: Rc::clone(&self.slots),
+        }));
+        STATE.with(sync_keep_alive);
         Ok(JSValue::UNDEFINED)
     }
 
@@ -296,14 +282,13 @@ impl AppKitApp {
             "keepAlive" => {
                 set_keep_flag(conv::boolean(global, value, format_args!("app.keepAlive"))?)
             }
+            "windows" => {
+                let count = conv::number(global, value, format_args!("app.windows"))?;
+                set_windows(count.max(0.0) as usize);
+            }
             "activationPolicy" => {
                 let policy = conv::activation_policy(global, value)?;
                 conv::check(global, started(global)?.set_activation_policy(policy))?;
-            }
-            "name" => {
-                let name = conv::optional_string(global, value, format_args!("app.name"))?
-                    .map(|name| name.to_utf8());
-                started(global)?.set_name(name.as_deref());
             }
             "badge" => {
                 let app = started(global)?;
@@ -313,15 +298,6 @@ impl AppKitApp {
                     conv::optional_string(global, value, format_args!("app.badge"))?
                 };
                 app.set_badge(&text.map(|t| t.to_utf8()).unwrap_or_default());
-            }
-            "menu" => {
-                let app = started(global)?;
-                if value.is_undefined_or_null() {
-                    app.set_menu(None);
-                } else {
-                    let menus = menus_from_js(global, value)?;
-                    app.set_menu(Some(&menus));
-                }
             }
             other => {
                 return Err(
@@ -344,21 +320,17 @@ impl AppKitApp {
         )?))
     }
 
-    pub fn get_live_views(&self, _global: &JSGlobalObject) -> JsResult<JSValue> {
-        Ok(JSValue::js_number(bun_appkit::view::live_count() as f64))
-    }
-
     /// Event slots start empty; JavaScript assigns them and the cached
     /// value is what gets read back.
     pub fn get_on_before_quit(&self, _global: &JSGlobalObject) -> JsResult<JSValue> {
         Ok(JSValue::UNDEFINED)
     }
 
-    pub fn get_on_reopen(&self, _global: &JSGlobalObject) -> JsResult<JSValue> {
+    pub fn get_on_close_all(&self, _global: &JSGlobalObject) -> JsResult<JSValue> {
         Ok(JSValue::UNDEFINED)
     }
 
-    pub fn get_on_menu(&self, _global: &JSGlobalObject) -> JsResult<JSValue> {
+    pub fn get_on_reopen(&self, _global: &JSGlobalObject) -> JsResult<JSValue> {
         Ok(JSValue::UNDEFINED)
     }
 }
@@ -367,127 +339,4 @@ impl Drop for AppKitApp {
     fn drop(&mut self) {
         self.slots.finalize();
     }
-}
-
-/// The already-normalised menu description from `bun:appkit` (see the
-/// module's `normalizeMenus`).
-fn menus_from_js(global: &JSGlobalObject, value: JSValue) -> JsResult<Vec<Menu>> {
-    if !value.is_array() {
-        return Err(global.throw_invalid_arguments(format_args!(
-            "app.menu must be an array of {{ title, items }} or null"
-        )));
-    }
-    let mut menus = Vec::new();
-    let mut iter = value.array_iterator(global)?;
-    let mut i = 0usize;
-    while let Some(menu) = iter.next()? {
-        if !menu.is_object() {
-            return Err(global.throw_invalid_arguments(format_args!(
-                "app.menu[{i}] must be {{ title, items }}"
-            )));
-        }
-        let title = match menu.get(global, "title")? {
-            Some(t) => JsStr::new(global, t, format_args!("app.menu[{i}].title"))?
-                .to_utf8()
-                .into_string(),
-            None => String::new(),
-        };
-        let items = match menu.get(global, "items")? {
-            Some(items) => menu_items_from_js(global, items, 0)?,
-            None => Vec::new(),
-        };
-        menus.push(Menu { title, items });
-        i += 1;
-    }
-    Ok(menus)
-}
-
-/// Submenus this deep are refused rather than recursed into without bound.
-const MAX_MENU_DEPTH: usize = 16;
-
-fn menu_items_from_js(
-    global: &JSGlobalObject,
-    value: JSValue,
-    depth: usize,
-) -> JsResult<Vec<Item>> {
-    if depth > MAX_MENU_DEPTH {
-        return Err(
-            global.throw_invalid_arguments(format_args!("app.menu: submenus nest too deeply"))
-        );
-    }
-    if !value.is_array() {
-        return Err(global.throw_invalid_arguments(format_args!("app.menu items must be an array")));
-    }
-    let mut items = Vec::new();
-    let mut iter = value.array_iterator(global)?;
-    while let Some(item) = iter.next()? {
-        if !item.is_object() {
-            return Err(global.throw_invalid_arguments(format_args!(
-                "app.menu items must be objects or \"separator\""
-            )));
-        }
-        if item
-            .get(global, "separator")?
-            .is_some_and(JSValue::to_boolean)
-        {
-            items.push(Item::Separator);
-            continue;
-        }
-        let title = match item.get(global, "title")? {
-            Some(t) => JsStr::new(global, t, format_args!("menu item title"))?
-                .to_utf8()
-                .into_string(),
-            None => String::new(),
-        };
-        let flag = |name: &'static str| -> JsResult<Option<bool>> {
-            Ok(item.get(global, name)?.map(JSValue::to_boolean))
-        };
-        if let Some(sub) = item
-            .get(global, "submenu")?
-            .filter(|s| !s.is_undefined_or_null())
-        {
-            items.push(Item::Submenu {
-                title,
-                items: menu_items_from_js(global, sub, depth + 1)?,
-                enabled: flag("enabled")?.unwrap_or(true),
-            });
-            continue;
-        }
-        let action = if let Some(id) = item.get(global, "id")?.filter(|v| v.is_number()) {
-            let id = id.as_number();
-            if !(id.fract() == 0.0 && id >= 1.0 && id <= f64::from(u32::MAX)) {
-                return Err(global.throw_invalid_arguments(format_args!(
-                    "app.menu item \"{title}\" has an invalid id"
-                )));
-            }
-            Action::Callback(id as u32)
-        } else if let Some(sel) = item.get(global, "action")?.filter(|v| v.is_string()) {
-            let name = JsStr::new(global, sel, format_args!("menu item action"))?.to_utf8();
-            Action::Selector(conv::check(global, ActionSelector::parse(&name))?)
-        } else {
-            return Err(global.throw_invalid_arguments(format_args!(
-                "app.menu item \"{title}\" needs onClick, action or submenu"
-            )));
-        };
-        let key = match item.get(global, "key")? {
-            Some(k) if k.is_string() => JsStr::new(global, k, format_args!("menu item key"))?
-                .to_utf8()
-                .into_string(),
-            _ => String::new(),
-        };
-        items.push(Item::Entry(Entry {
-            title,
-            action,
-            key,
-            modifiers: Modifiers {
-                shift: flag("shift")?.unwrap_or(false),
-                option: flag("option")?.unwrap_or(false),
-                control: flag("control")?.unwrap_or(false),
-                command: flag("command")?,
-            },
-            enabled: flag("enabled")?.unwrap_or(true),
-            checked: flag("checked")?.unwrap_or(false),
-        }));
-    }
-    Ok(items)
 }

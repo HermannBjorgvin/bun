@@ -1,5 +1,4 @@
-//! The event-slot calling convention shared by `AppKitApp`, `AppKitWindow`
-//! and `AppKitView`.
+//! The event-slot calling convention shared by `AppKitApp` and `AppKitView`.
 
 use core::cell::RefCell;
 
@@ -23,14 +22,6 @@ pub(super) enum SlotOutcome {
 }
 
 impl JsSlots {
-    /// Holds the wrapper alive (an open window keeps itself open).
-    pub(super) fn strong(this: JSValue, global: &JSGlobalObject) -> JsSlots {
-        JsSlots {
-            this_value: RefCell::new(JsRef::init_strong(this, global)),
-            global: GlobalRef::new(global),
-        }
-    }
-
     /// Lets the wrapper be collected (the JavaScript view tree keeps mounted
     /// views alive).
     pub(super) fn weak(this: JSValue, global: &JSGlobalObject) -> JsSlots {
@@ -60,12 +51,6 @@ impl JsSlots {
     /// The singleton's wrapper now exists.
     pub(super) fn bind(&self, this: JSValue, global: &JSGlobalObject) {
         self.this_value.borrow_mut().set_strong(this, global);
-    }
-
-    /// Stop keeping the wrapper alive (the window closed); events still reach
-    /// it while JavaScript holds it.
-    pub(super) fn release(&self) {
-        self.this_value.borrow_mut().downgrade();
     }
 
     /// The wrapper was collected; no further calls.

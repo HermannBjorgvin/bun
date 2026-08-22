@@ -33,7 +33,7 @@ impl TextEncoderStreamEncoder {
         if self.encode_latin1_into(input, &mut buffer).is_err() {
             return global.throw_out_of_memory_value();
         }
-        JSUint8Array::from_bytes(global, buffer.into())
+        bun_jsc::HostReturn::or_pending_exception(JSUint8Array::from_bytes(global, buffer.into()))
     }
 
     fn encode_latin1_into(&self, input: &[u8], buffer: &mut Vec<u8>) -> Result<(), AllocError> {
@@ -103,7 +103,7 @@ impl TextEncoderStreamEncoder {
         if buf.is_empty() {
             return JSUint8Array::create_empty(global);
         }
-        JSUint8Array::from_bytes(global, buf.into())
+        bun_jsc::HostReturn::or_pending_exception(JSUint8Array::from_bytes(global, buf.into()))
     }
 
     fn encode_utf16_into(&self, input: &[u16], buf: &mut Vec<u8>) -> Result<(), AllocError> {

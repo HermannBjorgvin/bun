@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 
-use crate::{JSGlobalObject, JSValue};
+use crate::{JSGlobalObject, JSValue, JsResult};
 
 bun_opaque::opaque_ffi! {
     /// Opaque FFI handle for a JSC `JSUint8Array` cell.
@@ -11,12 +11,14 @@ impl JSUint8Array {
     /// `bytes` must come from `bun.default_allocator` (the global mimalloc allocator);
     /// ownership is transferred to the returned JS Uint8Array.
     // The global allocator IS mimalloc, so `Box<[u8]>` encodes that ownership.
-    pub fn from_bytes(global: &JSGlobalObject, bytes: Box<[u8]>) -> JSValue {
+    pub fn from_bytes(global: &JSGlobalObject, bytes: Box<[u8]>) -> JsResult<JSValue> {
         let len = bytes.len();
         let ptr = bun_core::heap::into_raw(bytes).cast::<u8>();
         // SAFETY: `ptr`/`len` describe a heap allocation from the global (mimalloc)
         // allocator; the C++ side adopts and later frees it with the same allocator.
-        unsafe { JSUint8Array__fromDefaultAllocator(global, ptr, len) }
+        crate::host_fn::from_js_host_call(global, || unsafe {
+            JSUint8Array__fromDefaultAllocator(global, ptr, len)
+        })
     }
 
     pub fn from_bytes_copy(global: &JSGlobalObject, bytes: &[u8]) -> JSValue {

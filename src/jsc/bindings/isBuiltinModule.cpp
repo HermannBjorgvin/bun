@@ -78,9 +78,6 @@ static constexpr ASCIILiteral builtinModuleNamesSortedLength[] = {
     "timers/promises"_s,
     "_stream_readable"_s,
     "_stream_writable"_s,
-#if OS(DARWIN)
-    "bun:appkit/react"_s,
-#endif
     "stream/consumers"_s,
     "_stream_transform"_s,
     "readline/promises"_s,

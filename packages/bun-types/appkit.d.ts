@@ -5,6 +5,19 @@
  * stacks, buttons, text fields, tables and menus without a web view. AppKit is
  * loaded on first use, so programs that never touch it pay nothing.
  *
+ * It is two layers. {@link objc} is a bridge to the Objective-C runtime:
+ * every class, selector, protocol, enumeration and constant of Foundation,
+ * AppKit, QuartzCore, Metal and MetalKit under Apple's own names, blocks made
+ * from functions, and classes defined in JavaScript for delegates and targets.
+ * {@link Window}, {@link VStack}, {@link Button}, {@link Table}, the menu
+ * bar and the other classes here are written in JavaScript on that bridge,
+ * so each has {@link View.native `.native`} (the `NSWindow` or `NSView` it
+ * made), props that read the object live, and enumeration props that take
+ * every member by Apple's name; anything they do not cover is an
+ * `objc.classes.X` away. Native code only loads the frameworks, runs Bun's
+ * event loop inside AppKit's, owns the application lifecycle, and provides
+ * {@link MetalView} and {@link gpu}.
+ *
  * Everything runs on the main JavaScript thread. While windows are open Bun's
  * event loop keeps running as usual: timers, `fetch`, sockets, workers and
  * subprocesses all continue to work. The process exits when the last window
@@ -40,6 +53,7 @@
  *
  * @module bun:appkit
  */
+/// <reference path="./appkit-objc.generated.d.ts" />
 declare module "bun:appkit" {
   /**
    * A dynamic system colour name. These follow the user's appearance
@@ -197,13 +211,36 @@ declare module "bun:appkit" {
   }
 
   /**
-   * How a {@link VStack}/{@link HStack} places children on the cross axis.
+   * How a {@link VStack}/{@link HStack} places children on the cross axis
+   * (`-[NSStackView alignment]`, an `NSLayoutAttribute` on that axis).
    *
-   * - `"fill"` stretches each child across the stack.
+   * - `"fill"` stretches each child across the stack (leading or centre
+   *   alignment plus a width or height constraint per child).
    * - `"leading"`/`"trailing"` apply to a `VStack`; `"top"`/`"bottom"`/
    *   `"firstBaseline"`/`"lastBaseline"` apply to an `HStack`; `"center"` to both.
+   *   A name for the other axis maps across (`"bottom"` on a `VStack` is
+   *   `"trailing"`). Assigning also takes any {@link NSLayoutAttributeName}
+   *   or its number; reading gives the name above for the stack's axis when
+   *   there is one, else `NSLayoutAttribute`'s.
    */
   export type Align = "fill" | "leading" | "center" | "trailing" | "top" | "bottom" | "firstBaseline" | "lastBaseline";
+
+  /** `NSLayoutAttribute` by Apple's member names, prefix dropped; see {@link Align}. */
+  export type NSLayoutAttributeName =
+    | "left"
+    | "right"
+    | "top"
+    | "bottom"
+    | "leading"
+    | "trailing"
+    | "width"
+    | "height"
+    | "centerX"
+    | "centerY"
+    | "lastBaseline"
+    | "baseline"
+    | "firstBaseline"
+    | "notAnAttribute";
 
   /**
    * How a stack distributes children along its own axis
@@ -225,31 +262,75 @@ declare module "bun:appkit" {
     | "equalCentering"
     | "gravity";
 
-  /** Horizontal alignment of text inside a {@link Text} or text field. */
+  /** `NSStackViewDistribution` by Apple's member names, prefix dropped; see {@link Distribution} (`"gravityAreas"` is `"gravity"` there). */
+  export type NSStackViewDistributionName =
+    | "gravityAreas"
+    | "fill"
+    | "fillEqually"
+    | "fillProportionally"
+    | "equalSpacing"
+    | "equalCentering";
+
+  /**
+   * Horizontal alignment of text inside a {@link Text} or text field:
+   * `NSTextAlignment` by Apple's member names with the prefix dropped.
+   * Assigning also takes the full name (`"NSTextAlignmentCenter"`) or the
+   * member's number (`objc.enums.NSTextAlignment.center`).
+   */
   export type TextAlign = "left" | "center" | "right" | "justified" | "natural";
 
   /**
-   * The look and role of a {@link Button}.
-   *
-   * - `"default"`: a rounded push button.
-   * - `"primary"`: the window's default button, drawn in the accent colour;
-   *   Return activates it, including from a text field that has no
-   *   `onSubmit` handler.
-   * - `"destructive"`: marks a destructive action.
-   * - `"link"`: borderless, like a hyperlink.
-   * - `"toolbar"`: a square toolbar-style bezel.
+   * `NSBezelStyle`, by Apple's member names with the prefix dropped:
+   * `"push"` is `NSBezelStylePush`. The names after `"glass"` are the
+   * deprecated aliases AppKit still declares; reading `bezelStyle` gives the
+   * current name for a value. Assigning also takes the member's number
+   * (`objc.enums.NSBezelStyle.push`), and a value this list has no name for
+   * reads back as its number.
    */
-  export type ButtonKind = "default" | "primary" | "destructive" | "link" | "toolbar";
+  export type BezelStyle =
+    | "automatic"
+    | "push"
+    | "flexiblePush"
+    | "disclosure"
+    | "circular"
+    | "helpButton"
+    | "smallSquare"
+    | "toolbar"
+    | "accessoryBarAction"
+    | "accessoryBar"
+    | "pushDisclosure"
+    | "badge"
+    | "glass"
+    | "shadowlessSquare"
+    | "texturedSquare"
+    | "rounded"
+    | "regularSquare"
+    | "texturedRounded"
+    | "roundRect"
+    | "recessed"
+    | "roundedDisclosure"
+    | "inline";
 
   /**
-   * How an {@link Image} scales its picture to the view's bounds.
+   * How an {@link Image} scales its picture to the view's bounds
+   * (`-imageScaling`).
    *
-   * - `"down"`: shrink proportionally to fit, never enlarge.
-   * - `"fit"`: scale proportionally up or down to fit.
-   * - `"fill"`: stretch each axis independently.
-   * - `"none"`: draw at natural size.
+   * - `"down"`: shrink proportionally to fit, never enlarge (`NSImageScaleProportionallyDown`).
+   * - `"fit"`: scale proportionally up or down to fit (`NSImageScaleProportionallyUpOrDown`).
+   * - `"fill"`: stretch each axis independently (`NSImageScaleAxesIndependently`).
+   * - `"none"`: draw at natural size (`NSImageScaleNone`).
+   *
+   * Assigning also takes `NSImageScaling`'s own member names (short or
+   * full) or the number; reading gives the name above.
    */
   export type ImageScaling = "down" | "fit" | "fill" | "none";
+
+  /** `NSImageScaling` by Apple's member names, prefix dropped; see {@link ImageScaling}. */
+  export type NSImageScalingName =
+    | "scaleProportionallyDown"
+    | "scaleAxesIndependently"
+    | "scaleNone"
+    | "scaleProportionallyUpOrDown";
 
   /**
    * What an {@link Image} shows.
@@ -270,52 +351,14 @@ declare module "bun:appkit" {
    */
   export type ActivationPolicy = "regular" | "accessory" | "background";
 
-  /**
-   * The standard AppKit responder-chain actions a {@link MenuItem} may send,
-   * exactly as the built-in menus do. AppKit routes each to the focused view,
-   * its window or the application, and enables the item only while something
-   * can respond.
-   */
-  export type MenuAction =
-    | "orderFrontStandardAboutPanel:"
-    | "hide:"
-    | "hideOtherApplications:"
-    | "unhideAllApplications:"
-    | "terminate:"
-    | "miniaturizeAll:"
-    | "arrangeInFront:"
-    | "showHelp:"
-    | "orderFrontCharacterPalette:"
-    | "orderFrontColorPanel:"
-    | "orderFrontFontPanel:"
-    | "runPageLayout:"
-    | "performClose:"
-    | "performMiniaturize:"
-    | "performZoom:"
-    | "toggleFullScreen:"
-    | "toggleToolbarShown:"
-    | "runToolbarCustomizationPalette:"
-    | "print:"
-    | "undo:"
-    | "redo:"
-    | "cut:"
-    | "copy:"
-    | "paste:"
-    | "pasteAsPlainText:"
-    | "delete:"
-    | "selectAll:"
-    | "centerSelectionInVisibleArea:"
-    | "checkSpelling:"
-    | "showGuessPanel:"
-    | "toggleContinuousSpellChecking:"
-    | "startSpeaking:"
-    | "stopSpeaking:";
-
   /** A line between menu items. */
   export type MenuSeparator = "separator" | "-";
 
   /**
-   * One item in a menu.
+   * One item in a menu. The object is read when {@link App.menu} is
+   * assigned; changing its fields afterwards does nothing until the array
+   * is assigned again, but {@link App.menuItem} gives the `NSMenuItem` built
+   * from it for changes in place.
    *
    * @example
    * ```ts
@@ -324,20 +367,31 @@ declare module "bun:appkit" {
    * ```
    */
   export interface MenuItem {
-    /** The text shown for the item. */
+    /** The text shown for the item (`-[NSMenuItem title]`). */
     title: string;
     /**
-     * Called when the item is chosen. The app also emits a `"menu"` event with
-     * this item.
+     * Called when the item is chosen: the item's target is a script object
+     * and this is its action. The app also emits a `"menu"` event with this
+     * item.
      */
     onClick?: () => void;
     /**
-     * Instead of a callback, one of the standard AppKit responder-chain
-     * actions listed in {@link MenuAction}, sent to the focused view or window
-     * exactly as the built-in menus do. AppKit enables and disables such items
-     * automatically depending on what has focus.
+     * What choosing the item does, instead of `onClick`: a function (the
+     * same as `onClick`), or the name of an Objective-C action method such
+     * as `"copy:"`, `"performClose:"` or `"toggleFullScreen:"` (one
+     * argument, the sender, so one trailing colon). A selector is sent with
+     * no target, down the responder chain to the focused view, its window
+     * or the application, exactly as the built-in menus do, and AppKit
+     * enables the item only while something in that chain responds to it.
+     * The standard menus use `orderFrontStandardAboutPanel:`, `hide:`,
+     * `hideOtherApplications:`, `unhideAllApplications:`, `terminate:`,
+     * `undo:`, `redo:`, `cut:`, `copy:`, `paste:`, `delete:`, `selectAll:`,
+     * `toggleFullScreen:`, `performMiniaturize:`, `performZoom:` and
+     * `arrangeInFront:`; any other action method a responder implements
+     * (`performClose:`, `print:`, `centerSelectionInVisibleArea:`, one of a
+     * class defined with {@link ObjC.defineClass}) works the same way.
      */
-    action?: MenuAction;
+    action?: string | (() => void);
     /**
      * Key equivalent, a single character such as `"s"` or `","`. Command is
      * implied unless {@link MenuItem.command `command`} is `false`; an
@@ -356,21 +410,22 @@ declare module "bun:appkit" {
      */
     command?: boolean;
     /**
-     * Whether the item can be chosen. Items with an `action` are validated by
-     * AppKit instead.
+     * Whether the item can be chosen; `false` builds it with no target or
+     * action, greyed out. Items with a selector `action` are otherwise
+     * validated by AppKit.
      * @default true
      */
     enabled?: boolean;
-    /** Draw a check mark next to the item. @default false */
+    /** Draw a check mark next to the item (`-[NSMenuItem state]` on). @default false */
     checked?: boolean;
-    /** Nested items shown as a submenu of this item. */
+    /** Nested items shown as a submenu of this item (`-[NSMenuItem submenu]`). */
     submenu?: ReadonlyArray<MenuItem | MenuSeparator>;
   }
 
   /**
-   * One top-level menu in the menu bar. The first menu in {@link App.menu} is
-   * always the application menu (macOS shows it under the app's name whatever
-   * its `title`).
+   * One top-level menu in the menu bar: an `NSMenu` under an item of the
+   * main menu. The first menu in {@link App.menu} is always the application
+   * menu (macOS shows it under the app's name whatever its `title`).
    */
   export interface MenuSpec {
     title: string;
@@ -404,7 +459,7 @@ declare module "bun:appkit" {
      * window when it is `false`.
      */
     reopen: [hasVisibleWindows: boolean];
-    /** A custom menu item (one with an `onClick` or no `action`) was chosen. */
+    /** A custom menu item (one with a function to call, or no `action`) was chosen. */
     menu: [item: MenuItem];
   }
 
@@ -438,10 +493,17 @@ declare module "bun:appkit" {
     get badge(): string | null;
     set badge(value: string | number | null);
     /**
-     * The menu bar. `null` installs the standard application, Edit, View and
-     * Window menus so text editing shortcuts, full screen and Cmd-Q work out
-     * of the box; an array replaces the whole menu bar, so include the
-     * standard items you want to keep.
+     * The menu bar (`-[NSApplication mainMenu]`, built out of `NSMenu` and
+     * `NSMenuItem` once the application starts). `null` installs the
+     * standard application, Edit, View and Window menus so text editing
+     * shortcuts, full screen and Cmd-Q work out of the box; an array
+     * replaces the whole menu bar, so include the standard items you want
+     * to keep. Assigning builds a new main menu each time; reading gives
+     * back the array assigned (its functions cannot be read back out of an
+     * `NSMenu`), so editing that array in place changes nothing until it is
+     * assigned again. To change one item of the installed bar (enable,
+     * check, retitle it) without a rebuild, message its `NSMenuItem`:
+     * {@link App.menuItem}.
      *
      * @example
      * ```ts
@@ -454,6 +516,26 @@ declare module "bun:appkit" {
      * @default null
      */
     menu: MenuSpec[] | null;
+    /**
+     * The `NSMenuItem` the installed menu bar has for `item`: one of the
+     * item objects inside {@link App.menu} (matched by identity), or one of
+     * its top-level menus (the item of the main menu whose `submenu()` is
+     * that `NSMenu`). `null` before the application has started, for the
+     * standard bar, or for an object that is not part of the bar installed
+     * now. `setTitle:`, `setState:`, `setKeyEquivalent:` and the rest apply
+     * at once; `setEnabled:` lasts only while the item's menu has
+     * `autoenablesItems` off, because AppKit re-validates items with a
+     * target each time a menu opens (`-[NSMenu setAutoenablesItems:]`).
+     *
+     * @example
+     * ```ts
+     * const wrap = { title: "Word Wrap", onClick: () => toggleWrap() };
+     * app.menu = [{ title: app.name, items: [] }, { title: "View", items: [wrap] }];
+     * app.menuItem(wrap)?.setState_(objc.enums.NSControlStateValueOn);
+     * app.menuItem(wrap)?.setTitle_("Wrap Lines");
+     * ```
+     */
+    menuItem(item: MenuItem | MenuSpec): ObjCObject | null;
     /** Every window that has been created and not yet closed. */
     readonly windows: readonly Window[];
     /** Whether the app's effective appearance is dark. `false` until the application has started. */
@@ -501,9 +583,9 @@ declare module "bun:appkit" {
    * excluding the title bar.
    */
   export interface WindowOptions {
-    /** @default "" */
+    /** `-title`. @default "" */
     title?: string;
-    /** Content width. @default 480 */
+    /** Content width (`contentRectForFrameRect:` of the frame). @default 480 */
     width?: number;
     /** Content height. @default 320 */
     height?: number;
@@ -525,32 +607,33 @@ declare module "bun:appkit" {
     /** @default null */
     maxHeight?: number | null;
     /**
-     * Whether the user can resize the window. Content that needs more room
-     * and `width`/`height` assignments still can.
+     * Whether the user can resize the window (`NSWindowStyleMaskResizable`,
+     * which also lets it go full screen). Content that needs more room and
+     * `width`/`height` assignments still can.
      * @default true
      */
     resizable?: boolean;
-    /** @default true */
+    /** `NSWindowStyleMaskClosable`. @default true */
     closable?: boolean;
-    /** @default true */
+    /** `NSWindowStyleMaskMiniaturizable`. @default true */
     minimizable?: boolean;
     /**
      * Let the content extend under the title bar (`NSWindowStyleMaskFullSizeContentView`).
      * @default false
      */
     fullSizeContent?: boolean;
-    /** @default false */
+    /** `-titlebarAppearsTransparent`. @default false */
     titlebarTransparent?: boolean;
-    /** Hide the title text (the bar itself stays). @default false */
+    /** Hide the title text (the bar itself stays): `-titleVisibility`. @default false */
     titleHidden?: boolean;
-    /** Window background colour. @default "windowBackground" */
+    /** Window background colour (`-backgroundColor`). @default "windowBackground" */
     background?: Color;
-    /** Opacity of the whole window from 0 to 1. @default 1 */
+    /** Opacity of the whole window from 0 to 1 (`-alphaValue`). @default 1 */
     alpha?: number;
     /**
      * A name under which AppKit saves and restores the window's frame between
-     * launches (`setFrameAutosaveName:`). Only one open window may use a name
-     * at a time.
+     * launches (`setFrameAutosaveName:`): a frame saved under it wins over the
+     * size and position given. Only one open window may use a name at a time.
      * @default null
      */
     restoreName?: string | null;
@@ -573,9 +656,12 @@ declare module "bun:appkit" {
   }
 
   /**
-   * A native window. Creating one starts AppKit if it has not started yet.
-   * A window is shown as soon as it is created unless `visible: false` is
-   * passed; call {@link Window.show} to show it later.
+   * An `NSWindow`, made and driven through {@link objc} like the views are:
+   * every option is a property afterwards that reads and writes the window
+   * itself ({@link Window.native} is that very object), and the events are
+   * its `NSWindowDelegate`'s methods. Creating one starts AppKit if it has
+   * not started yet. A window is shown as soon as it is created unless
+   * `visible: false` is passed; call {@link Window.show} to show it later.
    *
    * The root {@link Window.content view} is pinned to the window's edges. A
    * `VStack` whose children do not {@link View.grow grow} sits at the top at
@@ -601,42 +687,71 @@ declare module "bun:appkit" {
    */
   export class Window {
     constructor(options?: WindowOptions);
-    title: string;
-    /** Content width in points. Assignments are clamped into the size limits. */
-    width: number;
-    /** Content height in points. Assignments are clamped into the size limits. */
-    height: number;
-    /** Screen x of the bottom-left corner. */
-    x: number;
-    /** Screen y of the bottom-left corner. */
-    y: number;
-    /** See {@link WindowOptions.minWidth}. Lowering a maximum under the current size shrinks the window to it. */
+    /** `-title`, live; `null` clears it. */
+    get title(): string;
+    set title(value: string | null | undefined);
+    /** Content width in points, live, with pending layout applied first. Assignments are clamped into the size limits; `null` assigns the default. */
+    get width(): number;
+    set width(value: number | null | undefined);
+    /** Content height in points, live. Assignments are clamped into the size limits; `null` assigns the default. */
+    get height(): number;
+    set height(value: number | null | undefined);
+    /** Screen x of the bottom-left corner (`-frame`), live. Assigning `null` to `x` or `y` centres the window. */
+    get x(): number;
+    set x(value: number | null | undefined);
+    /** Screen y of the bottom-left corner, live. */
+    get y(): number;
+    set y(value: number | null | undefined);
+    /**
+     * See {@link WindowOptions.minWidth}. `-contentMinSize` /
+     * `-contentMaxSize`, live: no limit reads `null`, and a limit set
+     * through {@link Window.native} shows here. The values assigned are
+     * what a later assignment on the same axis settles again: where a
+     * minimum exceeds a maximum the minimum wins, so that maximum reads
+     * back raised to it until either changes. Lowering a maximum under the
+     * current size shrinks the window to it.
+     */
     minWidth: number | null;
     minHeight: number | null;
     maxWidth: number | null;
     maxHeight: number | null;
+    /** As assigned; `null` puts the standard window background back. */
     background: Color;
+    /** `-alphaValue`, live; assignments are clamped to 0–1. */
     alpha: number;
-    /** The options fixed at creation, read back. Assigning one throws. */
-    readonly resizable: boolean;
-    readonly closable: boolean;
-    readonly minimizable: boolean;
-    readonly fullSizeContent: boolean;
-    readonly titlebarTransparent: boolean;
-    readonly titleHidden: boolean;
-    readonly restoreName: string | null;
+    /** `NSWindowStyleMaskResizable` in `-styleMask`, live like the other style-mask flags. */
+    resizable: boolean;
+    closable: boolean;
+    minimizable: boolean;
+    fullSizeContent: boolean;
+    /** `-titlebarAppearsTransparent`, live. */
+    titlebarTransparent: boolean;
+    /** Whether `-titleVisibility` is `NSWindowTitleHidden`, live. */
+    titleHidden: boolean;
+    /**
+     * `-frameAutosaveName`, live (`""` reads as `null`). Assigning a name
+     * restores a frame saved under it; a closed window gives its name up.
+     * @throws ERR_INVALID_STATE if another open window uses the name.
+     */
+    restoreName: string | null;
     /** The root view, or `null` for an empty window. */
     content: View | null;
-    /** Whether the window is on screen. Assigning calls {@link Window.show} or {@link Window.hide}. */
+    /** `-isVisible`: whether the window is on screen. Assigning calls {@link Window.show} or {@link Window.hide}. */
     visible: boolean;
-    /** Whether the window has been closed. A closed window cannot be shown again. */
+    /**
+     * Whether the window has been closed. A closed window cannot be shown
+     * again, and assigning any of its properties throws `ERR_INVALID_STATE`;
+     * the getters and {@link Window.native} keep answering.
+     */
     readonly closed: boolean;
-    /** Whether this is the key window (the one receiving keyboard input). */
+    /** `-isKeyWindow`: whether this is the key window (the one receiving keyboard input). */
     readonly key: boolean;
     /**
      * The `NSWindow` behind this window, for anything the properties above
-     * do not cover. See {@link objc}.
-     * @throws ERR_INVALID_STATE once the window is closed.
+     * do not cover: the same handle every read, each read counting as one
+     * acquisition of it (see {@link ObjCObject.release}). See {@link objc}.
+     * Still the window after {@link Window.close} (an `NSWindow` outlives
+     * its close), so an `onClose` handler can read its last frame or screen.
      *
      * @example
      * ```ts
@@ -644,51 +759,55 @@ declare module "bun:appkit" {
      * win.native.frame();              // { origin: { x, y }, size: { width, height } }
      * ```
      */
-    readonly native: ObjCObject;
-    /** Put the window on screen, make it key and bring the app to the front. */
+    readonly native: objc.NSWindow;
+    /** Put the window on screen and make it key (`makeKeyAndOrderFront:`); the first call also brings the app to the front. */
     show(): void;
-    /** Take the window off screen without closing it. */
+    /** Take the window off screen without closing it (`orderOut:`). */
     hide(): void;
-    /** Centre the window on its screen. */
+    /** Centre the window on its screen (`center`). */
     center(): void;
-    /** Make the window key and bring it to the front. */
+    /** Make the window key and bring it and the app to the front. */
     focus(): void;
     /**
-     * Close the window without asking {@link Window.shouldClose}.
-     * {@link Window.onClose} fires; when this was the last open window and
-     * {@link App.keepAlive} is `false` the process can exit. Calling
-     * `close()` again does nothing.
+     * Close the window (`close`) without asking {@link Window.shouldClose}.
+     * The content view leaves the window and keeps working (it can go into
+     * another one); {@link Window.onClose} fires; when this was the last
+     * open window and {@link App.keepAlive} is `false` the process can
+     * exit. Calling `close()` again does nothing.
      */
     close(): void;
     /**
-     * PNG bytes of the window's content view (no title bar) as currently
-     * drawn, or `null` when it has no backing store yet (never shown) or
-     * there is no window server.
+     * PNG bytes of the window's content area (no title bar) as currently
+     * laid out, shown or not and with or without a display, or `null`
+     * while the content area has no size.
      */
     snapshot(): Uint8Array | null;
-    /** Called after the window has closed, whether by the user, a quit, or {@link Window.close}. */
+    /** Called after the window has closed (`windowWillClose:`), whether by the user, a quit, or {@link Window.close}. */
     onClose: (() => void) | null | undefined;
     /**
-     * Called when the user clicks the close button, and for every visible
-     * closable window when the app is asked to quit. Return `false` to keep
-     * the window open (and, during a quit, cancel the quit). Not consulted
+     * `windowShouldClose:`: called when the user clicks the close button,
+     * and for every open window when the app is asked to quit. Return
+     * `false` to keep the window open (and, during a quit, cancel the
+     * quit); a handler that throws is reported and does not. Not consulted
      * by {@link Window.close}.
      */
     shouldClose: (() => boolean) | null | undefined;
     /**
-     * Called with the new content size after the user resizes the window, it
-     * zooms or enters full screen, or its content makes it grow. Not called
-     * for the program's own `width`/`height`/size-limit assignments.
+     * `windowDidResize:`: called with the new content size after the user
+     * resizes the window, it zooms or enters full screen, or its content
+     * makes it grow. Not called for the program's own
+     * `width`/`height`/size-limit assignments.
      */
     onResize: ((size: Size) => void) | null | undefined;
     /**
-     * Called with the new bottom-left screen position after the user moves
-     * the window. Not called for `x`/`y` assignments or {@link Window.center}.
+     * `windowDidMove:`: called with the new bottom-left screen position
+     * after the user moves the window. Not called for `x`/`y` assignments
+     * or {@link Window.center}.
      */
     onMove: ((position: Point) => void) | null | undefined;
-    /** Called when the window becomes the key window. */
+    /** `windowDidBecomeKey:`: the window became the key window. */
     onFocus: (() => void) | null | undefined;
-    /** Called when the window stops being the key window. */
+    /** `windowDidResignKey:`: the window stopped being the key window. */
     onBlur: (() => void) | null | undefined;
   }
 
@@ -707,22 +826,22 @@ declare module "bun:appkit" {
    */
   export interface ViewProps {
     /**
-     * Hidden views take no space in a stack.
+     * `-hidden`. Hidden views take no space in a stack.
      * @default false
      */
     hidden?: boolean;
     /**
-     * Opacity from 0 to 1.
+     * `-alphaValue`, from 0 to 1.
      * @default 1
      */
     alpha?: number;
-    /** Help text shown on hover. @default null */
+    /** `-toolTip`: help text shown on hover. @default null */
     tooltip?: string | null;
-    /** An identifier for the view (its accessibility identifier). @default null */
+    /** `-identifier` (also the accessibility identifier). @default null */
     id?: string | null;
-    /** Fixed width, or `null` for natural width. @default null */
+    /** Fixed width (a width constraint at priority 999), or `null` for natural width. @default null */
     width?: number | null;
-    /** Fixed height, or `null` for natural height. @default null */
+    /** Fixed height, likewise, or `null` for natural height. @default null */
     height?: number | null;
     /**
      * Lower and upper bounds on the size. Where a minimum exceeds a maximum
@@ -749,14 +868,14 @@ declare module "bun:appkit" {
      */
     grow?: number;
     /**
-     * Fill colour behind the view's content. A system colour name is
-     * resolved for the view's appearance at the time it is set.
+     * Fill colour of the view's layer (`layer.backgroundColor`). A system
+     * colour name is resolved for the view's appearance at the time it is set.
      * @default null
      */
     background?: Color | null;
-    /** Rounds the view's corners (and clips the background to them). @default 0 */
+    /** `layer.cornerRadius`; rounds the view's corners (and clips the background to them). @default 0 */
     cornerRadius?: number;
-    /** @default null */
+    /** `layer.borderWidth` / `layer.borderColor`. @default null */
     border?: Border | null;
   }
 
@@ -764,10 +883,10 @@ declare module "bun:appkit" {
    * Base class of every view. Not constructible directly; use one of the
    * concrete views below.
    *
-   * Every settable prop reads back the last value assigned, or its
-   * documented default while unset; assigning `null` returns a prop to its
-   * default. Props described as "as the user left it" read the live control
-   * state instead.
+   * `hidden`, `alpha`, `tooltip`, `id` and `cornerRadius` read the view
+   * ({@link View.native}); the sizes, `grow`, `background` and `border`
+   * read back the last value assigned, or their documented default while
+   * unset. Assigning `null` returns a prop to its default.
    *
    * @category AppKit
    */
@@ -791,33 +910,36 @@ declare module "bun:appkit" {
     /** The window this view is shown in, or `null` when not mounted. */
     readonly window: Window | null;
     /**
-     * `true` once the native view has been freed ahead of garbage collection
-     * (the React renderer does this when it unmounts a host element). Props
-     * still read their last value; setters, `click()`, `snapshot()` and
-     * adding it to a container throw `ERR_INVALID_STATE`.
-     */
-    readonly released: boolean;
-    /**
      * The view's frame in its parent's coordinates. Reading it lays the
      * window out first, so it reflects every change made so far; all zeros
      * while the view is not in a window.
      */
     readonly frame: Rect;
     /**
-     * The `NSView` behind this view, for anything the props do not cover.
-     * For {@link ScrollView}, {@link Table} and {@link TextEditor} this is the
-     * outer `NSScrollView`; `.documentView()` reaches the `NSTableView` /
-     * `NSTextView`. For {@link Group} it is the `NSBox`, whose children sit
-     * in an `NSStackView` inside its `contentView()`. For {@link MetalView} it
-     * is the `MTKView`, or a plain `NSView` when Metal is unavailable. See
-     * {@link objc}.
-     * @throws ERR_INVALID_STATE once the view is {@link View.released released}.
+     * The `NSView` this view is, for anything the props do not cover: the
+     * object the class built through {@link objc} (an `NSButton`, an
+     * `NSStackView`, ...), which its readable props and the common ones
+     * (`hidden`, `width`, `grow`, `frame`, ...) read and write. For
+     * {@link ScrollView}, {@link Table} and {@link TextEditor} this is the
+     * outer `NSScrollView`; `.documentView()` reaches the content, the
+     * `NSTableView` or the `NSTextView`. For {@link Group} it is the `NSBox`,
+     * whose children sit in an `NSStackView` inside its `contentView()`. For
+     * {@link MetalView} it is the `MTKView`, or a plain `NSView` when Metal
+     * is unavailable. Every read gives the same handle and counts as one
+     * acquisition of it (see {@link ObjCObject.release}), so
+     * `using view = button.native` is balanced. See {@link objc}.
      */
-    readonly native: ObjCObject;
+    readonly native: objc.NSView;
     /** Remove the view from its parent (no-op when it has none). */
     remove(): void;
     /** PNG bytes of the view as currently drawn, or `null` before it has a size. */
     snapshot(): Uint8Array | null;
+  }
+
+  /** Properties every container has. */
+  export interface ContainerProps extends ViewProps {
+    /** The initial children, as if appended in order. @default [] */
+    children?: readonly View[];
   }
 
   /**
@@ -826,8 +948,9 @@ declare module "bun:appkit" {
    * @category AppKit
    */
   export abstract class Container extends View {
-    /** Child views in display order. */
-    readonly children: readonly View[];
+    /** Child views in display order. Assigning is {@link Container.replaceChildren}. */
+    get children(): readonly View[];
+    set children(views: readonly View[]);
     /** Add views at the end. A view can only be in one container at a time. */
     append(...views: View[]): void;
     /**
@@ -847,19 +970,26 @@ declare module "bun:appkit" {
     replaceChildren(...views: View[]): void;
   }
 
-  /** Properties shared by {@link VStack}, {@link HStack} and {@link Group}. */
-  export interface StackProps extends ViewProps {
-    /** Gap between adjacent children. @default 8 */
+  /** Properties shared by {@link VStack}, {@link HStack} and {@link Group} (an `NSStackView`). */
+  export interface StackProps extends ContainerProps {
+    /** `-spacing`: gap between adjacent children. @default 8 */
     spacing?: number;
-    /** Inset between the stack's edges and its children. @default 0 */
+    /** `-edgeInsets`: inset between the stack's edges and its children; reads back as `{ top, left, bottom, right }`. @default 0 on every edge */
     padding?: Padding;
     /**
-     * Cross-axis placement of children.
+     * Cross-axis placement of children (`-alignment`, plus a width or
+     * height constraint per child for `"fill"`): an {@link Align} name, or
+     * any `NSLayoutAttribute` by Apple's name or number.
      * @default "fill" for VStack and Group, "center" for HStack
      */
-    align?: Align;
-    /** @default "fill" */
-    distribution?: Distribution;
+    align?: Align | NSLayoutAttributeName | number;
+    /**
+     * `-distribution`: a {@link Distribution} name, any
+     * `NSStackViewDistribution` member by Apple's name (`"gravityAreas"`,
+     * `"NSStackViewDistributionFillEqually"`), or its number.
+     * @default "fill"
+     */
+    distribution?: Distribution | NSStackViewDistributionName | number;
   }
 
   export interface VStackProps extends StackProps {}
@@ -871,17 +1001,23 @@ declare module "bun:appkit" {
    * @example
    * ```ts
    * const form = new VStack({ spacing: 12, padding: 20 });
-   * form.append(new TextField({ placeholder: "Name" }), new Button({ title: "OK", kind: "primary" }));
+   * form.append(new TextField({ placeholder: "Name" }), new Button({ title: "OK", keyEquivalent: "\r" }));
    * ```
    *
    * @category AppKit
    */
   export class VStack extends Container {
     constructor(props?: VStackProps);
+    readonly native: objc.NSStackView;
     spacing: number;
-    padding: Padding;
-    align: Align;
-    distribution: Distribution;
+    /** `-edgeInsets`. */
+    get padding(): Required<Insets>;
+    set padding(value: Padding | null | undefined);
+    /** `-alignment`: see {@link Align}. */
+    get align(): Align | NSLayoutAttributeName | number;
+    set align(value: Align | NSLayoutAttributeName | number | null | undefined);
+    get distribution(): Distribution | number;
+    set distribution(value: Distribution | NSStackViewDistributionName | number | null | undefined);
   }
 
   /**
@@ -891,13 +1027,19 @@ declare module "bun:appkit" {
    */
   export class HStack extends Container {
     constructor(props?: HStackProps);
+    readonly native: objc.NSStackView;
     spacing: number;
-    padding: Padding;
-    align: Align;
-    distribution: Distribution;
+    /** `-edgeInsets`. */
+    get padding(): Required<Insets>;
+    set padding(value: Padding | null | undefined);
+    /** `-alignment`: see {@link Align}. */
+    get align(): Align | NSLayoutAttributeName | number;
+    set align(value: Align | NSLayoutAttributeName | number | null | undefined);
+    get distribution(): Distribution | number;
+    set distribution(value: Distribution | NSStackViewDistributionName | number | null | undefined);
   }
 
-  export interface ZStackProps extends ViewProps {}
+  export interface ZStackProps extends ContainerProps {}
 
   /**
    * A plain view that pins every child to its own edges, so children overlap
@@ -910,9 +1052,14 @@ declare module "bun:appkit" {
   }
 
   export interface GroupProps extends StackProps {
-    /** Title drawn above the box. Empty for none. @default "" */
+    /**
+     * `-title`, drawn above the box; empty for none (`NSNoTitle`). A title
+     * position set through `.native` (`setTitlePosition:`) is kept when the
+     * title changes; only `""` hides it, and the next title shows it at the top.
+     * @default ""
+     */
     title?: string;
-    /** Inset between the box's border and its children. @default 4 */
+    /** Inset between the box's border and its children. @default 4 on every edge */
     padding?: Padding;
   }
 
@@ -923,23 +1070,34 @@ declare module "bun:appkit" {
    */
   export class Group extends Container {
     constructor(props?: GroupProps);
+    readonly native: objc.NSBox;
     title: string;
     spacing: number;
-    padding: Padding;
-    align: Align;
-    distribution: Distribution;
+    /** `-edgeInsets`. */
+    get padding(): Required<Insets>;
+    set padding(value: Padding | null | undefined);
+    /** `-alignment`: see {@link Align}. */
+    get align(): Align | NSLayoutAttributeName | number;
+    set align(value: Align | NSLayoutAttributeName | number | null | undefined);
+    get distribution(): Distribution | number;
+    set distribution(value: Distribution | NSStackViewDistributionName | number | null | undefined);
   }
 
   export interface ScrollBars {
-    /** @default false */
+    /** `-hasHorizontalScroller`. @default false */
     horizontal?: boolean;
-    /** @default true */
+    /** `-hasVerticalScroller`. @default true */
     vertical?: boolean;
   }
 
-  export interface ScrollViewProps extends ViewProps {
-    /** Which scrollers to show (they auto-hide when not needed). */
-    scrollBars?: ScrollBars;
+  export interface ScrollViewProps extends ContainerProps {
+    /**
+     * Which scrollers to show (they auto-hide when not needed): both flags,
+     * one boolean for both, or `"none"`, `"horizontal"`, `"vertical"`,
+     * `"both"`. Without a horizontal scroller the content is held to the
+     * view's width, so text wraps. Reads back both flags from the view.
+     */
+    scrollBars?: ScrollBars | boolean | "none" | "horizontal" | "vertical" | "both";
   }
 
   /**
@@ -958,13 +1116,15 @@ declare module "bun:appkit" {
    */
   export class ScrollView extends Container {
     constructor(props?: ScrollViewProps);
-    scrollBars: ScrollBars;
+    readonly native: objc.NSScrollView;
+    get scrollBars(): ScrollBars;
+    set scrollBars(value: ScrollBars | boolean | "none" | "horizontal" | "vertical" | "both" | null | undefined);
   }
 
-  export interface SplitViewProps extends ViewProps {
+  export interface SplitViewProps extends ContainerProps {
     /**
-     * `false` puts panes side by side with vertical dividers; `true` stacks
-     * them top to bottom.
+     * `false` puts panes side by side with vertical dividers (NSSplitView's
+     * `vertical = YES`); `true` stacks them top to bottom. Reads the view.
      * @default false
      */
     vertical?: boolean;
@@ -977,30 +1137,34 @@ declare module "bun:appkit" {
    */
   export class SplitView extends Container {
     constructor(props?: SplitViewProps);
+    readonly native: objc.NSSplitView;
     vertical: boolean;
   }
 
   export interface TextProps extends ViewProps {
-    /** @default "" */
+    /** `-stringValue`. @default "" */
     text?: string;
-    /** @default null (the standard label font) */
+    /** `-font`. @default null (the standard label font) */
     font?: Font | null;
-    /** @default null ("label") */
+    /** `-textColor`. @default null ("label") */
     color?: Color | null;
-    /** @default "natural" */
-    textAlign?: TextAlign;
-    /** Let the user select and copy the text. @default false */
+    /** `-alignment`, by name or `NSTextAlignment` value. @default "natural" */
+    textAlign?: TextAlign | number;
+    /** `-selectable`: let the user select and copy the text. @default false */
     selectable?: boolean;
     /**
-     * Maximum number of lines; longer text is truncated with an ellipsis. `0`
-     * wraps onto as many lines as needed.
+     * `-maximumNumberOfLines`, a non-negative integer; longer text is
+     * truncated with an ellipsis. `0` wraps onto as many lines as needed.
      * @default 1
      */
     lineLimit?: number;
   }
 
   /**
-   * A non-editable text label.
+   * A non-editable text label (`NSTextField`). `text`, `textAlign`,
+   * `selectable` and `lineLimit` read the label itself, so a change made
+   * through {@link View.native} shows; `font` and `color` read as last
+   * assigned.
    *
    * @example
    * ```ts
@@ -1011,82 +1175,103 @@ declare module "bun:appkit" {
    * @category AppKit
    */
   export class Text extends View {
-    constructor(props?: TextProps);
+    constructor(props?: TextProps | string);
+    readonly native: objc.NSTextField;
     text: string;
     font: Font | null;
     color: Color | null;
-    textAlign: TextAlign;
+    /** The short `NSTextAlignment` name, or the number for a value with none. */
+    get textAlign(): TextAlign | number;
+    set textAlign(value: TextAlign | number | null | undefined);
     selectable: boolean;
     lineLimit: number;
   }
 
   export interface ButtonProps extends ViewProps {
-    /** @default "" */
+    /** `-title`. @default "" */
     title?: string;
-    /** @default "default" */
-    kind?: ButtonKind;
-    /** @default true */
+    /** `-bezelStyle`: the button's shape, by name or `NSBezelStyle` value. @default "push" */
+    bezelStyle?: BezelStyle | number;
+    /** `-bordered`: `false` draws the title alone, like a link. @default true */
+    bordered?: boolean;
+    /** `-hasDestructiveAction`: lets AppKit mark the button as destructive (red where the bezel style shows it). @default false */
+    hasDestructiveAction?: boolean;
+    /** `-enabled`. @default true */
     enabled?: boolean;
-    /** An SF Symbol name drawn before the title, e.g. `"plus"`. @default null */
+    /** An SF Symbol name drawn before the title (`-image`), e.g. `"plus"`. @default null */
     symbol?: string | null;
     /**
-     * Key that activates the button while its window is key, e.g. `"\r"`
-     * (Return) or `"\u001b"` (Escape). `null` leaves it to `kind`: Return
-     * for `"primary"`, none otherwise.
+     * `-keyEquivalent`: the key that activates the button while its window
+     * is key, e.g. `"\r"` (Return, which also makes it the window's default
+     * button, drawn in the accent colour, and activates it from a text field
+     * that has no `onSubmit`) or `"\u001b"` (Escape). `null` and `""` mean none.
      * @default null
      */
     keyEquivalent?: string | null;
-    /** @default null (the standard control font) */
+    /** `-font`. @default null (the standard control font) */
     font?: Font | null;
-    /** Tint for the title and symbol. @default null */
+    /** `-contentTintColor`: tint for the title and symbol. @default null */
     tint?: Color | null;
-    /** Called when the button is clicked or its key equivalent is pressed. */
+    /**
+     * The button's action (`target`/`action`): called when it is clicked or
+     * its key equivalent is pressed, synchronously, inside the click.
+     */
     onClick?: () => void;
   }
 
   /**
-   * A push button.
+   * A push button (`NSButton`). `title`, `bezelStyle`, `bordered`,
+   * `hasDestructiveAction`, `keyEquivalent` and `enabled` read the button
+   * itself, so a change made through `.native` shows in them.
    *
    * @example
    * ```ts
-   * new Button({ title: "Save", kind: "primary", onClick: () => save() });
-   * new Button({ symbol: "trash", kind: "destructive", onClick: () => remove() });
+   * new Button({ title: "Save", keyEquivalent: "\r", onClick: () => save() }); // the default button
+   * new Button({ symbol: "trash", hasDestructiveAction: true, onClick: () => remove() });
+   * new Button({ title: "Docs", bordered: false }); // like a link
+   * new Button({ title: "Options", bezelStyle: "toolbar" });
    * ```
    *
    * @category AppKit
    */
   export class Button extends View {
-    constructor(props?: ButtonProps);
+    constructor(props?: ButtonProps | string);
+    readonly native: objc.NSButton;
     title: string;
-    kind: ButtonKind;
+    /** Reads the name for the button's `-bezelStyle`, or the number when {@link BezelStyle} has none for it. */
+    get bezelStyle(): BezelStyle | number;
+    set bezelStyle(value: BezelStyle | number | null | undefined);
+    bordered: boolean;
+    hasDestructiveAction: boolean;
     enabled: boolean;
     symbol: string | null;
     keyEquivalent: string | null;
     font: Font | null;
     tint: Color | null;
     onClick: (() => void) | null | undefined;
-    /** Act as if the user clicked the button (highlights, then fires `onClick`). */
+    /** Act as if the user clicked the button (`performClick:`: highlights, then fires `onClick`). */
     click(): void;
   }
 
   export interface ToggleProps extends ViewProps {
-    /** @default "" */
+    /** `-title`. @default "" */
     title?: string;
-    /** @default false */
+    /** `-state` is on. Assigning it does not fire `onChange`. @default false */
     checked?: boolean;
-    /** @default true */
+    /** `-enabled`. @default true */
     enabled?: boolean;
-    /** @default null (the standard control font) */
+    /** `-font`. @default null (the standard control font) */
     font?: Font | null;
   }
 
   export interface CheckboxProps extends ToggleProps {
-    /** Called with the new state after the user toggles the checkbox. */
+    /** The checkbox's action: called with the new state after the user toggles it. */
     onChange?: (checked: boolean) => void;
   }
 
   /**
-   * A checkbox with a title.
+   * A checkbox with a title (`NSButton`). `title`, `checked` and `enabled`
+   * read the control itself.
    *
    * @example
    * ```ts
@@ -1097,8 +1282,9 @@ declare module "bun:appkit" {
    */
   export class Checkbox extends View {
     constructor(props?: CheckboxProps);
+    readonly native: objc.NSButton;
     title: string;
-    /** The current state, as the user left it. */
+    /** Whether the checkbox is on, as the user left it. */
     checked: boolean;
     enabled: boolean;
     font: Font | null;
@@ -1123,6 +1309,7 @@ declare module "bun:appkit" {
    */
   export class Radio extends View {
     constructor(props?: RadioProps);
+    readonly native: objc.NSButton;
     title: string;
     checked: boolean;
     enabled: boolean;
@@ -1132,37 +1319,41 @@ declare module "bun:appkit" {
   }
 
   export interface SwitchProps extends ViewProps {
-    /** @default false */
+    /** `-state` is on. Assigning it does not fire `onChange`. @default false */
     checked?: boolean;
-    /** Called with the new state after the user flips the switch. */
+    /** `-enabled`. @default true */
+    enabled?: boolean;
+    /** The switch's action: called with the new state after the user flips it. */
     onChange?: (checked: boolean) => void;
   }
 
   /**
-   * An on/off switch (`NSSwitch`).
+   * An on/off switch (`NSSwitch`). `checked` and `enabled` read the control itself.
    *
    * @category AppKit
    */
   export class Switch extends View {
     constructor(props?: SwitchProps);
+    readonly native: objc.NSSwitch;
     checked: boolean;
+    enabled: boolean;
     onChange: ((checked: boolean) => void) | null | undefined;
     click(): void;
   }
 
   export interface TextFieldProps extends ViewProps {
-    /** @default "" */
+    /** `-stringValue`. @default "" */
     value?: string;
-    /** Greyed hint shown while empty. @default null */
+    /** `-placeholderString`: greyed hint shown while empty. @default null */
     placeholder?: string | null;
-    /** @default true */
+    /** `-editable`. @default true */
     editable?: boolean;
-    /** @default true */
+    /** `-enabled`. @default true */
     enabled?: boolean;
-    /** @default null */
+    /** `-font`. @default null */
     font?: Font | null;
-    /** @default "natural" */
-    textAlign?: TextAlign;
+    /** `-alignment`, by name or `NSTextAlignment` value. @default "natural" */
+    textAlign?: TextAlign | number;
     /**
      * `true` calls `onChange` on every keystroke; `false` only when editing
      * ends.
@@ -1170,31 +1361,38 @@ declare module "bun:appkit" {
      */
     continuous?: boolean;
     /**
-     * Called with the field's text when the user changes it. Assigning
-     * {@link TextField.value} from code does not call it. With
-     * `continuous: false` it is called once when editing ends, whatever ends
-     * it.
+     * Called with the field's text when the user changes it (the delegate's
+     * `controlTextDidChange:`). Assigning {@link TextField.value} from code
+     * does not call it. With `continuous: false` it is called once when
+     * editing ends or Return is pressed, and not at all if the value was
+     * assigned from code in between.
      */
     onChange?: (value: string) => void;
     /**
-     * Called with the field's text when the user presses Return. A field
-     * without an `onSubmit` handler lets Return press the window's
-     * `kind: "primary"` button instead, as in a native dialog.
+     * Called with the field's text when the user presses Return (the
+     * field's target/action). A field without an `onSubmit` handler lets
+     * Return press the window's default button (the one whose
+     * `keyEquivalent` is Return) instead, as in a native dialog.
      */
     onSubmit?: (value: string) => void;
-    /** Called when the field starts editing (gains keyboard focus and the user types). */
+    /** Called when the field starts editing: it has keyboard focus and the user types (`controlTextDidBeginEditing:`). */
     onFocus?: () => void;
     /**
-     * Called when editing ends: focus leaves the field, Return is pressed, or
-     * the program ends it (hiding or removing the field, replacing the
-     * window's content, closing the window). Delivered before that call
-     * returns.
+     * Called when editing ends (`controlTextDidEndEditing:`): focus leaves
+     * the field, Return is pressed, or the program ends it (hiding or
+     * removing the field, replacing the window's content, closing the
+     * window). Delivered before that call returns, and before the window's
+     * `onClose` when a close ended it.
      */
     onBlur?: () => void;
   }
 
   /**
-   * A single-line text input.
+   * A single-line text input (`NSTextField`). `value`, `placeholder`,
+   * `editable`, `enabled` and `textAlign` read the field itself; its events
+   * come from an `NSTextFieldDelegate` and the field's target/action, which
+   * the class installs (replacing either through {@link View.native} ends
+   * them).
    *
    * @example
    * ```ts
@@ -1213,13 +1411,16 @@ declare module "bun:appkit" {
    */
   export class TextField extends View {
     constructor(props?: TextFieldProps);
+    readonly native: objc.NSTextField;
     /** The current text, including edits the user has made. */
     value: string;
     placeholder: string | null;
     editable: boolean;
     enabled: boolean;
     font: Font | null;
-    textAlign: TextAlign;
+    /** The short `NSTextAlignment` name, or the number for a value with none. */
+    get textAlign(): TextAlign | number;
+    set textAlign(value: TextAlign | number | null | undefined);
     continuous: boolean;
     onChange: ((value: string) => void) | null | undefined;
     onSubmit: ((value: string) => void) | null | undefined;
@@ -1230,44 +1431,54 @@ declare module "bun:appkit" {
   export interface SecureFieldProps extends TextFieldProps {}
 
   /**
-   * A password input that shows bullets instead of the text.
+   * A password input that shows bullets instead of the text (`NSSecureTextField`).
    *
    * @category AppKit
    */
   export class SecureField extends TextField {
     constructor(props?: SecureFieldProps);
+    readonly native: objc.NSSecureTextField;
   }
 
   export interface SearchFieldProps extends TextFieldProps {}
 
   /**
-   * A rounded search input with a magnifier icon and a clear button.
+   * A rounded search input with a magnifier icon and a clear button
+   * (`NSSearchField`). `onSubmit` fires for Return or the search button, not
+   * while typing pauses.
    *
    * @category AppKit
    */
   export class SearchField extends TextField {
     constructor(props?: SearchFieldProps);
+    readonly native: objc.NSSearchField;
   }
 
   export interface TextEditorProps extends ViewProps {
-    /** @default "" */
+    /** `-string`. @default "" */
     value?: string;
-    /** @default true */
+    /** `-editable`. @default true */
     editable?: boolean;
-    /** @default null (the standard system font; pass `{ design: "monospaced" }` for code) */
+    /** `-font`. @default null (the standard system font; pass `{ design: "monospaced" }` for code) */
     font?: Font | null;
-    /** Text colour. @default null (the system text colour) */
+    /** `-textColor`. @default null (the system text colour) */
     color?: Color | null;
     /**
-     * Called with the full text after each user edit. Assigning
-     * {@link TextEditor.value} from code does not call it.
+     * Called with the full text after each user edit (the delegate's
+     * `textDidChange:`). Assigning {@link TextEditor.value} from code does
+     * not call it.
      */
     onChange?: (value: string) => void;
   }
 
   /**
-   * A multi-line, scrolling plain-text editor with undo. Give it a size or
-   * `grow` so it has room.
+   * A multi-line, scrolling plain-text editor with undo: the `NSTextView`
+   * inside the `NSScrollView` that `+[NSTextView scrollableTextView]`
+   * makes ({@link View.native} is the scroll view, `.documentView()` the
+   * text view). `value` and `editable` read the text view; `onChange` comes
+   * from an `NSTextViewDelegate` the class installs, which also gives the
+   * view an undo manager of its own. Give it a size or `grow` so it has
+   * room.
    *
    * @example
    * ```ts
@@ -1278,8 +1489,10 @@ declare module "bun:appkit" {
    */
   export class TextEditor extends View {
     constructor(props?: TextEditorProps);
-    /** The current text, including edits the user has made. */
+    readonly native: objc.NSScrollView;
+    /** `-string`: the current text, including edits the user has made. */
     value: string;
+    /** `-isEditable`. */
     editable: boolean;
     font: Font | null;
     color: Color | null;
@@ -1287,29 +1500,33 @@ declare module "bun:appkit" {
   }
 
   export interface SliderProps extends ViewProps {
-    /** @default 0 */
+    /** `-doubleValue`. @default 0 */
     value?: number;
-    /** @default 0 */
+    /** `-minValue`. @default 0 */
     min?: number;
-    /** @default 1 */
+    /** `-maxValue`. @default 1 */
     max?: number;
     /**
-     * Snap to multiples of `step` (and show tick marks). `0` allows any value.
+     * Snap to multiples of `step` above `min` (and show tick marks when the
+     * range is a whole number of steps). `0` allows any value.
      * @default 0
      */
     step?: number;
     /**
-     * `true` calls `onChange` continuously while dragging; `false` once on
-     * release.
+     * `-continuous`: `true` calls `onChange` continuously while dragging;
+     * `false` once on release.
      * @default true
      */
     continuous?: boolean;
-    /** Called with the new value when the user moves the slider. */
+    /** `-enabled`. @default true */
+    enabled?: boolean;
+    /** Called with the new value when the user moves the slider (its target/action). */
     onChange?: (value: number) => void;
   }
 
   /**
-   * A horizontal slider.
+   * A horizontal slider (`NSSlider`). `value`, `min`, `max`, `continuous`
+   * and `enabled` read the slider itself.
    *
    * @example
    * ```ts
@@ -1320,26 +1537,32 @@ declare module "bun:appkit" {
    */
   export class Slider extends View {
     constructor(props?: SliderProps);
+    readonly native: objc.NSSlider;
     /** The current value, as the user left it. */
     value: number;
     min: number;
     max: number;
     step: number;
     continuous: boolean;
+    enabled: boolean;
     onChange: ((value: number) => void) | null | undefined;
   }
 
   export interface PickerProps extends ViewProps {
-    /** The choices, in order. @default [] */
+    /** `-itemTitles`: the choices, in order (one menu item each). @default [] */
     items?: readonly string[];
-    /** Index of the selected item, `-1` for none. @default 0 once there are items, -1 while `items` is empty */
+    /** `-indexOfSelectedItem`, `-1` for none. @default 0 once there are items, -1 while `items` is empty */
     selectedIndex?: number;
-    /** Called with the index the user picked. */
+    /** `-enabled`. @default true */
+    enabled?: boolean;
+    /** Called with the index the user picked (the button's target/action). */
     onChange?: (index: number) => void;
   }
 
   /**
-   * A pop-up button that picks one item from a list.
+   * A pop-up button that picks one item from a list (`NSPopUpButton`).
+   * `items`, `selectedIndex` and `enabled` read the button itself; an index
+   * assigned before there are enough items takes effect once there are.
    *
    * @example
    * ```ts
@@ -1350,59 +1573,68 @@ declare module "bun:appkit" {
    */
   export class Picker extends View {
     constructor(props?: PickerProps);
+    readonly native: objc.NSPopUpButton;
     items: readonly string[];
     /** The selected index as the user left it, `-1` for none. */
     selectedIndex: number;
+    enabled: boolean;
     onChange: ((index: number) => void) | null | undefined;
   }
 
   export interface SegmentedProps extends ViewProps {
-    /** One label per segment. @default [] */
+    /** `-labelForSegment:`, one label per segment. @default [] */
     items?: readonly string[];
-    /** Index of the selected segment, `-1` for none. @default 0 once there are items, -1 while `items` is empty */
+    /** `-selectedSegment`, `-1` for none. @default 0 once there are items, -1 while `items` is empty */
     selectedIndex?: number;
-    /** Called with the index of the segment the user clicked. */
+    /** `-enabled`. @default true */
+    enabled?: boolean;
+    /** Called with the index of the segment the user clicked (the control's target/action). */
     onChange?: (index: number) => void;
   }
 
   /**
-   * A segmented control that selects one of a few options.
+   * A segmented control that selects one of a few options
+   * (`NSSegmentedControl`, one segment selected at a time). `items`,
+   * `selectedIndex` and `enabled` read the control itself.
    *
    * @category AppKit
    */
   export class Segmented extends View {
     constructor(props?: SegmentedProps);
+    readonly native: objc.NSSegmentedControl;
     items: readonly string[];
     selectedIndex: number;
+    enabled: boolean;
     onChange: ((index: number) => void) | null | undefined;
   }
 
   export interface ProgressProps extends ViewProps {
-    /** @default 0 */
+    /** `-doubleValue`; kept when a later `min`/`max` makes room for it. @default 0 */
     value?: number;
-    /** @default 0 */
+    /** `-minValue`. @default 0 */
     min?: number;
-    /** @default 100 */
+    /** `-maxValue`. @default 100 */
     max?: number;
     /**
-     * Show indefinite activity instead of `value`.
+     * `-indeterminate`: show indefinite activity instead of `value`.
      * @default false
      */
     indeterminate?: boolean;
     /**
-     * Animate the indeterminate bar or spinner.
+     * Animate the indeterminate bar or spinner (`startAnimation:`).
      * @default true
      */
     running?: boolean;
     /**
-     * Draw as a circular spinner instead of a bar.
+     * `-style`: draw as a circular spinner instead of a bar.
      * @default false
      */
     spinner?: boolean;
   }
 
   /**
-   * A progress bar or spinner.
+   * A progress bar or spinner (`NSProgressIndicator`). `value`, `min`, `max`,
+   * `indeterminate` and `spinner` read the indicator itself.
    *
    * @example
    * ```ts
@@ -1418,6 +1650,7 @@ declare module "bun:appkit" {
    */
   export class Progress extends View {
     constructor(props?: ProgressProps);
+    readonly native: objc.NSProgressIndicator;
     value: number;
     min: number;
     max: number;
@@ -1427,18 +1660,22 @@ declare module "bun:appkit" {
   }
 
   export interface ImageProps extends ViewProps {
-    /** @default null */
+    /** `-image`. A file that does not load throws an `Error` whose `path` is the file. @default null */
     image?: ImageSource | null;
-    /** @default "down" */
-    scaling?: ImageScaling;
-    /** Tint for template images and SF Symbols. @default null */
+    /** `-imageScaling`, by name or `NSImageScaling` value. @default "down" */
+    scaling?: ImageScaling | NSImageScalingName | number;
+    /** `-contentTintColor`: tint for template images and SF Symbols. @default null */
     tint?: Color | null;
-    /** Point size for an SF Symbol. @default 0 (the symbol's natural size) */
+    /** Point size for an SF Symbol (`-symbolConfiguration`). @default 0 (the symbol's natural size) */
     size?: number;
+    /** `-enabled`. @default true */
+    enabled?: boolean;
   }
 
   /**
-   * Displays an image file, image bytes, or an SF Symbol.
+   * Displays an image file, image bytes, or an SF Symbol (`NSImageView`).
+   * `scaling` and `enabled` read the view itself; `image`, `tint` and `size`
+   * read as last assigned.
    *
    * @example
    * ```ts
@@ -1451,10 +1688,14 @@ declare module "bun:appkit" {
    */
   export class Image extends View {
     constructor(props?: ImageProps);
+    readonly native: objc.NSImageView;
     image: ImageSource | null;
-    scaling: ImageScaling;
+    /** The curated name, else the `NSImageScaling` name, or the number for a value with none. */
+    get scaling(): ImageScaling | NSImageScalingName | number;
+    set scaling(value: ImageScaling | NSImageScalingName | number | null | undefined);
     tint: Color | null;
     size: number;
+    enabled: boolean;
   }
 
   export interface DividerProps extends ViewProps {
@@ -1469,23 +1710,24 @@ declare module "bun:appkit" {
   }
 
   /**
-   * A one-pixel separator line.
+   * A one-pixel separator line (an `NSBox` of type separator).
    *
    * @category AppKit
    */
   export class Divider extends View {
     constructor(props?: DividerProps);
+    readonly native: objc.NSBox;
     vertical: boolean | null;
   }
 
   export interface SpacerProps extends ViewProps {
-    /** Minimum length along the stack's axis. @default 0 */
+    /** Minimum length along the enclosing stack's or split view's axis. @default 0 */
     minLength?: number;
   }
 
   /**
-   * Empty, stretchable space inside a stack: pushes the views after it to
-   * the far edge. Spacers share leftover space like views with `grow: 1`
+   * Empty, stretchable space inside a stack (a plain `NSView`): pushes the
+   * views after it to the far edge. Spacers share leftover space like views with `grow: 1`
    * (a larger `grow` still applies), so one on each side of a view centres
    * it and two spacers split the space equally. In a `SplitView`,
    * `minLength` holds along the split's axis.
@@ -1503,43 +1745,63 @@ declare module "bun:appkit" {
     minLength: number;
   }
 
-  /** A column of a {@link Table}. A bare string is shorthand for `{ title }`. */
+  /** A column of a {@link Table} (an `NSTableColumn`). A bare string is shorthand for `{ title }`. */
   export interface TableColumn {
-    /** Identifier; defaults to the title. */
+    /** `-identifier`; defaults to the title. */
     id?: string;
-    /** Header text. */
+    /** `-title`: the header text. */
     title: string;
-    /** Width in points; omit or `0` to size automatically. */
+    /** `-width` in points; omit or `0` to size automatically. */
     width?: number;
   }
 
+  /**
+   * What {@link Table.rows} accepts: one inner array per row in column
+   * order, a number or boolean showing as its text; a bare string or number
+   * is a one-cell row.
+   */
+  export type TableRows = ReadonlyArray<ReadonlyArray<string | number | boolean> | string | number>;
+
   export interface TableProps extends ViewProps {
-    /** @default [] */
+    /** `-tableColumns`. Without any the table has one untitled column, which reads as `[]`. @default [] */
     columns?: ReadonlyArray<TableColumn | string>;
     /**
-     * Cell text, one inner array per row in column order. Cells are read
-     * when they are displayed, so a large array is cheap to assign.
+     * Cell text ({@link TableRows}); a missing cell shows empty. The table's
+     * data source reads a cell when its row is displayed
+     * (`tableView:viewForTableColumn:row:`), so a large array is cheap to
+     * assign; the rows are copied when assigned.
      * @default []
      */
-    rows?: ReadonlyArray<ReadonlyArray<string>>;
-    /** Selected row indexes. @default [] */
+    rows?: TableRows;
+    /**
+     * `-selectedRowIndexes`. Indexes past the last row are remembered and
+     * selected once the rows reach them; a single-selection table keeps the
+     * lowest.
+     * @default []
+     */
     selectedIndexes?: readonly number[];
-    /** Allow selecting more than one row. @default false */
+    /** `-allowsMultipleSelection`. @default false */
     multiple?: boolean;
-    /** Show the column header row. `null` shows it once `columns` are given and hides it for the implicit single column. @default null */
+    /** `-headerView` shown or not. `null` shows it once `columns` are given and hides it for the implicit single column. @default null */
     headerVisible?: boolean | null;
-    /** Alternate row background colours. @default false */
+    /** `-usesAlternatingRowBackgroundColors`. @default false */
     alternatingRows?: boolean;
-    /** Row height in points; `null` for the system default (about 24 on current macOS). @default null */
+    /** `-rowHeight` in points; `null` restores the system default. @default the system's (24 on current macOS) */
     rowHeight?: number | null;
-    /** Called with the selected row indexes whenever the user changes the selection. */
+    /** Called with the selected row indexes whenever the user changes the selection (the delegate's `tableViewSelectionDidChange:`). */
     onSelect?: (indexes: number[]) => void;
-    /** Called with the row index when the user double-clicks a row. */
+    /** Called with the row index when the user double-clicks a row (the table's `doubleAction`, reading `-clickedRow`). */
     onActivate?: (row: number) => void;
   }
 
   /**
-   * A scrolling, multi-column table of text cells.
+   * A scrolling, multi-column table of text cells: a view-based
+   * `NSTableView` inside an `NSScrollView` ({@link View.native} is the
+   * scroll view, `.documentView()` the table). One script object the class
+   * installs is the table's data source and delegate, so `rows` stay in
+   * JavaScript and AppKit asks for a cell as its row scrolls into sight;
+   * `selectedIndexes`, `multiple`, `alternatingRows`, `rowHeight` and
+   * `columns` read the table.
    *
    * @example
    * ```ts
@@ -1557,14 +1819,28 @@ declare module "bun:appkit" {
    */
   export class Table extends View {
     constructor(props?: TableProps);
-    columns: ReadonlyArray<TableColumn | string>;
-    rows: ReadonlyArray<ReadonlyArray<string>>;
-    /** The selection as the user left it. */
-    selectedIndexes: readonly number[];
+    readonly native: objc.NSScrollView;
+    /**
+     * `-tableColumns` as `{ id, title, width }` (title and width as they are
+     * now, a column a script added to the `NSTableView` included, though its
+     * cells stay empty); `[]` while the table has only its one untitled column.
+     */
+    get columns(): readonly Required<TableColumn>[];
+    set columns(value: ReadonlyArray<TableColumn | string> | null | undefined);
+    /** The rows as last assigned: a frozen copy, every cell as its text. */
+    get rows(): ReadonlyArray<ReadonlyArray<string>>;
+    set rows(value: TableRows | null | undefined);
+    /** `-selectedRowIndexes`: the selection as the user left it. */
+    get selectedIndexes(): readonly number[];
+    set selectedIndexes(value: readonly number[] | null | undefined);
+    /** `-allowsMultipleSelection`. */
     multiple: boolean;
     headerVisible: boolean | null;
+    /** `-usesAlternatingRowBackgroundColors`. */
     alternatingRows: boolean;
-    rowHeight: number | null;
+    /** `-rowHeight`. */
+    get rowHeight(): number;
+    set rowHeight(value: number | null | undefined);
     onSelect: ((indexes: number[]) => void) | null | undefined;
     onActivate: ((row: number) => void) | null | undefined;
   }
@@ -1700,7 +1976,11 @@ declare module "bun:appkit" {
    */
   export type BlendMode = "alpha" | "premultiplied" | "add" | false;
 
-  /** A clear colour: a {@link Color} string or `[r, g, b, a]` components from 0 to 1. */
+  /**
+   * A clear colour: a {@link Color} string or `[r, g, b, a]` components from
+   * 0 to 1, in sRGB. A system colour name is resolved to its sRGB value for
+   * the current appearance once, when given; Metal has no dynamic colours.
+   */
   export type ClearColor = Color | readonly [r: number, g: number, b: number, a: number];
 
   /** Bytes to upload: any typed array, `DataView` or `ArrayBuffer`. */
@@ -2427,19 +2707,28 @@ declare module "bun:appkit" {
     /**
      * Colour the drawable is cleared to by the first
      * {@link GpuFrame.renderPass renderPass(view)} of each frame (see
-     * {@link ViewPassOptions.clear}). The view's output is colour-matched as
-     * sRGB, like every other view's colours.
+     * {@link ViewPassOptions.clear}): the `MTKView`'s `clearColor`, an
+     * `MTLClearColor` in sRGB, so the view's output is colour-matched like
+     * every other view's colours. Reads back as the string you assigned; the
+     * struct is not something the bridge hands back.
      * @default "#000000"
      */
     clearColor?: Color;
     /**
-     * Target frame rate while the view is on screen and {@link MetalViewProps.running running}.
+     * Target frame rate while the view is on screen and
+     * {@link MetalViewProps.running running}: the `MTKView`'s
+     * `preferredFramesPerSecond`, a whole number kept within 1–240. Reads the
+     * view when Metal is available (so a value set through
+     * {@link View.native native} shows), the assigned value otherwise.
      * @default 60
      */
     preferredFPS?: number;
     /**
-     * Drive `onFrame` from the display's refresh timer. With `false` (or with
-     * no display attached) frames only happen when you call {@link MetalView.draw}.
+     * Drive `onFrame` from the display's refresh timer: the inverse of the
+     * `MTKView`'s `paused`, except that the view is also kept paused while no
+     * display is attached, so with `false` (or headless) frames only happen
+     * when you call {@link MetalView.draw}. Reads back as assigned, since
+     * `paused` alone cannot tell the two reasons apart.
      * @default true
      */
     running?: boolean;
@@ -2450,16 +2739,19 @@ declare module "bun:appkit" {
   }
 
   /**
-   * A view you draw into with Metal (`MTKView`). Each frame it hands
-   * {@link MetalView.onFrame} a {@link GpuFrame}; encode a render pass into
-   * the view with `frame.renderPass(view)` (add `{ depthFormat }` for a depth
-   * buffer) and the result is presented when the frame commits
-   * (automatically after `onFrame` returns, unless you committed it
-   * yourself). It sizes like any other view: give it `width`/`height` or
-   * `grow`.
+   * A view you draw into with Metal: {@link View.native native} is the
+   * `MTKView` (a plain `NSView` when {@link Gpu.available} is `false`), whose
+   * `MTKViewDelegate` is native code that calls {@link MetalView.onFrame}
+   * from `drawInMTKView:` and {@link MetalView.onResize} from
+   * `mtkView:drawableSizeWillChange:`. Each frame it hands `onFrame` a
+   * {@link GpuFrame}; encode a render pass into the view with
+   * `frame.renderPass(view)` (add `{ depthFormat }` for a depth buffer) and
+   * the result is presented when the frame commits (automatically after
+   * `onFrame` returns, unless you committed it yourself). It sizes like any
+   * other view: give it `width`/`height` or `grow`.
    *
-   * Without a GPU ({@link Gpu.available} `false`) the view still takes part
-   * in layout but never produces frames.
+   * Without a GPU the view still takes part in layout but never produces
+   * frames.
    *
    * @example
    * ```ts
@@ -2484,14 +2776,19 @@ declare module "bun:appkit" {
     /** The same object as the module's {@link gpu} export. */
     readonly gpu: Gpu;
     /**
-     * Called once per frame with a fresh {@link GpuFrame}. If the handler
-     * returns without committing the frame it is committed for you; if it
-     * throws, the frame is dropped and the error is reported. A frame the
-     * GPU later fails to run is reported the same way, as a
-     * {@link GpuExecutionError}, before the next call.
+     * Called once per frame (`MTKViewDelegate` `drawInMTKView:`, synchronously)
+     * with a fresh {@link GpuFrame}. If the handler returns without
+     * committing the frame it is committed for you; if it throws, the frame
+     * is dropped and the error is reported. A frame the GPU later fails to
+     * run is reported the same way, as a {@link GpuExecutionError}, before
+     * the next call.
      */
     onFrame: ((frame: GpuFrame, info: FrameInfo) => void) | null | undefined;
-    /** Called with the new drawable size in pixels when the view resizes or changes screen. */
+    /**
+     * Called with the new drawable size in pixels when the view resizes or
+     * changes screen (`MTKViewDelegate` `mtkView:drawableSizeWillChange:`,
+     * delivered once the call that caused the layout has returned).
+     */
     onResize: ((size: Size) => void) | null | undefined;
     /**
      * Render one frame now, synchronously running `onFrame`. This is how a
@@ -2511,9 +2808,149 @@ declare module "bun:appkit" {
   }
 
   /**
+   * Storage for an out-parameter: an argument whose Objective-C type is a
+   * pointer to one value (`NSError **`, `BOOL *`, `double *`,
+   * `NSRangePointer`). {@link ObjC.out `objc.out()`} makes one; a plain `{}`
+   * works too (such a parameter is typed `Partial<ObjCOut<T>>`). A parameter that is a C array or buffer the method indexes
+   * (`unichar *buffer` with a `range:`, `id objects[]` with a `count:`,
+   * `char *`, `const CGFloat *`) is not this: it accepts only `null`, and
+   * needs `bun:ffi` otherwise.
+   *
+   * Passing one where a method takes such a pointer hands the method storage
+   * holding `value` (zero / `nil` when unset); after the call `value` is what
+   * the method left there (`null` for `nil`). Passing `null` instead, or
+   * leaving off out-parameters at the end of the argument list, passes
+   * `NULL`. The other way round, a block or a {@link ObjC.defineClass defined}
+   * method receives one for each pointer argument it is called with: `value`
+   * is what the caller's storage holds for numbers, booleans and structs (an
+   * enumeration's `stop` reads `false`), starts `null` for an out-only
+   * object pointer (`NSError **`) and holds the caller's object for one
+   * declared `inout` (`N^@`, KVC validation), and what the function leaves
+   * in `value` is stored back when it returns (converted like any argument
+   * of the pointed-to type).
+   *
+   * @example
+   * ```ts
+   * const error = objc.out<ObjCObject | null>();
+   * const attrs = NSFileManager.defaultManager().attributesOfItemAtPath_error_(path, error);
+   * if (attrs === null) console.error(`${error.value!.localizedDescription()}`);
+   * ```
+   */
+  export interface ObjCOut<T = any> {
+    value: T;
+  }
+
+  /**
+   * The members of one `NS_ENUM` / `NS_OPTIONS` type from
+   * {@link ObjC.enums `objc.enums`}, under both their short name (Apple's
+   * member name less the prefix it shares with the type, first word in lower
+   * case: `titled`, `byWordWrapping`, `png`) and their full name
+   * (`NSWindowStyleMaskTitled`). Frozen; `Object.keys()` lists both
+   * spellings. `Short` names the members; `Big` those whose value is above
+   * 2^53 and so a `bigint` (`NSEventMask.any`).
+   */
+  export type ObjCEnum<Short extends string = never, Big extends string = never> = {
+    readonly [K in Short]: number;
+  } & { readonly [K in Big]: bigint } & { readonly [member: string]: number };
+
+  /**
+   * The `Error` a message sent through {@link objc} throws when the method
+   * raises an Objective-C exception (`[array objectAtIndex:99]`,
+   * `[dict setObject:nil forKey:k]`). The process carries on; whatever the
+   * method had done before raising stays done.
+   */
+  export interface ObjCException extends Error {
+    readonly code: "ERR_OBJC_EXCEPTION";
+    /** The `NSException` name, e.g. `"NSRangeException"` (the class name for anything else thrown, or for an exception made without a name). */
+    name: string;
+    /** The `NSException` reason, `""` when it has none (`-description` for anything else thrown). */
+    message: string;
+    /** `-[NSException userInfo]` printed with `-description`, when there is one. */
+    readonly userInfo?: string;
+    /** The thrown object itself, usually an `NSException`; absent only when `nil` was thrown. */
+    readonly exception?: ObjCObject;
+  }
+
+  /**
+   * One instance method of a class made with {@link ObjC.defineClass}: the
+   * function alone, or the function with the method's Objective-C type
+   * encoding when nothing else declares it; or, for a method that answers
+   * the same every time (`isFlipped`, `acceptsFirstResponder`), that answer.
+   *
+   * The function runs on the main thread, synchronously, inside whatever sent
+   * the message (AppKit dispatching an event, or your own bridged call), with
+   * the receiving object's handle as `this` and the arguments converted the
+   * way message results are (objects as {@link ObjCObject}, never unboxed).
+   * What it returns is converted the way message arguments are for the
+   * method's return type. If it throws, or returns something that does not
+   * fit, that is reported as an uncaught JavaScript error and the sender gets
+   * `0` / `NO` / `nil`.
+   *
+   * A constant (`isFlipped: true`, `tag: 7`, `menu: null`) becomes a native
+   * method that returns it without calling into JavaScript, so it costs
+   * nothing and answers on any thread. It must fit the return type: a
+   * boolean for `BOOL`, a number for the numeric types, `null` for an
+   * object, class, selector or pointer.
+   */
+  export type ObjCMethod =
+    | ((this: ObjCObject, ...args: any[]) => unknown)
+    | ObjCConstant
+    | {
+        /**
+         * The method's type encoding, return type first, then `@:` for the
+         * receiver and selector, then one code per argument:
+         * `"v@:@"` (void, one object), `"B@:"` (BOOL, none), `"q@:@q"`
+         * (NSInteger; object, NSInteger), `"{CGSize=dd}@:@"` (a struct).
+         * Needed only when no adopted protocol and no superclass declares the
+         * selector; without it such a method takes and returns objects.
+         */
+        types?: string;
+        fn: (this: ObjCObject, ...args: any[]) => unknown;
+      }
+    | { types?: string; value: ObjCConstant };
+
+  /** What a defined method can return without a function: see {@link ObjCMethod}. */
+  export type ObjCConstant = boolean | number | bigint | null;
+
+  /** What {@link ObjC.defineClass} takes. */
+  export interface ObjCClassDefinition {
+    /**
+     * The Objective-C class name (letters, digits, `_`). Must not be taken;
+     * omitted, one is generated. The class is then also reachable as
+     * `objc.classes[name]`.
+     */
+    name?: string;
+    /** The class to extend, by name or handle. Default `NSObject`. */
+    superclass?: string | ObjCClass | ObjCObject;
+    /**
+     * Protocols the class adopts, by name (`"NSTableViewDataSource"`,
+     * `"NSWindowDelegate"`). `conformsToProtocol:` then answers for them,
+     * and their method declarations type the methods below, optional ones
+     * included. Every method a protocol marks required must be defined or
+     * inherited. Any protocol the Foundation, AppKit, QuartzCore, Metal and
+     * MetalKit headers declare works, registered at run time or not; another
+     * framework's must be registered by it. An unknown name is a `TypeError`.
+     */
+    protocols?: string[];
+    /**
+     * Instance methods keyed by selector, with colons
+     * (`"tableView:objectValueForTableColumn:row:"`, `"isFlipped"`) or with
+     * underscores the way sends spell them
+     * (`tableView_objectValueForTableColumn_row_`). Each replaces any
+     * superclass implementation outright; there is no `super` call, so
+     * `init…` methods cannot be defined, and neither can the
+     * reference-counting methods, `dealloc`, `forwardInvocation:` or
+     * `methodSignatureForSelector:`.
+     */
+    methods: { [selector: string]: ObjCMethod };
+  }
+
+  /**
    * A handle on an Objective-C object (an `id`), from {@link objc} or from a
    * {@link Window.native}/{@link View.native}. It keeps the object retained
-   * until it is garbage collected.
+   * until it is garbage collected. One object has one handle for as long as
+   * the handle is reachable, so `===` compares objects; a class always comes
+   * back as its {@link ObjCClass}.
    *
    * Every property is a method that sends the selector of the same name,
    * spelled PyObjC style: each `_` stands for a `:` and the call takes
@@ -2528,6 +2965,14 @@ declare module "bun:appkit" {
    * unboxed; use `${object}`, {@link ObjC.js `objc.js()`} or the object's
    * own methods (`UTF8String()`, `intValue()`) to get JavaScript values.
    *
+   * `"count" in handle` tells whether the object responds to that selector,
+   * `Object.keys(handle)` lists the selectors its classes implement (spelled
+   * as properties), `console.log(handle)` prints `[objc ClassName: description]`,
+   * `using` releases the handle at the end of the block, and the Foundation
+   * collections are iterable: an `NSArray`, `NSSet` or `NSOrderedSet` yields
+   * its objects, an `NSDictionary` its keys, an `NSIndexSet` its indexes, an
+   * `NSEnumerator` what it has left.
+   *
    * @example
    * ```ts
    * const { NSMutableArray } = objc.classes;
@@ -2535,6 +2980,7 @@ declare module "bun:appkit" {
    * list.addObject_("one");          // strings box to NSString
    * list.count();                    // 1
    * `${list.objectAtIndex_(0)}`;     // "one"
+   * for (const item of list) console.log(objc.js(item));
    * ```
    */
   export interface ObjCObject {
@@ -2551,12 +2997,39 @@ declare module "bun:appkit" {
     /** What {@link ObjC.js `objc.js()`} gives for the object, or its `-description` when that is still an object. */
     toJSON(): unknown;
     /**
-     * Give up this handle's reference now instead of at garbage collection.
-     * Every later use of the handle throws `ERR_INVALID_STATE`. The
-     * `retain`/`release`/`autorelease` selectors themselves are refused:
-     * reference counting is the handle's job.
+     * Give back one acquisition of the object: each result that produced it
+     * (a send's, an out-parameter's, `objc.ns()`, a read of
+     * {@link View.native}/{@link Window.native}) counted one, and the
+     * receiver and arguments of a callback count none. With the last one
+     * the handle's reference goes now instead of at garbage collection and
+     * every later use of it throws `ERR_INVALID_STATE`, for every variable
+     * and earlier result that refers to the same object (one object has one
+     * handle); a message that returns the object afterwards mints a fresh
+     * handle. The `retain`/`release`/`autorelease` selectors themselves are
+     * refused: reference counting is the handle's job.
      */
     release(): void;
+    /** {@link ObjCObject.release release()}, for `using handle = …`: gives back what the initialiser's send acquired when the block ends. */
+    [Symbol.dispose](): void;
+    /**
+     * On a block object: call it with `args`, converted by the type
+     * signature the block was compiled with (a block from
+     * {@link ObjC.block `objc.block()`} or one a framework handed over, such
+     * as a completion handler a defined method receives). On any other
+     * object this is the `invoke` selector (`NSInvocation` has one).
+     * @throws TypeError if the block records no signature, or the arguments do not fit it.
+     */
+    invoke(...args: unknown[]): any;
+    /**
+     * The elements of an `NSArray`, `NSSet`, `NSOrderedSet` or `NSHashTable`,
+     * the keys of an `NSDictionary` or `NSMapTable`, the indexes of an
+     * `NSIndexSet`, or what an `NSEnumerator` has left, as handles (numbers
+     * for indexes); the generated declarations for those classes say which
+     * (`objc.NSArray` yields `ObjCObject`, `objc.NSIndexSet` `number`). Reads
+     * as `undefined` on any other object, which is therefore not iterable;
+     * on an untyped handle the element type is `any`.
+     */
+    [Symbol.iterator](): IterableIterator<any>;
     /** The object's address. */
     readonly [objc.pointer]: bigint;
     /**
@@ -2586,8 +3059,11 @@ declare module "bun:appkit" {
     toJSON(): unknown;
     /**
      * `+alloc`. The only thing to do with the result is send it an `init…`;
-     * the allocation itself happens then, so an `init…` that throws leaves
-     * nothing behind. Anything else on the result throws a `TypeError`.
+     * the allocation itself waits until then (or, for a class cluster whose
+     * instances alone know their `init…` methods, until the first `init…` is
+     * looked up), so an `init…` that throws leaves nothing initialised
+     * behind. Anything else on the result throws a `TypeError` until an
+     * `init…` has succeeded.
      */
     readonly alloc: () => ObjCObject;
     // A property, because `new(): T` in an interface would be a construct signature.
@@ -2597,123 +3073,384 @@ declare module "bun:appkit" {
   }
 
   /**
-   * Classes {@link ObjC.classes `objc.classes`} knows by name, so that
+   * The classes {@link ObjC.classes `objc.classes`} has declarations for
+   * (appkit-objc.generated.d.ts), so that their methods complete and
    * destructuring them type-checks under `noUncheckedIndexedAccess`. Every
-   * other name is an {@link ObjCClass} too; this list only spares the `!`.
+   * other name is an {@link ObjCClass} too.
    */
-  export interface ObjCKnownClasses {
-    readonly NSObject: ObjCClass;
-    readonly NSString: ObjCClass;
-    readonly NSMutableString: ObjCClass;
-    readonly NSAttributedString: ObjCClass;
-    readonly NSNumber: ObjCClass;
-    readonly NSValue: ObjCClass;
-    readonly NSData: ObjCClass;
-    readonly NSDate: ObjCClass;
-    readonly NSURL: ObjCClass;
-    readonly NSArray: ObjCClass;
-    readonly NSMutableArray: ObjCClass;
-    readonly NSDictionary: ObjCClass;
-    readonly NSMutableDictionary: ObjCClass;
-    readonly NSSet: ObjCClass;
-    readonly NSNull: ObjCClass;
-    readonly NSError: ObjCClass;
-    readonly NSBundle: ObjCClass;
-    readonly NSProcessInfo: ObjCClass;
-    readonly NSUserDefaults: ObjCClass;
-    readonly NSNotificationCenter: ObjCClass;
-    readonly NSFileManager: ObjCClass;
-    readonly NSRunLoop: ObjCClass;
-    readonly NSTimer: ObjCClass;
-    readonly NSApplication: ObjCClass;
-    readonly NSWindow: ObjCClass;
-    readonly NSView: ObjCClass;
-    readonly NSStackView: ObjCClass;
-    readonly NSScrollView: ObjCClass;
-    readonly NSTableView: ObjCClass;
-    readonly NSTextView: ObjCClass;
-    readonly NSTextField: ObjCClass;
-    readonly NSButton: ObjCClass;
-    readonly NSControl: ObjCClass;
-    readonly NSBox: ObjCClass;
-    readonly NSImage: ObjCClass;
-    readonly NSImageView: ObjCClass;
-    readonly NSColor: ObjCClass;
-    readonly NSFont: ObjCClass;
-    readonly NSMenu: ObjCClass;
-    readonly NSMenuItem: ObjCClass;
-    readonly NSScreen: ObjCClass;
-    readonly NSWorkspace: ObjCClass;
-    readonly NSPasteboard: ObjCClass;
-    readonly NSCursor: ObjCClass;
-    readonly NSEvent: ObjCClass;
-    readonly NSAlert: ObjCClass;
-    readonly NSOpenPanel: ObjCClass;
-    readonly NSSavePanel: ObjCClass;
-    readonly NSSound: ObjCClass;
-    readonly NSAnimationContext: ObjCClass;
-    readonly NSLayoutConstraint: ObjCClass;
-    readonly NSVisualEffectView: ObjCClass;
-    readonly CALayer: ObjCClass;
-    readonly MTKView: ObjCClass;
+  export interface ObjCKnownClasses {}
+
+  /**
+   * Types for what the {@link objc} bridge hands out, under the names
+   * Objective-C uses: `objc.NSWindow` is a handle on an `NSWindow` (an
+   * {@link ObjCObject} with that class's instance methods and its
+   * superclasses' spelled out), `objc.classes.NSWindow` the type of the
+   * class object `objc.classes.NSWindow` (its class methods),
+   * `objc.protocols.NSTableViewDelegate` an object conforming to that
+   * protocol (its `@optional` methods declared optional: test
+   * `"tableView_viewForTableColumn_row_" in delegate` before calling one),
+   * `objc.NSWindowStyleMask` a member of that enumeration (a number, or
+   * `number | bigint` for the few with a member above 2^53), and
+   * `objc.CGRect` and the rest below the structs that cross as objects. The classes, protocols and enumerations are generated from the
+   * macOS SDK (appkit-objc.generated.d.ts) for the classes `bun:appkit`
+   * builds on and the common Foundation and AppKit ones; any other class is
+   * a plain {@link ObjCObject}, any other selector on these is still `any`.
+   */
+  export namespace objc {
+    /**
+     * What a parameter of type `id` accepts: a handle, or a JavaScript value
+     * the bridge boxes the way {@link ObjC.ns `objc.ns()`} does.
+     */
+    type Id =
+      | ObjCObject
+      | ObjCClass
+      | string
+      | number
+      | boolean
+      | bigint
+      | Date
+      | ArrayBufferView
+      | ArrayBufferLike
+      | readonly unknown[]
+      | { readonly [key: string]: unknown };
+    /** `CGPoint` / `NSPoint`. */
+    interface CGPoint {
+      x: number;
+      y: number;
+    }
+    /** `CGSize` / `NSSize`. */
+    interface CGSize {
+      width: number;
+      height: number;
+    }
+    /** `CGRect` / `NSRect`. A parameter also takes the flat {@link Rect}. */
+    interface CGRect {
+      origin: CGPoint;
+      size: CGSize;
+    }
+    interface CGVector {
+      dx: number;
+      dy: number;
+    }
+    /** `NSRange`. `location` is {@link ObjC.NSNotFound `objc.NSNotFound`}, a `bigint`, in a range that reports no match. */
+    interface NSRange {
+      location: number | bigint;
+      length: number;
+    }
+    interface NSEdgeInsets {
+      top: number;
+      left: number;
+      bottom: number;
+      right: number;
+    }
+    interface NSDirectionalEdgeInsets {
+      top: number;
+      leading: number;
+      bottom: number;
+      trailing: number;
+    }
+    interface CGAffineTransform {
+      a: number;
+      b: number;
+      c: number;
+      d: number;
+      tx: number;
+      ty: number;
+    }
+    interface CATransform3D {
+      m11: number;
+      m12: number;
+      m13: number;
+      m14: number;
+      m21: number;
+      m22: number;
+      m23: number;
+      m24: number;
+      m31: number;
+      m32: number;
+      m33: number;
+      m34: number;
+      m41: number;
+      m42: number;
+      m43: number;
+      m44: number;
+    }
   }
 
   /** The {@link objc} export. */
   export interface ObjC {
     /**
      * Any Objective-C class the loaded frameworks (Foundation, AppKit,
-     * QuartzCore, Metal) register, by name. Under `noUncheckedIndexedAccess`
-     * a name outside {@link ObjCKnownClasses} reads as possibly `undefined`
-     * to TypeScript; at run time it is a class or a `TypeError`, never
-     * `undefined`, so `objc.classes.NSRareThing!` is safe.
+     * QuartzCore, Metal) register, by name. The ones `bun:appkit` builds on
+     * and the common Foundation and AppKit classes ({@link ObjCKnownClasses})
+     * are typed with their methods (`objc.classes.NSWindow` is an
+     * {@link objc.classes.NSWindow}, what it makes an {@link objc.NSWindow});
+     * every other name is a plain {@link ObjCClass}, which under
+     * `noUncheckedIndexedAccess` reads as possibly `undefined` to TypeScript;
+     * at run time it is a class or a `TypeError`, never `undefined`, so
+     * `objc.classes.NSRareThing!` is safe.
      * @throws TypeError for a name that is not a registered class.
      */
     readonly classes: { readonly [name: string]: ObjCClass } & ObjCKnownClasses;
+    /**
+     * Any protocol the loaded frameworks register, by name, as the `Protocol`
+     * object `conformsToProtocol:` and the like take. Same
+     * `noUncheckedIndexedAccess` caveat as {@link ObjC.classes}.
+     * @throws TypeError for a name no loaded framework registers.
+     */
+    readonly protocols: { readonly [name: string]: ObjCObject };
+    /**
+     * The constants the loaded frameworks export as globals, by name:
+     * `NSString` keys and names (`NSFontAttributeName`,
+     * `NSWindowDidResizeNotification`, `NSDefaultRunLoopMode`) come back as
+     * handles, and the numbers and structs Foundation and AppKit declare
+     * (`NSFontWeightBold`, `NSViewNoIntrinsicMetric`, `NSZeroRect`, and the
+     * CoreFoundation and C numbers their headers pull in) as numbers and
+     * objects. Anything else is read as an object, after a check that the
+     * global holds one; use {@link ObjC.constant} to give another type.
+     * Same `noUncheckedIndexedAccess` caveat as {@link ObjC.classes}.
+     * @throws TypeError for a name no loaded framework exports, the name of
+     * a function, or a global outside the table that does not hold an object.
+     */
+    readonly constants: { readonly [name: string]: unknown };
+    /**
+     * One exported constant read as the type encoding `type` says: `"@"` (an
+     * object, the default outside the built-in table), `"d"` / `"f"`
+     * (`double` / `float`), `"q"` / `"Q"` (`NSInteger` / `NSUInteger`), `"B"`,
+     * or a struct such as `"{CGSize=dd}"`. An `"@"` read is checked (the
+     * global must hold nil or a pointer to an instance of a registered
+     * class); reading a constant as any other type it does not have is
+     * undefined behaviour, as in C.
+     *
+     * @example
+     * ```ts
+     * objc.constant("NSFontWeightHeavy", { type: "d" }); // 0.56
+     * objc.constant("kCAGravityCenter");                 // a handle on the NSString
+     * ```
+     * @throws TypeError for a name no loaded framework exports, the name of
+     * an exported function, or a type that is not a value type.
+     */
+    constant(name: string, options?: { type?: string }): unknown;
+    /**
+     * Every `NS_ENUM`, `NS_OPTIONS` and `NS_CLOSED_ENUM` of Foundation,
+     * AppKit, QuartzCore, Metal and MetalKit by type name, as an
+     * {@link ObjCEnum} of its members (`objc.enums.NSWindowStyleMask.titled`,
+     * `objc.enums.NSEventType.keyDown`, `objc.enums.MTLPixelFormat.bgra8Unorm`);
+     * and every member, every constant of an unnamed enum and every
+     * `static const` number of those headers by its full name, as the number
+     * itself (`objc.enums.NSWindowStyleMaskTitled`,
+     * `objc.enums.NSUTF8StringEncoding`, `objc.enums.NSModalResponseOK`,
+     * `objc.enums.NSUpArrowFunctionKey`). The few values above 2^53
+     * (`NSNotFound`, `NSUIntegerMax` masks) are `bigint`s. Generated from the
+     * macOS SDK, so the values are the ones the frameworks on this
+     * architecture use, and all of those names are typed
+     * ({@link objc.Enums}); only a member's full name on its enumeration
+     * (`objc.enums.NSWindowStyleMask.NSWindowStyleMaskTitled`) is left to the
+     * index signature. An enumeration-typed parameter in the generated
+     * declarations (`objc.NSWindowStyleMask`) takes these numbers, and a
+     * `bigint` for the masks above 2^53.
+     * @throws TypeError for a name that is neither.
+     */
+    readonly enums: objc.Enums & { readonly [name: string]: number };
+    /**
+     * Storage to pass for an out-parameter (`NSError **`, `BOOL *`,
+     * `NSRangePointer`, …): one value, holding `value` going in; read
+     * `.value` after the call. See {@link ObjCOut}.
+     */
+    out<T = any>(value?: T): ObjCOut<T>;
     /** A selector value for a `SEL`-typed argument (a string works there too); a `TypeError` anywhere else. */
     sel(name: string): ObjCSelector;
     /**
+     * Define an Objective-C class whose instance methods are JavaScript
+     * functions, for delegates, data sources, targets and subclass
+     * overrides. Returns the class; make instances with `.new()` or
+     * `.alloc().init…()` like any other. AppKit calls the methods on the
+     * main thread from inside event dispatch (or from inside your own call
+     * that triggered them, such as `reloadData()`); a message from another
+     * thread is not delivered, reads as `0` / `nil` there, and is reported
+     * as an uncaught error.
+     *
+     * Each method's type encoding is, in order: its `types`; what a listed
+     * protocol declares for the selector; what the superclass implements for
+     * it; what Foundation's and AppKit's protocols declare for it when none
+     * is listed and they agree (a `TypeError` when they conflict); otherwise
+     * object return and object arguments. Supported types are the ones in
+     * the `objc` table except C-string and pointer returns; a block
+     * argument arrives as a handle to {@link ObjCObject.invoke invoke}.
+     *
+     * Most AppKit setters that take one of these objects (`setDelegate:`,
+     * `setDataSource:`, `setTarget:`) hold it zeroing-weak: keep your
+     * handle referenced for as long as AppKit should call it, and once it
+     * is gone the property reads `nil`. For the few properties still
+     * declared `assign` instead (`NSXMLParser.delegate`,
+     * `NSComboBox.dataSource`, `NSCache.delegate`, `NSTextFinder.client`
+     * and the like) the bridge has the receiver hold what you set until you
+     * set another value or `null`, so those never dangle either. The class,
+     * its functions and whatever they close over live for the rest of the
+     * process, so define classes once at module scope.
+     *
+     * @example
+     * ```ts
+     * const DataSource = objc.defineClass({
+     *   protocols: ["NSTableViewDataSource"],
+     *   methods: {
+     *     "numberOfRowsInTableView:": () => rows.length,
+     *     tableView_objectValueForTableColumn_row_: (_table, _column, row) => rows[row],
+     *   },
+     * });
+     * const dataSource = DataSource.new();
+     * tableView.setDataSource_(dataSource);
+     *
+     * const Flipped = objc.defineClass({
+     *   superclass: "NSView",
+     *   methods: { isFlipped: () => true },
+     * });
+     * ```
+     * @throws TypeError for a taken or malformed name, an unknown superclass
+     * or protocol, a required protocol method left undefined, a type
+     * encoding that does not parse or does not match the selector's argument
+     * count, a function declaring more parameters than that, an `init…`
+     * selector, or an unsupported type.
+     */
+    defineClass(definition: ObjCClassDefinition): ObjCClass;
+    /**
+     * An object to install as a control's or menu item's `target`, whose
+     * `action:` method calls `fn` with the sender. Set the control's action
+     * to `"action:"`. `NSControl` and `NSMenuItem` do not retain their
+     * target: keep the returned handle referenced while it should fire. The
+     * object keeps `fn` alive and lets it go when it deallocates.
+     *
+     * @example
+     * ```ts
+     * const target = objc.target(sender => console.log(`${sender} clicked`));
+     * button.setTarget_(target);
+     * button.setAction_("action:");
+     * ```
+     */
+    target(fn: (this: ObjCObject, sender: ObjCObject | null) => unknown): ObjCObject;
+    /**
+     * An Objective-C block whose body is `fn`, to pass where a method takes
+     * a block (`@?`). `types` is the block's type encoding: the return type,
+     * `@?` for the block itself, then one code per argument (`"v@?"` for
+     * `void (^)(void)`, `"v@?@Q^B"` for `void (^)(id, NSUInteger, BOOL *)`,
+     * `"q@?@@"` for an `NSComparator`); without it the block returns `void`
+     * and takes one object per parameter `fn` declares. Only the encodings
+     * the `bun:appkit` documentation lists are supported.
+     *
+     * For the block parameters of Foundation, AppKit, QuartzCore, Metal and
+     * MetalKit methods (`enumerateObjectsUsingBlock:`,
+     * `sortedArrayUsingComparator:`, `addOperationWithBlock:`, NSTimer's
+     * block timers, `beginSheetModalForWindow:completionHandler:`, ...) the
+     * bridge knows the type, so a plain function can be passed directly
+     * where that type is a supported one, and a block of a different type
+     * passed there is a `TypeError`. For any other method `types` must
+     * match its block parameter exactly, as in C: a mismatch is undefined
+     * behaviour, not an error.
+     *
+     * `fn` runs on the main thread inside whatever calls the block, with the
+     * arguments converted the way message results are; a `BOOL *` argument
+     * (an enumeration's `stop`) arrives as an {@link ObjCOut}. Its return
+     * value is converted for the block's return type. A throw, or a value
+     * that does not fit, is reported as an uncaught error and the caller
+     * gets `0` / `NO` / `nil` (and every `BOOL *` set, so an enumeration
+     * ends). A call on another thread returns zero without running `fn`
+     * and is reported as an uncaught error on the main thread. The block
+     * keeps `fn` alive while anything retains it. The returned handle
+     * cannot be sent messages, only passed, released, or called with
+     * {@link ObjCObject.invoke `.invoke(...args)`}.
+     *
+     * @example
+     * ```ts
+     * list.enumerateObjectsUsingBlock_((obj, index, stop) => {
+     *   if (index === 2) stop.value = true;
+     * });
+     * const expr = NSExpression.expressionForBlock_arguments_(
+     *   objc.block((object, expressions, context) => `got ${object}`, "@@?@@@"),
+     *   [],
+     * );
+     * ```
+     * @throws TypeError when `types` does not parse or is not a supported
+     * block signature (the message lists them).
+     */
+    block(fn: (...args: any[]) => unknown, types?: string): ObjCObject;
+    /**
      * Convert Foundation values to JavaScript: `NSString` to string,
-     * `NSNumber` to number or boolean, `NSArray` to an array and
-     * `NSDictionary` to an object (converted element by element), `NSNull`
-     * and `nil` to `null`. Anything else comes back as the {@link ObjCObject}
-     * it was; JavaScript values pass through unchanged.
+     * `NSNumber` to number or boolean, `NSData` to a `Uint8Array` (copied),
+     * `NSDate` to a `Date`, `NSArray` to an array and `NSDictionary` to an
+     * object (converted element by element), `NSNull` and `nil` to `null`.
+     * Anything else comes back as the {@link ObjCObject} it was; JavaScript
+     * values pass through unchanged.
      */
     js(value: unknown): unknown;
     /**
      * The reverse of {@link ObjC.js}: string to `NSString`, number and
-     * boolean to `NSNumber`, array to `NSArray`, plain object to
+     * boolean to `NSNumber`, `Date` to `NSDate`, `ArrayBuffer` or any view of
+     * one to `NSData` (copied), array to `NSArray`, plain object to
      * `NSDictionary`, `null`/`undefined` to `nil` (returned as `null`).
-     * An `ObjCObject` gives another handle on the same object.
+     * An `ObjCObject` comes back as it is.
      */
     ns(value: unknown): ObjCObject | null;
     /**
-     * Whether two live handles refer to the same Objective-C object (`a == b`
-     * on the `id`s). A handle is also the same as itself; anything that is
-     * not a handle, including `null`, and a released handle compared with
-     * another, is not.
+     * Whether `a` and `b` are handles on the same Objective-C object. One
+     * object has one handle, so this is `a === b` for handles; anything that
+     * is not a handle, including `null`, is not the same as anything.
      */
     same(a: ObjCObject | ObjCClass | null | undefined, b: ObjCObject | ObjCClass | null | undefined): boolean;
     /** The property key under which every {@link ObjCObject} and {@link ObjCClass} reports its address as a `bigint`. */
     readonly pointer: unique symbol;
+    /**
+     * `NSNotFound` (`NSIntegerMax`, 2^63 - 1), as the `bigint` that
+     * `indexOfObject:`, `rangeOfString:` and the like return when there is
+     * no match. Integer results above 2^53 are always `bigint`s, so
+     * `list.indexOfObject_(x) === objc.NSNotFound` is exact.
+     */
+    readonly NSNotFound: bigint;
   }
 
   /**
-   * Direct access to the Objective-C runtime: every class and selector of the
-   * frameworks `bun:appkit` loads, under Apple's own names, for the cases the
-   * classes above do not cover. Main thread only, like the rest of the
-   * module; it does not need the app to be running.
+   * The Objective-C bridge the classes above are written on: every class and
+   * selector of the frameworks `bun:appkit` loads, under Apple's own names,
+   * and so also everything those classes do not cover. It does not need the
+   * app to be running.
+   * Main thread only, like the rest of the module: the Objective-C runtime
+   * itself is thread-safe, but the bridge keeps its handles, defined classes,
+   * blocks and autorelease pools on the main thread's JavaScript heap and
+   * event loop, so in a `Worker` every call throws (`objc.sel()`,
+   * `objc.enums` and `objc.NSNotFound`, which touch no object, work anywhere).
    *
-   * Not supported yet: block arguments, pointer arguments other than `null`
-   * (so no out-parameters such as `NSError **`; a pointer result is `null`
-   * for `NULL` and otherwise its address as a `bigint`, which nothing
-   * accepts back), structs other than
-   * `CGRect`/`CGPoint`/`CGSize`/`NSRange`/`NSEdgeInsets`/`CGAffineTransform`,
-   * defining subclasses, and variadic methods (`stringWithFormat:`,
-   * `arrayWithObjects:`, `dictionaryWithObjectsAndKeys:` and the like, which
-   * are recognised by name; use `stringWithString:`, `objc.ns([...])` or
-   * `predicateWithFormat:argumentArray:` instead); those throw a `TypeError`.
-   * An Objective-C exception raised by a method you call still ends the
-   * process.
+   * Where a method takes a block, pass a function (for the methods whose
+   * block type the bridge knows) or {@link ObjC.block `objc.block(fn, types)`};
+   * where it takes a pointer to a value (`NSError **`, `double *`,
+   * `NSRangePointer`), pass {@link ObjC.out `objc.out()`} or `null`.
+   * A `CGColorRef`, `CGColorSpaceRef`, `CGImageRef`, `CGPathRef` or
+   * `CGContextRef` crosses as an object handle either way (they are
+   * Objective-C objects at run time), so `layer.setBackgroundColor_(color.CGColor())`
+   * works; only a handle on an object of that type (or `null`) is accepted
+   * as one, and the result of a `create…` method is released with its
+   * handle. Not supported yet: other pointer arguments (`void *`, pointers to
+   * pointers or to other opaque structs, C arrays and buffers such as
+   * `getCharacters:range:`'s) except as `null` (a pointer result is
+   * `null` for `NULL` and otherwise its address as a `bigint`, which nothing
+   * accepts back), structs or unions holding an array, bit-field, pointer
+   * or `long double` (any other struct passed by value crosses: `CGRect`,
+   * `NSRange`, `NSEdgeInsets`, `CGAffineTransform`, `CATransform3D` and the
+   * like as objects with the field names, `MTLSize`, `CMTime` and anything
+   * else as an array of its members in order, which every struct also
+   * accepts going in),
+   * class methods and `super` calls in {@link ObjC.defineClass defined
+   * classes}, and variadic methods (`stringWithFormat:`,
+   * `arrayWithObjects:`, `dictionaryWithObjectsAndKeys:` and the rest the
+   * SDK declares with `...` or a `va_list`; use `stringWithString:`,
+   * `objc.ns([...])` or `predicateWithFormat:argumentArray:` instead); those
+   * throw a `TypeError`. So do `performSelector:` and its object-returning
+   * variants, whose result cannot be typed: send the selector itself. A
+   * window returned by an `init…` or `new…` message, or by a class method of
+   * a window class, has `releasedWhenClosed` turned off, so closing it
+   * leaves the handle valid. `NSProxy` instances work as receivers; an
+   * unknown selector on one is a `TypeError` when the proxy answers
+   * `methodSignatureForSelector:` with `nil`. An Objective-C exception
+   * raised by the method you call (or by a proxy resolving it) is thrown as
+   * an {@link ObjCException}.
    *
    * @example
    * ```ts
@@ -2726,206 +3463,4 @@ declare module "bun:appkit" {
    * ```
    */
   export const objc: ObjC;
-}
-
-/**
- * A React renderer for `bun:appkit`: write native macOS windows as JSX using
- * the `react` and `react-reconciler` packages installed in your project
- * (`bun add react react-reconciler`).
- *
- * Host components are exported as constants, so a `react-dom` app ports by
- * swapping HTML tags for these. Props are the same as the options of the
- * matching `bun:appkit` class; changed props are assigned to the live view.
- * String children of `Text`, `Button`, `Checkbox`, `Radio` and `Group` become
- * their `text`/`title`. A prop that cannot be applied to a mounted view (an
- * invalid value, or a create-only `Window` option) is logged with
- * `console.error` and skipped rather than unmounting the tree.
- *
- * An app bundled with `bun build` or `bun build --compile` carries its own
- * copy of React, which this module cannot find by itself; pass it in with
- * {@link RootOptions.modules}.
- *
- * @example
- * ```tsx
- * import { useState } from "react";
- * import { render, Window, VStack, Text, Button } from "bun:appkit/react";
- *
- * function Counter() {
- *   const [count, setCount] = useState(0);
- *   return (
- *     <Window title="Counter" width={300} height={120}>
- *       <VStack padding={20} spacing={12}>
- *         <Text font={{ size: 24, weight: "bold" }}>Count: {count}</Text>
- *         <Button onClick={() => setCount(c => c + 1)}>Increment</Button>
- *       </VStack>
- *     </Window>
- *   );
- * }
- *
- * render(<Counter />);
- * ```
- *
- * @module bun:appkit/react
- */
-declare module "bun:appkit/react" {
-  import type * as AppKit from "bun:appkit";
-
-  /**
-   * A host component. `ref` receives the underlying `bun:appkit` instance
-   * (a {@link AppKit.Window} or {@link AppKit.View} subclass).
-   */
-  export type AppKitComponent<P> = (props: P & { children?: any; key?: string | number | null; ref?: any }) => any;
-
-  /** Props of {@link Window}: {@link AppKit.WindowOptions} with the content given as the single child. */
-  export interface WindowProps extends Omit<AppKit.WindowOptions, "content"> {}
-  export interface VStackProps extends AppKit.VStackProps {}
-  export interface HStackProps extends AppKit.HStackProps {}
-  export interface ZStackProps extends AppKit.ZStackProps {}
-  export interface GroupProps extends AppKit.GroupProps {}
-  export interface ScrollViewProps extends AppKit.ScrollViewProps {}
-  export interface SplitViewProps extends AppKit.SplitViewProps {}
-  export interface TextProps extends AppKit.TextProps {}
-  export interface ButtonProps extends AppKit.ButtonProps {}
-  export interface CheckboxProps extends AppKit.CheckboxProps {}
-  export interface RadioProps extends AppKit.RadioProps {}
-  export interface SwitchProps extends AppKit.SwitchProps {}
-  export interface TextFieldProps extends AppKit.TextFieldProps {}
-  export interface SecureFieldProps extends AppKit.SecureFieldProps {}
-  export interface SearchFieldProps extends AppKit.SearchFieldProps {}
-  export interface TextEditorProps extends AppKit.TextEditorProps {}
-  export interface SliderProps extends AppKit.SliderProps {}
-  export interface PickerProps extends AppKit.PickerProps {}
-  export interface SegmentedProps extends AppKit.SegmentedProps {}
-  export interface ProgressProps extends AppKit.ProgressProps {}
-  export interface ImageProps extends AppKit.ImageProps {}
-  export interface DividerProps extends AppKit.DividerProps {}
-  export interface SpacerProps extends AppKit.SpacerProps {}
-  export interface TableProps extends AppKit.TableProps {}
-  export interface MetalViewProps extends AppKit.MetalViewProps {}
-
-  /** A window; shown when mounted and closed when unmounted. Its child is the root view. */
-  export const Window: AppKitComponent<WindowProps>;
-  export const VStack: AppKitComponent<VStackProps>;
-  export const HStack: AppKitComponent<HStackProps>;
-  export const ZStack: AppKitComponent<ZStackProps>;
-  export const Group: AppKitComponent<GroupProps>;
-  export const ScrollView: AppKitComponent<ScrollViewProps>;
-  export const SplitView: AppKitComponent<SplitViewProps>;
-  /** A label. String and number children become its `text`. */
-  export const Text: AppKitComponent<TextProps>;
-  /** A push button. String children become its `title`. */
-  export const Button: AppKitComponent<ButtonProps>;
-  export const Checkbox: AppKitComponent<CheckboxProps>;
-  export const Radio: AppKitComponent<RadioProps>;
-  export const Switch: AppKitComponent<SwitchProps>;
-  export const TextField: AppKitComponent<TextFieldProps>;
-  export const SecureField: AppKitComponent<SecureFieldProps>;
-  export const SearchField: AppKitComponent<SearchFieldProps>;
-  export const TextEditor: AppKitComponent<TextEditorProps>;
-  export const Slider: AppKitComponent<SliderProps>;
-  export const Picker: AppKitComponent<PickerProps>;
-  export const Segmented: AppKitComponent<SegmentedProps>;
-  export const Progress: AppKitComponent<ProgressProps>;
-  export const Image: AppKitComponent<ImageProps>;
-  export const Divider: AppKitComponent<DividerProps>;
-  export const Spacer: AppKitComponent<SpacerProps>;
-  export const Table: AppKitComponent<TableProps>;
-  /** A Metal-backed view; see {@link AppKit.MetalView}. `onFrame` is an ordinary prop. */
-  export const MetalView: AppKitComponent<MetalViewProps>;
-
-  /** What React passes to the error callbacks alongside the error. */
-  export interface ErrorInfo {
-    componentStack?: string;
-    /** The error boundary that caught it ({@link RootOptions.onCaughtError} only). */
-    errorBoundary?: unknown;
-  }
-
-  /**
-   * The React modules the renderer drives. Every root in a process uses the
-   * same ones: the first root fixes them, and a later root that passes a
-   * different `react` throws.
-   *
-   * @example
-   * ```tsx
-   * import * as react from "react";
-   * import reconciler from "react-reconciler";
-   * import * as constants from "react-reconciler/constants";
-   * import { render } from "bun:appkit/react";
-   *
-   * render(<App />, { modules: { react, reconciler, constants } });
-   * ```
-   */
-  export interface ReactModules {
-    /** The `"react"` module (19 or newer). */
-    react: object;
-    /** The default export of `"react-reconciler"` (0.31 or newer), or the module itself. */
-    reconciler: Function | { default: Function };
-    /** The `"react-reconciler/constants"` module. */
-    constants: object;
-  }
-
-  /** Options for {@link createRoot} and {@link render}; the error callbacks are React 19's. */
-  export interface RootOptions {
-    /**
-     * An error nothing caught (no error boundary above it). React has already
-     * unmounted the tree. Default: reported as an uncaught exception.
-     */
-    onUncaughtError?: (error: unknown, info: ErrorInfo) => void;
-    /** An error an error boundary caught. Default: logged with `console.error`. */
-    onCaughtError?: (error: unknown, info: ErrorInfo) => void;
-    /**
-     * An error React recovered from by itself (for example by retrying the
-     * render). Default: logged with `console.error`.
-     */
-    onRecoverableError?: (error: unknown, info: ErrorInfo) => void;
-    /**
-     * Where React comes from. By default `react`, `react-reconciler` and
-     * `react-reconciler/constants` are resolved from the directory of the
-     * entry point (`Bun.main`). An app that bundles React (`bun build`,
-     * `bun build --compile`), or keeps it somewhere else, imports the three
-     * modules itself and passes them here so components and renderer share
-     * one copy.
-     */
-    modules?: ReactModules;
-  }
-
-  /** A mounted React tree. */
-  export interface Root {
-    /** Render (or re-render) `element` into this root. Windows in the tree exist by the time it returns. */
-    render(element: unknown): void;
-    /** Unmount everything, closing the windows the tree created. */
-    unmount(): void;
-    /** The open windows this root created, in mount order. */
-    readonly windows: readonly AppKit.Window[];
-  }
-
-  /**
-   * Create an empty root to render into later.
-   *
-   * @example
-   * ```tsx
-   * const root = createRoot({ onUncaughtError: (error) => console.error("render failed", error) });
-   * root.render(<App />);
-   * // later
-   * root.unmount();
-   * ```
-   *
-   * @throws if `react` and `react-reconciler` cannot be found (see {@link ReactModules}).
-   */
-  export function createRoot(options?: RootOptions): Root;
-
-  /**
-   * Create a root and mount `element` into it synchronously: windows in the
-   * tree exist by the time `render` returns.
-   *
-   * @throws if `react` and `react-reconciler` cannot be found (see {@link ReactModules}).
-   */
-  export function render(element: unknown, options?: RootOptions): Root;
-
-  /**
-   * Run `fn` and flush the state updates it schedules before returning, like
-   * `react-dom`'s `flushSync`. Before the first root exists it only calls `fn`.
-   */
-  export function flushSync<R>(fn: () => R): R;
-  export function flushSync(): void;
 }

@@ -1,19 +1,9 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isASAN, isDebug, isMacOS } from "harness";
-import { cpSync, readFileSync, rmSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { bunEnv, bunExe, isASAN, isDebug, isMacOS, tempDir } from "harness";
+import { readFileSync } from "node:fs";
+import { basename, join } from "node:path";
 
 const fixtures = join(import.meta.dir, "fixtures");
-// The React fixtures need React 19 while test/ pins React 18, so
-// test/package.json carries react, react-reconciler and scheduler under alias
-// names and beforeAll copies them into react-app/node_modules under their real
-// names. Nothing is fetched at test time.
-const reactApp = join(import.meta.dir, "react-app");
-const reactModules: [alias: string, name: string][] = [
-  ["react-19", "react"],
-  ["react-reconciler-19", "react-reconciler"],
-  ["scheduler-0.27", "scheduler"],
-];
 
 type FixtureResult = {
   /** One entry per JSON line the fixture printed. */
@@ -28,13 +18,18 @@ type FixtureResult = {
 
 async function runFixture(
   name: string,
-  opts: { timeoutMs?: number; cwd?: string; args?: string[]; expectFailure?: boolean } = {},
+  opts: { timeoutMs?: number; args?: string[]; expectFailure?: boolean } = {},
 ): Promise<FixtureResult> {
-  const cwd = opts.cwd ?? fixtures;
+  // The bridge fixtures also run JSC's exception-scope validation where the
+  // build has it, so a native glue path that leaves an exception unchecked
+  // fails its test rather than only a dedicated run.
+  const env = name.startsWith("objc-")
+    ? { ...bunEnv, BUN_JSC_validateExceptionChecks: "1", BUN_JSC_dumpSimulatedThrows: "1" }
+    : bunEnv;
   await using proc = Bun.spawn({
-    cmd: [bunExe(), join(cwd, name), ...(opts.args ?? [])],
-    env: bunEnv,
-    cwd,
+    cmd: [bunExe(), join(fixtures, name), ...(opts.args ?? [])],
+    env,
+    cwd: fixtures,
     stdout: "pipe",
     stderr: "pipe",
     timeout: opts.timeoutMs ?? 10_000,
@@ -62,22 +57,19 @@ test.skipIf(isMacOS)("off macOS bun:appkit is not a builtin and Bun.AppKit is ab
       bunExe(),
       "-e",
       `const { isBuiltin, builtinModules } = require("node:module");
-       const result = {};
-       for (const id of ["bun:appkit", "bun:appkit/react"]) {
-         const importError = await import(id).then(() => null, e => e);
-         let resolveError = null;
-         try { require.resolve(id); } catch (e) { resolveError = e; }
-         result[id] = {
-           importError: importError && { name: importError.constructor.name, code: importError.code },
-           resolveError: resolveError && resolveError.code,
-           getBuiltinModule: typeof process.getBuiltinModule(id),
-           isBuiltin: isBuiltin(id),
-           listed: builtinModules.includes(id),
-         };
-       }
-       result.hasKey = "AppKit" in Bun;
-       result.type = typeof Bun.AppKit;
-       console.log(JSON.stringify(result));`,
+       const id = "bun:appkit";
+       const importError = await import(id).then(() => null, e => e);
+       let resolveError = null;
+       try { require.resolve(id); } catch (e) { resolveError = e; }
+       console.log(JSON.stringify({
+         importError: importError && { name: importError.constructor.name, code: importError.code },
+         resolveError: resolveError && resolveError.code,
+         getBuiltinModule: typeof process.getBuiltinModule(id),
+         isBuiltin: isBuiltin(id),
+         listed: builtinModules.includes(id),
+         hasKey: "AppKit" in Bun,
+         type: typeof Bun.AppKit,
+       }));`,
     ],
     env: bunEnv,
     stdout: "pipe",
@@ -85,16 +77,12 @@ test.skipIf(isMacOS)("off macOS bun:appkit is not a builtin and Bun.AppKit is ab
   });
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   expect(stdout.trim(), stderr).toStartWith("{");
-  const notABuiltin = {
+  expect(JSON.parse(stdout.trim())).toEqual({
     importError: { name: "ResolveMessage", code: "ERR_MODULE_NOT_FOUND" },
     resolveError: "MODULE_NOT_FOUND",
     getBuiltinModule: "undefined",
     isBuiltin: false,
     listed: false,
-  };
-  expect(JSON.parse(stdout.trim())).toEqual({
-    "bun:appkit": notABuiltin,
-    "bun:appkit/react": notABuiltin,
     hasKey: false,
     type: "undefined",
   });
@@ -102,6 +90,26 @@ test.skipIf(isMacOS)("off macOS bun:appkit is not a builtin and Bun.AppKit is ab
 });
 
 describe.skipIf(!isMacOS)("Bun.AppKit", () => {
+  // Which arms of the display / GPU forks this run exercises: headless CI
+  // agents and a logged-in desktop take different paths in app start, the
+  // window class and MetalView, so the log should say which one ran.
+  beforeAll(async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const { app, gpu } = require("bun:appkit");
+         const { release, arch } = require("node:os");
+         console.log(JSON.stringify({ hasDisplay: app.hasDisplay, gpu: gpu.available, darwin: release(), arch: arch(), agent: process.env.BUILDKITE_AGENT_NAME ?? null }));`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const [stdout] = await Promise.all([proc.stdout.text(), proc.exited]);
+    console.warn(`bun:appkit test mode: ${stdout.trim()}`);
+  });
+
   test.concurrent(
     "every Objective-C binding and delegate method compiled in matches the frameworks on this machine",
     async () => {
@@ -154,6 +162,58 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
       ],
     });
     expect(exitCode).toBe(0);
+  });
+
+  // bun test --isolate (which --parallel implies) gives every file a fresh
+  // global object on the same thread; each loads bun:appkit anew and the
+  // bridge follows it there instead of staying with the first.
+  test.concurrent("every file under bun test --isolate can load bun:appkit", async () => {
+    const file = `import { expect, test } from "bun:test";
+      import { objc } from "bun:appkit";
+      test("bridge", () => {
+        expect(typeof Bun.AppKit).toBe("object");
+        expect(Bun.AppKit.objc).toBe(objc);
+        const text = objc.classes.NSString.stringWithString_("isolated");
+        expect(String(text)).toBe("isolated");
+        expect(objc.js(text)).toBe("isolated");
+        const seen: unknown[] = [];
+        objc.classes.NSArray.arrayWithArray_(["a", "b"]).enumerateObjectsUsingBlock_((item: unknown) => { seen.push(objc.js(item)); });
+        expect(seen).toEqual(["a", "b"]);
+        const Counter = objc.defineClass({ methods: { "twice:": { types: "q@:q", fn: (n: number) => n * 2 } } });
+        const counter = Counter.new();
+        expect(counter.twice_(21)).toBe(42);
+      });`;
+    using dir = tempDir("appkit-isolate", { "a.test.ts": file, "b.test.ts": file, "c.test.ts": file });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--isolate", "a.test.ts", "b.test.ts", "c.test.ts"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const output = stdout + stderr;
+    expect(output).not.toContain("error:");
+    expect(output).toMatch(/\b3 pass\b/);
+    expect(output).toMatch(/\b0 fail\b/);
+    expect(exitCode).toBe(0);
+  });
+
+  // The counts docs/runtime/appkit.mdx quotes that come from this tree (not
+  // from the installed SDK) are the tree's.
+  test("the numbers in the documentation are the tree's", async () => {
+    const root = join(import.meta.dir, "../../../..");
+    const { treeCounts } = await import(join(root, "scripts/appkit-tree-counts.ts"));
+    const counts = treeCounts(root);
+    const docs = readFileSync(join(root, "docs/runtime/appkit.mdx"), "utf8");
+    const paragraph = docs.split("\n").find(line => line.includes("In numbers:")) ?? "";
+    expect(paragraph).toContain(`the ${counts.elements.length} curated elements`);
+    expect(paragraph).toContain(`made of ${counts.bridgedClasses.length} AppKit and Foundation classes`);
+    expect(paragraph).toContain(`${counts.enumTypes} enumerations with ${counts.enumMembers} members`);
+    expect(paragraph).toContain(`${counts.looseConstants} loose constants`);
+    expect(paragraph).toContain(
+      `${counts.boundClasses} classes and ${counts.boundSelectors} selectors of typed bindings`,
+    );
   });
 
   test.concurrent("reading app (including by reflection) never starts the application", async () => {
@@ -358,6 +418,13 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
       expect(Math.abs(grow.nested.reweighted[1] - 2 * grow.nested.reweighted[0])).toBeLessThanOrEqual(2);
       expect(grow.nested.hidden).toBe(300);
       expect(Math.abs(grow.nested.restored[0] - grow.nested.restored[1])).toBeLessThanOrEqual(1);
+      // Both labels span the 320pt column; hiding and showing one leaves it spanning again.
+      const fill = step(r, "fill hidden");
+      expect(fill.shown).toEqual([fill.shown[0], fill.shown[0]]);
+      expect(fill.shown[0]).toBeGreaterThanOrEqual(320);
+      expect(fill.whileHidden).toBe(fill.shown[0]);
+      expect(fill.reshown).toEqual(fill.shown);
+      expect(fill.constraints[1]).toBe(fill.constraints[0]);
       // The growing pane takes the 200pt the window gained; the other keeps its width.
       const split = step(r, "split grow");
       expect(split.after[1] - split.before[1]).toBeGreaterThanOrEqual(190);
@@ -444,6 +511,543 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
     expect(r.exitCode).toBe(0);
   });
 
+  test.concurrent(
+    "Button, Checkbox, Radio and Switch are bridge-built NSButtons: live getters, every NSBezelStyle, target/action events, placed in containers and windows",
+    async () => {
+      const r = await runFixture("controls.ts");
+      if (r.skipped) return;
+      expect(step(r, "live"), r.stderr).toEqual({
+        step: "live",
+        same: true,
+        isButton: true,
+        isSwitch: true,
+        title: "Native",
+        enabled: false,
+        checked: true,
+        hostedIn: "NSStackView",
+        defaults: {
+          bezelStyle: "push",
+          bordered: true,
+          hasDestructiveAction: false,
+          keyEquivalent: null,
+          switchEnabled: true,
+        },
+      });
+      const bezel = step(r, "bezelStyle");
+      expect(bezel.styles).toEqual({
+        toolbar: ["toolbar", 11],
+        accessoryBarAction: ["accessoryBarAction", 12],
+        NSBezelStyleFlexiblePush: ["flexiblePush", 2],
+        // A deprecated alias reads back as the current name for its value.
+        texturedRounded: ["toolbar", 11],
+        badge: ["badge", 15],
+        number: "circular",
+        // NSThickSquareBezelStyle: still accepted by AppKit, absent from the current header.
+        unnamed: 3,
+        unnamedRoundTrip: 3,
+        reset: "push",
+      });
+      expect(bezel.bogus).toMatchObject({ isTypeError: true, code: "ERR_INVALID_ARG_TYPE" });
+      expect(bezel.negative).toMatchObject({ isTypeError: true, code: "ERR_INVALID_ARG_TYPE" });
+      expect(bezel.bogus.message).toStartWith(
+        'Button.bezelStyle must be an NSBezelStyle name ("automatic", "push", "flexiblePush"',
+      );
+      expect(bezel.bogus.message).not.toContain('"NSBezelStylePush"');
+      expect(step(r, "roles")).toEqual({
+        step: "roles",
+        roles: { keyEquivalent: ["\r", "\r"], bordered: [false, false], hasDestructiveAction: [true, true] },
+        after: [null, true, false],
+      });
+      const kept = step(r, "kept");
+      expect(kept).toEqual({
+        step: "kept",
+        hasImage: true,
+        // NSImageOnly with an empty title, NSImageLeft beside one (also for an image set through .native).
+        imagePositions: [1, 2, 2],
+        pointSize: 18,
+        boldTrait: true,
+        tinted: true,
+        reads: { symbol: "star.fill", font: { size: 18, weight: "bold", design: "rounded" }, tint: "red" },
+        cleared: { image: null, position: 0, pointSize: true, tint: null },
+        badSymbol: {
+          message: 'Button.symbol: no system symbol named "no.such.symbol.anywhere"',
+          code: "ERR_INVALID_ARG_VALUE",
+          isTypeError: true,
+        },
+        badFont: {
+          message: "Button.font.size must be a positive number or null",
+          code: "ERR_INVALID_ARG_TYPE",
+          isTypeError: true,
+        },
+        badTint: {
+          message: 'Button.tint: invalid color "rgb(nan,0,0)"',
+          code: "ERR_INVALID_ARG_VALUE",
+          isTypeError: true,
+        },
+        badTitle: { message: "Button.title must be a string or null", code: "ERR_INVALID_ARG_TYPE", isTypeError: true },
+      });
+      const events = step(r, "events");
+      expect(events).toEqual({
+        step: "events",
+        // Each handler ran inside its click, before click() returned.
+        log: ["click:true", "after button.click()", "check:true", "switch:true", "after throwing click"],
+        // Both throwing clicks (click() and a performClick: sent by hand) were reported, not swallowed or rethrown.
+        uncaught: ["from onClick", "from onClick"],
+        target: true,
+        action: "action:",
+        respondsToAction: true,
+        states: { check: true, toggle: true },
+        notClickable: {
+          message: "click() only applies to a Button, Checkbox, Radio or Switch",
+          code: undefined,
+          isTypeError: true,
+        },
+      });
+      const native = step(r, "native");
+      expect(native).toEqual({
+        step: "native",
+        same: true,
+        usable: "read",
+        outsider: native.outsider,
+        outsiderSymbol: native.outsider,
+        // No view kinds by name: a subclass outside the module cannot construct one at all.
+        unknownKind: native.outsider,
+      });
+      expect(native.outsider).toMatchObject({ isTypeError: true });
+      expect(native.outsider.message).toStartWith("View is abstract");
+      expect(step(r, "hosting")).toEqual({
+        step: "hosting",
+        soloFrame: true,
+        laidOut: [true, true, true],
+        pinned: [true, 3],
+        created: 40,
+        after: 0,
+        collected: ["button with onClick"],
+      });
+      // Collecting the View objects leaves their NSViews in the superview and runs none of its methods.
+      expect(step(r, "script superview")).toEqual({
+        step: "script superview",
+        under: 22,
+        kept: 22,
+        movesBefore: 0,
+        left: 0,
+        moves: 22,
+        uncaught: [],
+      });
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "VStack, HStack, ZStack, Group, ScrollView and SplitView are bridge-built: children are subviews, props read the view, the common props are the child's NSView",
+    async () => {
+      const r = await runFixture("containers.ts");
+      if (r.skipped) return;
+      const badType = { code: "ERR_INVALID_ARG_TYPE" };
+      expect(step(r, "stack"), r.stderr).toEqual({
+        step: "stack",
+        isStack: true,
+        arranged: 2,
+        sameChild: true,
+        superview: true,
+        spacing: 5,
+        // Apple's names (short or full), the curated "gravity", or the number; reads back the short name.
+        distributions: [
+          ["fillEqually", 1],
+          ["gravity", -1],
+          ["gravity", -1],
+          ["equalSpacing", 3],
+          ["fillProportionally", 2],
+          ["gravity", -1],
+          ["gravity", -1],
+        ],
+        reset: true,
+        vertical: true,
+        alignments: ["fill", true, "lastBaseline", true],
+        insets: { top: 2, left: 6, bottom: 2, right: 6 },
+        // `padding` reads `-edgeInsets`, however it was given or set.
+        padding: [
+          { top: 2, left: 6, bottom: 2, right: 6 },
+          { top: 1, left: 2, bottom: 1, right: 2 },
+          { top: 0, left: 0, bottom: 0, right: 0 },
+          { top: 1, left: 2, bottom: 3, right: 4 },
+        ],
+        // Curated names map to the axis's attribute ("bottom" is trailing in a column); any
+        // NSLayoutAttribute name or number is taken as is and reads back by its own name.
+        aligned: [
+          ["center", 9],
+          ["trailing", 6],
+          ["trailing", 6],
+          ["center", 9],
+          ["trailing", 6],
+          // NSStackView resolves leading/trailing to left/right from here on; they read back the same.
+          ["trailing", 2],
+          ["center", 9],
+          ["fill", 1],
+        ],
+        badDistribution: {
+          message: expect.stringContaining("VStack.distribution must be an NSStackViewDistribution name"),
+          ...badType,
+        },
+        badNegative: {
+          message: expect.stringContaining("VStack.distribution must be an NSStackViewDistribution name"),
+          ...badType,
+        },
+        badPadding: { message: "HStack.padding array form is [vertical, horizontal]", ...badType },
+        badAlign: { message: expect.stringContaining('HStack.align must be "fill", "leading"'), ...badType },
+        badBaseline: {
+          message: "firstBaseline/lastBaseline alignment only applies to a horizontal stack",
+          code: "ERR_INVALID_ARG_VALUE",
+        },
+      });
+      // width/minHeight are two constraints on the label; clearing width leaves one.
+      expect(step(r, "common")).toEqual({
+        step: "common",
+        tooltip: "from native",
+        hidden: true,
+        id: "the-label",
+        alpha: 0.5,
+        constraints: [2, 1],
+        reads: [null, 30, null],
+        corner: [4, 4],
+        background: true,
+        autoresizing: false,
+      });
+      // A bridge TypeError naming the layer's class (NSViewBackingLayer here) and what was passed.
+      const notCGColor = (got: RegExp) => ({
+        message: expect.stringMatching(
+          new RegExp(
+            `^-\\[\\w+ setBackgroundColor:\\]: argument 0 must be a CGColor \\(\\^\\{CGColor=\\}\\), got ${got.source}$`,
+          ),
+        ),
+      });
+      expect(step(r, "counts")).toEqual({
+        step: "counts",
+        layer: true,
+        constraint: true,
+        labelColor: true,
+        nsapp: true,
+        stackUsable: true,
+      });
+      expect(step(r, "cgcolor")).toEqual({
+        step: "cgcolor",
+        cleared: null,
+        string: notCGColor(/a string/),
+        number: notCGColor(/a number/),
+        array: notCGColor(/an array/),
+        nscolor: notCGColor(/an? \w*Color/),
+        colorSpace: notCGColor(/an? \w+/),
+        set: true,
+        roundTrip: true,
+      });
+      expect(step(r, "kinds")).toEqual({
+        step: "kinds",
+        group: {
+          isBox: true,
+          title: "Renamed",
+          titlePositions: [2, 0, "", 3, 0, 2],
+          innerStack: true,
+          inContent: true,
+        },
+        zstack: { className: "NSView", order: [true, true], reordered: true },
+        scroll: {
+          isScrollView: true,
+          document: true,
+          clip: [true, true],
+          scrollBars: { horizontal: true, vertical: true },
+          second: { message: expect.stringContaining("ScrollView takes a single child"), code: "ERR_INVALID_STATE" },
+          badBars: {
+            message: 'ScrollView.scrollBars must be "none", "horizontal", "vertical" or "both", got "sideways"',
+            ...badType,
+          },
+        },
+        split: { isSplitView: true, vertical: true, panes: 2 },
+      });
+      expect(step(r, "collected")).toEqual({ step: "collected", created: 180, after: 0 });
+      expect(step(r, "window")).toEqual({ step: "window", inFirst: true, detached: true, inSecond: true });
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "Window is a bridge-built NSWindow: options are live properties, events are its NSWindowDelegate, closed windows are collected",
+    async () => {
+      const r = await runFixture("windows.ts");
+      if (r.skipped) return;
+      expect(step(r, "delegate"), r.stderr).toEqual({
+        step: "delegate",
+        isWindow: true,
+        sameHandle: true,
+        conforms: true,
+        responds: [true, true, true, true],
+        // win.width/x/center() are the program's own and not reported; the same
+        // changes through .native are, then performClose: asks shouldClose (which
+        // refuses), and key-window changes arrive as onFocus/onBlur.
+        events: ["resize 320x120", "move 30,40", "shouldClose", "focus", "blur"],
+        closedAfterRefusal: false,
+        width: 320,
+        x: 30,
+        y: 40,
+      });
+      expect(step(r, "live")).toEqual({
+        step: "live",
+        title: "renamed",
+        titleAgain: "again",
+        initialBits: { resizable: true, closable: true, minimizable: true, fullSizeContent: false },
+        flippedBits: { resizable: false, closable: false, minimizable: false, fullSizeContent: true },
+        flippedProps: { resizable: false, closable: false, minimizable: false, fullSizeContent: true },
+        fullScreenOff: false,
+        resizableViaNative: true,
+        fullScreenOn: true,
+        titleHidden: [true, true],
+        titlebarTransparent: [true, true],
+        alphaClamped: 1,
+        alphaViaNative: 0.5,
+        backgroundSet: true,
+        backgroundReset: "windowBackground",
+        visible: [true, true],
+      });
+      expect(step(r, "restoreName")).toEqual({
+        step: "restoreName",
+        named: ["bun-appkit-windows-test", "bun-appkit-windows-test"],
+        cleared: [null, ""],
+        afterClose: "",
+      });
+      // minWidth 400 widened the 320pt window, maxHeight 90 shortened it; neither was reported.
+      // The container holds the content's 5 pins and the 2 limits.
+      expect(step(r, "limits")).toEqual({
+        step: "limits",
+        read: [400, 90, null],
+        size: [400, 90],
+        contentMin: 400,
+        contentMax: 90,
+        containerConstraints: 7,
+        contentSuperviewIsContainer: true,
+        resizeEvents: [],
+      });
+      expect(step(r, "closed")).toEqual({
+        step: "closed",
+        events: ["close"],
+        closed: true,
+        visible: false,
+        key: false,
+        contentWindow: true,
+        superviewGone: true,
+        nativeStillAnswers: "again",
+        windows: 1,
+      });
+      expect(step(r, "native after close")).toEqual({ step: "native after close", same: true, frame: "number" });
+      expect(step(r, "limits live")).toEqual({
+        step: "limits live",
+        // [minWidth, maxWidth, maxHeight, container constraint constants]
+        initial: [null, 300, 150, [150, 300]],
+        // minWidth 400 > maxWidth 300: the maximum is raised to it everywhere and the window widened.
+        raised: [400, 400, 400, 400, [150, 400, 400]],
+        // Clearing the minimum lets the maximum given (300) apply again.
+        restored: [null, 300, 300, [150, 300]],
+        // A limit set through .native reads back; assigning one axis keeps the other's.
+        viaNative: [70, null],
+        otherAxisKept: [70, 70, 250],
+        // A maximum of 0 is a limit, not "none".
+        zeroMax: [0, 0],
+      });
+      expect(step(r, "orphaned delegate")).toEqual({
+        step: "orphaned delegate",
+        gone: true,
+        verdict: true,
+        threw: false,
+      });
+      expect(step(r, "collected")).toEqual({ step: "collected", made: 40, collected: 20, nativesLeft: 0, windows: 0 });
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "Text, TextField, Slider, Picker, Segmented, Progress, Image, Divider and Spacer are bridge-built: live getters, Apple's enum names, delegate and target/action events, axis-following layout",
+    async () => {
+      const r = await runFixture("leaves.ts");
+      if (r.skipped) return;
+      const badType = { code: "ERR_INVALID_ARG_TYPE", isTypeError: true };
+      const badValue = { code: "ERR_INVALID_ARG_VALUE", isTypeError: true };
+      expect(step(r, "text"), r.stderr).toEqual({
+        step: "text",
+        isTextField: true,
+        editable: false,
+        text: "Native",
+        // Every NSTextAlignment member by short or full name or number; reads back the short name.
+        align: {
+          center: ["center", true],
+          right: ["right", true],
+          justified: ["justified", true],
+          left: ["left", true],
+          NSTextAlignmentCenter: ["center", true],
+          number: "right",
+          reset: "natural",
+        },
+        // lineLimit n>1 is word wrapping plus truncatesLastVisibleLine; 0 wraps without limit.
+        wrapped: [3, 3, true],
+        unlimited: [0, false, "0"],
+        pointSize: 20,
+        colored: true,
+        selectable: [true, true],
+        defaults: { text: "", font: null, color: null, textAlign: "natural", selectable: false, lineLimit: 1 },
+        cleared: { label: true, pointSize: true },
+        badAlign: {
+          message:
+            'Text.textAlign must be an NSTextAlignment name ("left", "center", "right", "justified" or "natural") or value',
+          ...badType,
+        },
+        badLines: { message: "Text.lineLimit must be a non-negative integer or null", ...badType },
+        negativeLines: { message: "Text.lineLimit must be a non-negative integer or null", ...badType },
+        fractionalLines: { message: "Text.lineLimit must be a non-negative integer or null", ...badType },
+        shorthand: "short",
+      });
+      expect(step(r, "field")).toEqual({
+        step: "field",
+        classes: [true, true, true],
+        searchWhole: true,
+        bezeled: [true, true],
+        placeholder: "native",
+        value: "from code",
+        sameDelegate: true,
+        delegateClassShared: true,
+        conforms: true,
+        action: "action:",
+        // Begin/Change/action/End through the delegate and target; the value
+        // setter fires nothing; continuous:false reports once at end or Return,
+        // and not at all for an edit that code replaced.
+        log: [
+          "focus",
+          ["change", "ab"],
+          ["change", "abc"],
+          ["submit", "abc"],
+          "blur",
+          ["quiet", "q2"],
+          ["quiet", "q3"],
+        ],
+        live: [false, false],
+        defaults: {
+          value: "",
+          placeholder: null,
+          editable: true,
+          enabled: true,
+          font: null,
+          textAlign: "natural",
+          continuous: true,
+        },
+        badValue: { message: "TextField.value must be a string or null", ...badType },
+      });
+      // Editing a setter ends is delivered as the setter returns (pending change first), the
+      // handler sees settled state and may change the view; its throw is reported.
+      expect(step(r, "held")).toEqual({
+        step: "held",
+        log: ["change:pending", "blur hidden=true children=2", "hidden set"],
+        uncaught: ["from onBlur"],
+        tooltip: "set from onBlur",
+        spacing: 2,
+      });
+      // The field's blur and the window's close arrive from two places (the
+      // field's delegate, the window's) and are delivered in that order.
+      expect(step(r, "close while editing")).toEqual({
+        step: "close while editing",
+        log: ["blur inWindow=true listed=true", "close inWindow=false listed=false", "closed"],
+      });
+      expect(step(r, "default button")).toEqual({
+        step: "default button",
+        withoutKey: [],
+        withKey: ["default"],
+        eventType: "number",
+        withSubmit: ["submit:typed"],
+        cell: true,
+      });
+      expect(step(r, "slider")).toEqual({
+        step: "slider",
+        isSlider: true,
+        snappedValue: 6,
+        dragged: [8, 8],
+        log: [8, 4.4],
+        ticks: 6,
+        unevenTicks: 0,
+        live: [0, 9, 9, false, false],
+        enabled: [false, false],
+        defaults: { value: 0, min: 0, max: 1, step: 0, continuous: true, enabled: true },
+        badStep: { message: "Slider.step must be a positive number or null", ...badType },
+        badValue: { message: "Slider.value must be a number or null", ...badType },
+      });
+      expect(step(r, "choices")).toEqual({
+        step: "choices",
+        nativeItems: { picker: [["a", "b", "c"], 2], segmented: ["p", "q"], none: [] },
+        classes: [true, true],
+        pullsDown: false,
+        log: [
+          ["picker", 2],
+          ["segmented", 1],
+        ],
+        after: [0, 0],
+        titles: ["A,B,C", "y"],
+        enabled: [false, false, true],
+        badItems: { message: "Picker.items[0] must be a string", ...badType },
+      });
+      expect(step(r, "progress")).toEqual({
+        step: "progress",
+        isProgress: true,
+        bar: [150, 150, false, false],
+        spinning: [true, true, true, true],
+        running: false,
+        keptSize: true,
+        back: [true, false],
+        defaults: { value: 0, min: 0, max: 100, indeterminate: false, running: true, spinner: false },
+      });
+      expect(step(r, "image")).toEqual({
+        step: "image",
+        isImageView: true,
+        symbol: true,
+        fromFile: [true, true],
+        fromData: true,
+        fromBuffer: true,
+        scaling: {
+          fit: ["fit", 3],
+          fill: ["fill", 1],
+          none: ["none", 2],
+          down: ["down", 0],
+          scaleAxesIndependently: ["fill", 1],
+          NSImageScaleNone: ["none", 2],
+          number: "fit",
+        },
+        configured: true,
+        tinted: true,
+        enabled: [false, false, true],
+        cleared: [null, null],
+        defaults: { image: null, scaling: "down", tint: null, size: 0 },
+        missing: {
+          message: 'could not load image file "/definitely/missing.png"',
+          isTypeError: false,
+          path: "/definitely/missing.png",
+        },
+        badData: { message: "Image.image: unrecognized image data", ...badValue },
+        badSource: { message: "Image.image must be { symbol }, { file }, { data } or null", ...badType },
+        badScaling: {
+          message: 'Image.scaling must be "down", "fit", "fill" or "none", or an NSImageScaling name or value',
+          ...badType,
+        },
+        badSymbol: { message: 'Image.image: no system symbol named "no.such.symbol.anywhere"', ...badValue },
+      });
+      expect(step(r, "axis")).toEqual({
+        step: "axis",
+        isBox: true,
+        boxType: true,
+        spacerClass: "NSView",
+        inRow: { dividerTall: true, spacerWide: true },
+        inColumn: { dividerWide: true, spacerTall: true },
+        split: { across: true, down: true },
+        grow: [0, 3],
+        defaults: { vertical: null, minLength: 0 },
+      });
+      expect(step(r, "collected")).toEqual({ step: "collected", left: 0, uncaught: [] });
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
   test.concurrent("programmatic value/checked setters do not fire onChange", async () => {
     const r = await runFixture("textfield-setter.ts");
     if (r.skipped) return;
@@ -471,6 +1075,17 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
         children: ["Button", "Text"],
         spacing: 3,
         value: "edited from onBlur",
+      });
+      // A JS-defined delegate re-enters the container mid-call: refused with an error (reported,
+      // since it threw inside a callback), the field's own setter goes through, nothing aborts;
+      // a bridge target changes its button from inside click().
+      expect(step(r, "bridge delegate while editing")).toEqual({
+        step: "bridge delegate while editing",
+        log: ["delegate", "field ok", "removed", "before clicked"],
+        errors: [expect.stringMatching(/this view is inside a call into AppKit that called back into JavaScript/)],
+        children: ["Button", "Button"],
+        value: "edited from delegate",
+        title: "before clicked",
       });
       // Editing that a setter ends is still reported (it is not the setter's echo).
       expect(step(r, "hide while editing")).toEqual({ step: "hide while editing", log: ["blur", "hidden set"] });
@@ -530,6 +1145,251 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
   });
 
   test.concurrent(
+    "TextEditor and Table are bridge-built: the NSTextView and NSTableView inside .native, their delegate and data source, live props, events from the delegate",
+    async () => {
+      const r = await runFixture("editors.ts");
+      if (r.skipped) return;
+      expect(step(r, "text editor"), r.stderr).toEqual({
+        step: "text editor",
+        outer: "NSScrollView",
+        inner: "NSTextView",
+        richText: false,
+        conforms: true,
+        // undoManagerForTextView: hands each editor an undo manager of its own.
+        ownUndo: true,
+        undoClass: "NSUndoManager",
+        // A user edit reaches onChange (textDidChange:) and undo; the value setter reports nothing and clears undo.
+        afterInsert: { value: "xabc", changes: ["xabc"], canUndo: true },
+        afterSet: { value: "reset", changes: ["xabc"], canUndo: false },
+        editable: false,
+        pointSize: 13,
+        font: { design: "monospaced", size: 13 },
+        red: true,
+        colorBack: true,
+        uncaught: [],
+      });
+      expect(step(r, "table")).toEqual({
+        step: "table",
+        outer: "NSScrollView",
+        inner: "NSTableView",
+        sameDelegate: true,
+        target: expect.stringMatching(/^BunScriptObject\d+$/),
+        conforms: [true, true],
+        doubleAction: "action:",
+        action: null,
+        numberOfRows: 3,
+        // tableView:viewForTableColumn:row: read straight off the data source: ragged rows give "", numbers their text, an unknown column nil.
+        cells: [
+          { kind: "NSTableCellView", text: "alpha" },
+          { kind: "NSTableCellView", text: "1" },
+          { kind: "NSTableCellView", text: "" },
+          { kind: "NSTableCellView", text: "3" },
+          null,
+        ],
+        strangerCell: null,
+        afterUser: [[1]],
+        afterSetter: [[1]],
+        activations: [],
+        // columns read -tableColumns, so a width the user dragged shows.
+        liveColumns: [
+          { id: "Name", title: "Name", width: 100 },
+          { id: "size", title: "Size", width: 77 },
+        ],
+        withStranger: { ids: ["Name", "size", "stranger"], cell: null },
+        hiddenHeader: null,
+        implicit: { columns: [], count: 1, id: "value", header: null },
+        rowHeight: { set: 30, native: 30 },
+        rowHeightBack: true,
+        alternating: true,
+        multiple: true,
+        rows: [["alpha", "1"], ["beta"], ["gamma", "3", "extra"]],
+        badRows: {
+          threw: true,
+          isTypeError: true,
+          message: "Table.rows[0] must be an array of cell strings",
+          code: "ERR_INVALID_ARG_TYPE",
+        },
+        badColumns: {
+          threw: true,
+          isTypeError: true,
+          message: "Table.columns[0] must be a string or a { id, title, width } object",
+          code: "ERR_INVALID_ARG_TYPE",
+        },
+        badColumnTitle: {
+          threw: true,
+          isTypeError: true,
+          message: "Table.columns[0].title must be a string",
+          code: "ERR_INVALID_ARG_TYPE",
+        },
+        badIndexes: {
+          threw: true,
+          isTypeError: true,
+          message: "Table.selectedIndexes[] must be a number",
+          code: "ERR_INVALID_ARG_TYPE",
+        },
+        badIndexesShape: {
+          threw: true,
+          isTypeError: true,
+          message: "Table.selectedIndexes must be an array of row indexes",
+          code: "ERR_INVALID_ARG_TYPE",
+        },
+        uncaught: [],
+      });
+      // selectedIndexes given before rows (and before the data source exists) still ends up selected, without an onSelect.
+      expect(step(r, "selected at construction")).toEqual({
+        step: "selected at construction",
+        selected: [1],
+        native: [true, 1],
+        rows: 2,
+        selects: [],
+        later: [0],
+        uncaught: [],
+      });
+      expect(step(r, "remembered index")).toEqual({
+        step: "remembered index",
+        selected: [1, 5],
+        selects: [],
+        uncaught: [],
+      });
+      expect(step(r, "orphaned data source")).toEqual({
+        step: "orphaned data source",
+        rows: 0,
+        cell: null,
+        uncaught: [],
+      });
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "the menu bar is built through the bridge: the standard menus, app.name, every item shape of app.menu, dispatch and refusals",
+    async () => {
+      const r = await runFixture("menus.ts", { timeoutMs: 5_000 });
+      if (r.skipped) return;
+      const name = basename(bunExe());
+      // A spec assigned before the application starts is installed when it does.
+      expect(step(r, "before start"), r.stderr).toEqual({
+        step: "before start",
+        running: false,
+        menu: true,
+        mainMenu: true,
+        // menuItem() is null until the bar exists, then the very NSMenuItem.
+        item: null,
+        after: ["Early"],
+        itemAfter: true,
+      });
+      expect(step(r, "standard")).toEqual({
+        step: "standard",
+        earlyGone: null,
+        name,
+        titles: [name, "Edit", "View", "Window"],
+        appItems: [
+          `About ${name}|orderFrontStandardAboutPanel:|`,
+          "-",
+          "Services|submenuAction:|",
+          "-",
+          `Hide ${name}|hide:|h`,
+          "Hide Others|hideOtherApplications:|h",
+          "Show All|unhideAllApplications:|",
+          "-",
+          `Quit ${name}|terminate:|q`,
+        ],
+        edit: [
+          "Undo|undo:|z",
+          "Redo|redo:|Z",
+          "-",
+          "Cut|cut:|x",
+          "Copy|copy:|c",
+          "Paste|paste:|v",
+          "Delete|delete:|",
+          "Select All|selectAll:|a",
+        ],
+        view: ["Enter Full Screen|toggleFullScreen:|f"],
+        window: ["Minimize|performMiniaturize:|m", "Zoom|performZoom:|", "-", "Bring All to Front|arrangeInFront:|"],
+        hideOthersMask: true,
+        targets: true,
+        windowsMenu: true,
+        servicesMenu: true,
+        terminateTarget: true,
+      });
+      expect(step(r, "renamed")).toEqual({ step: "renamed", title: "Renamed", quit: "Quit Renamed", back: name });
+      expect(step(r, "custom")).toEqual({
+        step: "custom",
+        // app.menuItem(x) is the NSMenuItem built for x, by identity: setEnabled:/setTitle:/setState: change the installed bar, not the spec.
+        menuItem: {
+          doIs: true,
+          twice: true,
+          inner: true,
+          holder: true,
+          top: true,
+          separator: {
+            threw: true,
+            isTypeError: true,
+            message: "app.menuItem() expects an item or menu object from app.menu",
+          },
+          copy: null,
+          after: "Done|false",
+          checked: 0,
+          sameBar: true,
+          spec: "Do",
+        },
+        titles: ["Main", "Second"],
+        second: [],
+        // title|action|key|enabled|state: a function is `action:` on the shared target, a selector goes untargeted, disabled items get neither.
+        items: [
+          "Do|action:||true|0",
+          "-",
+          "Copy|copy:|c|true|0",
+          "Custom|customAction:||true|0",
+          "Fn|action:||true|0",
+          "Off|null||false|0",
+          "Checked|action:||true|1",
+          "Sub|submenuAction:||true|0",
+          "Held|submenuAction:||false|0",
+          "Bare|action:|b|true|0",
+          "Upper|action:|S|true|0",
+        ],
+        oneTarget: true,
+        selectorTargets: [null, null],
+        offTarget: null,
+        tags: [1, 2, 4, 5],
+        masks: { copy: true, inner: true, bare: true, upper: true },
+        held: { enabled: false, deep: ["Deep|copy:"] },
+        calls: ["do", "fn", "inner"],
+        chosen: ["Do", "Fn", "Checked", "Inner"],
+        getter: true,
+        uncaught: [],
+      });
+      const refused = step(r, "refused");
+      for (const key of [
+        "both",
+        "twoColons",
+        "noColon",
+        "badClick",
+        "submenuAndAction",
+        "notArray",
+        "badMenu",
+        "badItem",
+      ]) {
+        expect(refused[key], key).toMatchObject({ threw: true, isTypeError: true });
+      }
+      expect(refused.twoColons.message).toMatch(/selector that takes the sender/);
+      expect(refused.still).toBe("Main");
+      expect(step(r, "restored")).toEqual({
+        step: "restored",
+        titles: [name, "Edit", "View", "Window"],
+        getter: null,
+        doItem: null,
+        // An NSMenuItem held over from the replaced bar dispatches to nothing.
+        staleCalls: 3,
+        windowsMenu: true,
+      });
+      expect(r.signal).toBeNull();
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
     "Picker and Segmented: selectedIndex defaults, duplicate titles, out-of-range and prop order",
     async () => {
       const r = await runFixture("picker.ts");
@@ -573,8 +1433,11 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
     if (r.skipped) return;
     const created = step(r, "created");
     expect(created.live).toBeGreaterThanOrEqual(created.baseline + 300);
+    expect(created.natives).toBe(300);
     const collected = step(r, "collected");
     expect(collected.after).toBeLessThanOrEqual(collected.baseline + 5);
+    // Not only the View objects: the NSViews behind the collected ones are deallocated too.
+    expect(collected.nativesLeft).toBeLessThanOrEqual(Math.max(collected.after - collected.baseline, 0));
     expect(r.exitCode).toBe(0);
   });
 
@@ -589,6 +1452,43 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
       expect(step(r, "still-alive")).toBeDefined();
       expect(step(r, "unexpected-timer")).toBeUndefined();
       // A SIGKILL here means keepAlive = false did not release the process.
+      expect(r.signal).toBeNull();
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "reopen and menu listeners all run even when one of them, or the item's onClick, throws",
+    async () => {
+      const r = await runFixture("app-events.ts", { timeoutMs: 5_000 });
+      if (r.skipped) return;
+      expect(step(r, "reopen"), r.stderr).toEqual({
+        step: "reopen",
+        reopens: [false, true],
+        handled: true,
+        uncaught: ["reopen boom"],
+      });
+      expect(step(r, "menu")).toEqual({ step: "menu", chosen: ["same item"], uncaught: ["onClick boom", "menu boom"] });
+      expect(r.signal).toBeNull();
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "a modal session run through the bridge holds timers until it ends, then the loop resumes, also when begun inside the wait",
+    async () => {
+      const r = await runFixture("modal.ts", { timeoutMs: 15_000 });
+      if (r.skipped) return;
+      // NSModalResponseStop; the timeout armed before the session ran only after it.
+      expect(step(r, "top level"), r.stderr).toEqual({
+        step: "top level",
+        response: -1000,
+        ranDuring: false,
+        ranAfter: true,
+      });
+      expect(step(r, "inside wait")).toEqual({ step: "inside wait", response: -1000 });
+      expect(step(r, "watchdog")).toBeUndefined();
+      expect(step(r, "done")).toEqual({ step: "done" });
       expect(r.signal).toBeNull();
       expect(r.exitCode).toBe(0);
     },
@@ -665,6 +1565,43 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
     },
   );
 
+  // The bridge loads the Objective-C runtime itself: bun links the same
+  // libraries as before it existed and registers no Objective-C image. And
+  // the one frame that catches NSException must keep DWARF unwind info (an
+  // __eh_frame FDE with its LSDA), since release builds strip __unwind_info
+  // and ld64.lld drops the FDE of any frame it managed to encode compactly.
+  test.concurrent("bun links no Objective-C runtime and the catch frame keeps its DWARF unwind entry", async () => {
+    const tool = (...cmd: string[]) => {
+      const { stdout, exitCode } = Bun.spawnSync({ cmd, stdout: "pipe", stderr: "pipe" });
+      return exitCode === 0 ? stdout.toString() : null;
+    };
+    if (tool("xcode-select", "-p") === null) {
+      console.warn("no developer tools here; linkage and unwind checks skipped");
+      return;
+    }
+    const exe = bunExe();
+    const libraries = tool("otool", "-L", exe)!;
+    expect(libraries).toContain("libSystem");
+    expect(libraries).not.toContain("libobjc");
+    const sections = tool("size", "-m", exe)!;
+    expect(sections).not.toContain("__objc_imageinfo");
+    expect(sections).toMatch(/__gcc_except_tab: [1-9]/);
+    expect(sections).toMatch(/__eh_frame: [1-9]/);
+    const symbols = tool("nm", exe) ?? "";
+    const symbol = symbols.split("\n").find(line => line.endsWith(" _Bun__NSInvocation__tryInvoke"));
+    if (symbol === undefined) {
+      // A stripped binary: the sections above are all that can be checked.
+      expect(symbols.trim().split("\n").length).toBeLessThan(100);
+      return;
+    }
+    const address = BigInt("0x" + symbol.split(" ")[0]);
+    const frames = tool("dwarfdump", "--eh-frame", exe)!;
+    const covering = [...frames.matchAll(/FDE cie=[0-9a-f]+ pc=([0-9a-f]+)\.\.\.([0-9a-f]+)\n((?:  .*\n)*)/g)].find(
+      m => BigInt("0x" + m[1]) <= address && address < BigInt("0x" + m[2]),
+    );
+    expect(covering?.[0] ?? "no FDE covers Bun__NSInvocation__tryInvoke").toContain("LSDA Address");
+  });
+
   test.concurrent("an uncaught NSException names itself before the crash report", async () => {
     const r = await runFixture("objc-exception.ts", { timeoutMs: 10_000, expectFailure: true });
     if (r.skipped) return;
@@ -728,7 +1665,7 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
     expect(again.document).toBeGreaterThan(2 * again.scroll);
     expect(step(r, "vstack align")).toEqual({
       step: "vstack align",
-      align: "bottom",
+      align: "trailing",
       threw: { isTypeError: true, message: expect.stringContaining("horizontal stack") },
     });
     expect(r.exitCode).toBe(0);
@@ -827,6 +1764,10 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
         range: { location: 6, length: 5 },
         notFound: "9223372036854775807",
         notFoundType: "bigint",
+        notFoundRange: true,
+        notFoundIndex: true,
+        foundIndex: 0,
+        notFoundConstant: ["bigint", "9223372036854775807"],
         substring: "hello",
         bigRange: "9223372036854775807",
         badRange: true,
@@ -873,10 +1814,69 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
         sameNulls: false,
         sameStrings: false,
       });
-      const badState = { threw: true, isTypeError: false, code: "ERR_INVALID_STATE" };
-      expect(step(r, "native after close")).toMatchObject(badState);
-      expect(step(r, "native after close").message).toMatch(/closed/);
+      expect(step(r, "native after close")).toEqual({ step: "native after close", same: true });
       expect(step(r, "handle after close")).toEqual({ step: "handle after close", title: "u" });
+      // Windows created through objc are told not to release themselves on close, so their handles survive it.
+      expect(step(r, "bridge window")).toEqual({
+        step: "bridge window",
+        releasedWhenClosed: [false, false, false],
+        titlesAfterClose: ["raw", "new"],
+        frameWidthAfterClose: 120,
+      });
+      // An NSProxy receiver gets only the message sent (no respondsToSelector: probe), so a recording proxy records that.
+      expect(step(r, "proxy")).toEqual({
+        step: "proxy",
+        isProxy: [true, false],
+        recorded: "undefined",
+        untouchedBeforeUndo: true,
+        replayed: ["undone"],
+        jsLeavesProxy: "[object ObjCObject]",
+        stringifies: "string",
+        typo: { threw: true, isTypeError: true },
+      });
+      // An NSException inside a send is an ERR_OBJC_EXCEPTION Error named after it; nothing aborts.
+      const objcException = { threw: true, isError: true, code: "ERR_OBJC_EXCEPTION", stack: "string" };
+      expect(step(r, "exception range")).toEqual({
+        step: "exception range",
+        ...objcException,
+        name: "NSRangeException",
+        message: expect.stringContaining("index 3 beyond bounds for empty array"),
+        exceptionName: "NSRangeException",
+        countAfter: 0,
+      });
+      expect(step(r, "exception nil object")).toMatchObject({
+        ...objcException,
+        name: "NSInvalidArgumentException",
+        message: expect.stringContaining("object cannot be nil (key: k)"),
+        exceptionName: "NSInvalidArgumentException",
+      });
+      expect(step(r, "exception userInfo")).toEqual({
+        step: "exception userInfo",
+        ...objcException,
+        name: "BunFixtureException",
+        message: "because",
+        userInfo: expect.stringMatching(/detail = 42/),
+        exceptionName: "BunFixtureException",
+      });
+      expect(step(r, "exception nil name")).toEqual({
+        step: "exception nil name",
+        ...objcException,
+        name: "NSException",
+        message: "",
+        exceptionName: "null",
+      });
+      expect(step(r, "exception init")).toMatchObject({
+        ...objcException,
+        name: "NSInvalidArgumentException",
+        message: expect.stringContaining("initWithString:"),
+        consumedAfter: true,
+      });
+      expect(step(r, "exception proxy")).toMatchObject({
+        ...objcException,
+        name: "NSInternalInconsistencyException",
+        message: expect.stringContaining("must begin a group before registering undo"),
+        untouched: true,
+      });
       const typeError = { threw: true, isTypeError: true };
       expect(step(r, "unknown class")).toEqual({
         step: "unknown class",
@@ -891,14 +1891,17 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
         "+[NSString definitelyNot]: unrecognized selector",
       );
       expect(step(r, "wrong arg count")).toMatchObject(typeError);
-      expect(step(r, "wrong arg count").message).toMatch(/compare:.*"compare_".*1 argument.*0 were passed/);
+      expect(step(r, "wrong arg count").message).toMatch(/compare:\]: expected 1 argument\(s\), got 0/);
       expect(step(r, "wrong arg count extra")).toMatchObject(typeError);
       expect(step(r, "wrong arg count extra").message).toMatch(/length\]: "length".*0 arguments.*1 was passed/);
       expect(step(r, "wrong arg count msgSend")).toMatchObject(typeError);
       expect(step(r, "wrong arg count msgSend").message).toContain("compare:");
       expect(step(r, "msgSend works")).toEqual({ step: "msgSend works", threw: false, value: 0 });
-      expect(step(r, "block arg")).toMatchObject(typeError);
-      expect(step(r, "block arg").message).toMatch(/block.*not supported yet/i);
+      expect(step(r, "block arg")).toEqual({ step: "block arg", threw: false });
+      expect(step(r, "block arg number")).toMatchObject(typeError);
+      expect(step(r, "block arg number").message).toMatch(
+        /must be a function or a block made with objc\.block\(\) \(@\?\), got a number/,
+      );
       expect(step(r, "pointer arg")).toMatchObject(typeError);
       expect(step(r, "pointer arg").message).toMatch(/pointer/i);
       for (const name of ["fractional index", "negative unsigned", "string for number", "symbol for object"]) {
@@ -917,16 +1920,37 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
           message: expect.stringMatching(/release\(\)/),
         });
       }
-      for (const name of ["variadic format", "variadic objects", "variadic append", "variadic init"]) {
+      expect(step(r, "autorelease pool refused")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/NSAutoreleasePool.*managed/),
+      });
+      for (const name of ["performSelector refused", "performSelector withObject refused"]) {
+        expect(step(r, name)).toMatchObject({ step: name, ...typeError, message: expect.stringMatching(/msgSend/) });
+      }
+      // The void-returning variants have nothing to mistype.
+      expect(step(r, "performSelector afterDelay allowed")).toEqual({
+        step: "performSelector afterDelay allowed",
+        threw: false,
+      });
+      for (const name of [
+        "variadic format",
+        "variadic subclass",
+        "variadic instance",
+        "variadic init",
+        "variadic appkit",
+        "variadic unconventional name",
+        "variadic core image",
+        "va_list",
+      ]) {
         expect(step(r, name)).toMatchObject({ step: name, ...typeError, message: expect.stringMatching(/variadic/) });
       }
-      expect(step(r, "va_list")).toMatchObject({ ...typeError, message: expect.stringMatching(/va_list/) });
       expect(step(r, "object arguments:")).toEqual({ step: "object arguments:", threw: false, value: "sum:" });
       expect(step(r, "non-variadic format")).toEqual({
         step: "non-variadic format",
         threw: false,
         value: 'SELF == "a"',
       });
+      expect(step(r, "non-variadic format int")).toMatchObject({ step: "non-variadic format int", threw: false });
       for (const name of ["init on class", "init on class msgSend"]) {
         expect(step(r, name)).toMatchObject({ step: name, ...typeError, message: expect.stringMatching(/alloc\(\)/) });
       }
@@ -957,7 +1981,7 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
         message: expect.stringMatching(/cannot convert an object/),
       });
       expect(step(r, "null-proto object for id")).toEqual({ step: "null-proto object for id", threw: false, value: 0 });
-      expect(step(r, "date for id")).toMatchObject(typeError);
+      expect(step(r, "map for id")).toMatchObject(typeError);
       for (const name of ["NUL in char*", "NUL in SEL"]) {
         expect(step(r, name)).toMatchObject({ step: name, ...typeError, message: expect.stringMatching(/NUL/) });
       }
@@ -989,18 +2013,806 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
     },
   );
 
+  test.concurrent(
+    "objc.defineClass / objc.target: AppKit calls JavaScript methods, encodings from types, protocol or superclass",
+    async () => {
+      const r = await runFixture("objc-define.ts", { timeoutMs: 40_000 });
+      if (r.skipped) return;
+      expect(step(r, "data source")).toEqual({
+        step: "data source",
+        className: "FixtureDataSource",
+        sameClass: true,
+        instanceClass: "FixtureDataSource",
+        isKindOfNSObject: true,
+        // reloadData asked the JS data source synchronously.
+        numberOfRows: 3,
+        direct: "gamma",
+        askedRows: true,
+        askedValue: true,
+        respondsRows: true,
+        respondsValue: true,
+        respondsNope: false,
+        conforms: true,
+        conformsOther: false,
+        classConforms: true,
+        instancesRespond: true,
+        // q@:@ from the NSTableViewDataSource protocol, not the all-object default.
+        signature: "q",
+        protocolsString: "[objc.protocols]",
+        sameProtocol: true,
+      });
+      expect(step(r, "target")).toEqual({
+        step: "target",
+        generatedClassName: true,
+        // Still the target after a reader's `using` gave its read back: a third click lands.
+        stillTarget: true,
+        clicks: 3,
+        senderIsButton: true,
+        secondSender: null,
+        thisIsTarget: true,
+        responds: true,
+        buttonTarget: true,
+      });
+      expect(step(r, "subclass")).toEqual({
+        step: "subclass",
+        superclassName: "NSView",
+        flipped: true,
+        plainFlipped: false,
+        accepts: true,
+        plainAccepts: false,
+        moved: true,
+        isKindOfNSView: true,
+        frameWidth: 10,
+      });
+      // NSView's dealloc removes its subviews; the deallocating parent's override is skipped.
+      expect(step(r, "dealloc")).toEqual({
+        step: "dealloc",
+        whileAlive: ["NSButton"],
+        afterRelease: ["NSButton"],
+        childSuperview: null,
+        childClass: "NSButton",
+      });
+      expect(step(r, "inherit")).toEqual({
+        step: "inherit",
+        fromObjectSuperclass: "NSObject",
+        generatedNames: true,
+        base: "base",
+        derived: "derived",
+        inheritedTwice: 42,
+        derivedSuperclass: true,
+      });
+      const escaped = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const misfit = (selector: string, expected: string, got: string) => ({
+        threw: true,
+        isTypeError: true,
+        message: expect.stringMatching(
+          new RegExp(`^-\\[BunScriptObject\\d+ ${selector}\\]: must return ${escaped(expected)}, got ${escaped(got)}$`),
+        ),
+      });
+      expect(step(r, "constants")).toEqual({
+        step: "constants",
+        flipped: true,
+        opaque: false,
+        tag: -7,
+        alpha: 0.25,
+        menu: null,
+        big: "18446744073709551615",
+        ratio: 1.5,
+        level: 3,
+        kvc: -7,
+        responds: true,
+        mainThread: [42, 1],
+        uncaught: [
+          "objc: -[FixtureAsks level] was called on another thread; its JavaScript function only runs on the main thread, so the caller received 0 / NO / nil",
+        ],
+        wrongBool: misfit("isFlipped", "a boolean (B)", "an integer"),
+        wrongObject: misfit(
+          "menu",
+          "an object, string, number, boolean or null (@)",
+          "the constant a boolean; a constant method returns a boolean, a number or null",
+        ),
+        wrongVoid: misfit(
+          "poke:",
+          "nothing (v)",
+          "the constant null; a constant method returns a boolean, a number or null",
+        ),
+        wrongStruct: misfit(
+          "frame",
+          "a {origin, size} or {x, y, width, height} object ({CGRect={CGPoint=dd}{CGSize=dd}})",
+          "the constant null; a constant method returns a boolean, a number or null",
+        ),
+        wrongRange: misfit("small", "an integer (C)", "300"),
+        wrongFraction: misfit("whole", "an integer (q)", "a number"),
+        wrongKind: {
+          threw: true,
+          isTypeError: true,
+          message:
+            'objc.defineClass(): methods["text"] must be a function, a constant (boolean, number or null), or { types, fn } or { types, value } with types a string',
+        },
+      });
+      expect(step(r, "types")).toEqual({
+        step: "types",
+        rect: { origin: { x: 2, y: 2 }, size: { width: 6, height: 4 } },
+        add: 3.75,
+        not: [false, true],
+        sel: "some:extra:",
+        cls: true,
+        big: "1152921504606846977",
+        describe: "got 42",
+        describeString: "got s",
+        list: ["a", 1, true, null],
+        nothing: null,
+        keepSame: true,
+        keepNull: null,
+      });
+      // A throw (or an unconvertible result) is an uncaught JS error; the sender reads zero / nil.
+      expect(step(r, "throws")).toEqual({
+        step: "throws",
+        boom: { threw: false, value: null },
+        count: { threw: false, value: 0 },
+        flag: { threw: false, value: false },
+        badRows: { threw: false, value: 0 },
+        badSel: { threw: false, value: null },
+        uncaught: [
+          "boom from js",
+          "count failed",
+          expect.stringMatching(/-\[FixtureThrows flag\]: must return a boolean \(B\), got a string/),
+          expect.stringMatching(/-\[FixtureThrows rows\]: must return an integer \(q\), got 1\.5/),
+          expect.stringMatching(
+            /-\[FixtureThrows badSel\]: must return a selector name \(:\), got a string containing a NUL/,
+          ),
+        ],
+      });
+      expect(step(r, "forward by hand")).toEqual({ step: "forward by hand", threw: false });
+      // The IMP never reads an argument the invocation lacks; the mismatch is reported.
+      expect(step(r, "forward wrong signature")).toEqual({
+        step: "forward wrong signature",
+        sent: { threw: false },
+        uncaught: [expect.stringMatching(/invocation whose signature takes 0 argument\(s\).*the method takes 3/)],
+      });
+      // q from NSTableViewDataSource and B from NSWindowDelegate without naming them; @ for a selector of its own.
+      expect(step(r, "untyped encodings")).toEqual({
+        step: "untyped encodings",
+        rows: "q@",
+        shouldClose: "B@",
+        own: "@@",
+        rowsValue: 0,
+      });
+      expect(step(r, "untyped conflict")).toMatchObject({
+        threw: true,
+        isTypeError: true,
+        message: expect.stringMatching(/state\]: protocols declare this selector with different types: .*NS\w+ \(/),
+      });
+      // N^@: the script sees the caller's object and what it stores comes back.
+      expect(step(r, "inout")).toEqual({ step: "inout", ok: true, out: "in+k", types: "N^@" });
+      const typeError = { threw: true, isTypeError: true };
+      expect(step(r, "name taken")).toMatchObject({ ...typeError, message: expect.stringContaining('"NSObject"') });
+      expect(step(r, "name taken twice")).toMatchObject({
+        ...typeError,
+        message: expect.stringContaining('"FixtureTypes"'),
+      });
+      expect(step(r, "bad name")).toMatchObject(typeError);
+      expect(step(r, "no protocol")).toMatchObject({
+        ...typeError,
+        message: 'objc: no protocol named "NSDefinitelyNotAProtocol" is registered by the loaded frameworks',
+      });
+      expect(step(r, "protocol lookup")).toMatchObject({
+        ...typeError,
+        message: expect.stringContaining("NSDefinitelyNotAProtocol"),
+      });
+      expect(step(r, "bad superclass")).toMatchObject({
+        ...typeError,
+        message: 'objc: no class named "NSDefinitelyNotAClass"',
+      });
+      expect(step(r, "bad types")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/x:\]: type encoding "v@:\{\{\{" is not valid/),
+      });
+      expect(step(r, "types arity")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/"v@:" has 0 argument\(s\) but the selector takes 1/),
+      });
+      expect(step(r, "types no self")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/x\]: type encoding "v" must start with the return type followed by "@:"/),
+      });
+      expect(step(r, "types bad self")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/"vq:@" must start with the return type followed by "@:"/),
+      });
+      expect(step(r, "fn arity")).toMatchObject({
+        ...typeError,
+        message: 'objc.defineClass(): "x:" takes 1 argument but its function declares 2',
+      });
+      expect(step(r, "init refused")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/ init\]: init methods cannot be defined/),
+      });
+      expect(step(r, "initWith refused")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/ initWithRows:\]: init methods cannot be defined/),
+      });
+      expect(step(r, "required missing")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(
+          /adopts NSCopying but does not define copyWithZone:, which the protocol requires/,
+        ),
+      });
+      expect(step(r, "required inherited")).toEqual({ step: "required inherited", threw: false, value: "NSCell" });
+      expect(step(r, "required defined")).toEqual({ step: "required defined", threw: false, value: "NSObject" });
+      // @? both ways in a defined method: the parameter is callable, the return takes a block handle.
+      expect(step(r, "block param")).toEqual({
+        step: "block param",
+        received: ["function", 49, 4],
+        result: 100,
+        same: true,
+        direct: 81,
+        released: true,
+      });
+      // A bare function where a block is returned has no type to go by: reported, nil returned.
+      expect(step(r, "block return fn")).toEqual({ step: "block return fn", threw: false, value: null });
+      expect(step(r, "reserved")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/dealloc\]: this selector cannot be defined/),
+      });
+      expect(step(r, "not a function")).toMatchObject({
+        ...typeError,
+        message: expect.stringContaining('methods["x"]'),
+      });
+      expect(step(r, "no methods")).toMatchObject(typeError);
+      expect(step(r, "target not a function")).toMatchObject(typeError);
+      expect(step(r, "name reusable")).toMatchObject(typeError);
+      expect(step(r, "name reused")).toEqual({ step: "name reused", threw: false, value: "FixtureRetry" });
+      expect(step(r, "lifetime")).toEqual({ step: "lifetime", aliveWhileHeld: true, collectedAfterRelease: true });
+      expect(step(r, "lifetime off thread")).toEqual({ step: "lifetime off thread", collected: true });
+      expect(step(r, "assign delegate")).toEqual({
+        step: "assign delegate",
+        heldWhileSet: 1,
+        parsed: true,
+        elements: 3,
+        sameObject: true,
+        goneAfterNil: true,
+      });
+      expect(step(r, "assign delegate owner released")).toEqual({ step: "assign delegate owner released", gone: true });
+      expect(step(r, "done")).toEqual({ step: "done" });
+      expect(r.signal).toBeNull();
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "objc.block / functions as block arguments: enumeration, predicates, comparators, run-loop callbacks",
+    async () => {
+      const r = await runFixture("objc-blocks.ts", { timeoutMs: 40_000 });
+      if (r.skipped) return;
+      expect(step(r, "enumerate")).toEqual({
+        step: "enumerate",
+        // stop.value = true at index 2 ends the enumeration; list.count() re-enters the bridge from inside the block.
+        seen: [
+          ["alpha", 0, false, 4],
+          ["beta", 1, false, 4],
+          ["gamma", 2, false, 4],
+        ],
+        receiverUndefined: true,
+      });
+      expect(step(r, "passing test")).toEqual({
+        step: "passing test",
+        isIndexSet: true,
+        count: 2,
+        hasOne: true,
+        hasThree: true,
+        hasTwo: false,
+        first: 2,
+        none: true,
+        yes: true,
+        no: false,
+      });
+      expect(step(r, "comparator")).toEqual({
+        step: "comparator",
+        sorted: ["gamma", "delta", "beta", "alpha"],
+        pairs: [
+          ["one", 1],
+          ["two", 2],
+        ],
+      });
+      expect(step(r, "explicit")).toEqual({
+        step: "explicit",
+        seen: [0, 1, 2, 3, 3, 2, 1, 0],
+        description: true,
+        expression: "value:x",
+        expressionNull: "value:null",
+        defaultTypes: true,
+        same: true,
+      });
+      // A block's recorded signature types a call from JavaScript, out-parameters included.
+      expect(step(r, "invoke")).toEqual({
+        step: "invoke",
+        compare: [-1, 1],
+        stopBefore: false,
+        stopAfter: true,
+        omitted: { threw: false },
+        fromFramework: "got:z",
+        selector: "function",
+        tooMany: {
+          threw: true,
+          isTypeError: true,
+          message: expect.stringMatching(/block q@\?@@: expected 2 argument\(s\), got 3/),
+        },
+        notBlockClass: "function",
+      });
+      // Nothing runs before the loop turns; then the operation, the performBlock: and the timer all do.
+      expect(step(r, "run loop")).toEqual({
+        step: "run loop",
+        before: { operation: 0, performed: 0, timers: 0 },
+        operation: 1,
+        performed: 1,
+        timers: ["__NSCFTimer"],
+        timerValid: false,
+      });
+      expect(step(r, "animation")).toEqual({
+        step: "animation",
+        syncContexts: ["NSAnimationContext", "NSAnimationContext"],
+        syncCompleted: 0,
+        completed: 1,
+      });
+      expect(step(r, "throws")).toEqual({
+        step: "throws",
+        // The throw set *stop, so the block ran once; the misfit return read as NO.
+        calls: 1,
+        matched: 0,
+        uncaught: ["thrown in block", "block B@?@Q^B: must return a boolean (B), got a string"],
+      });
+      // Releasing the block's only reference from inside its own function is safe for that call.
+      expect(step(r, "release inside")).toMatchObject({
+        step: "release inside",
+        calls: 1,
+        released: { threw: true, message: "ObjCObject has been released" },
+      });
+      // A background queue calling the block gets zero; the main thread reports it.
+      expect(step(r, "off thread")).toEqual({
+        step: "off thread",
+        ran: 0,
+        uncaught: [
+          "objc: block v@? was called on another thread; its JavaScript function only runs on the main thread, so the caller received 0 / NO / nil",
+        ],
+      });
+      const typeError = { threw: true, isTypeError: true };
+      const unsupported = step(r, "unsupported types");
+      expect(unsupported).toMatchObject(typeError);
+      expect(unsupported.message).toStartWith(
+        'objc: block type encoding "v@?@@@@@@" is not one a JavaScript function can be called through; the supported ones are ',
+      );
+      // The documentation lists exactly the encodings the bridge supports.
+      const supported = (unsupported.message as string).split("the supported ones are ")[1].split(", ");
+      const docs = readFileSync(join(import.meta.dir, "../../../../docs/runtime/appkit.mdx"), "utf8");
+      const documented = [...docs.matchAll(/^\| `([^`]*@\?[^`]*)` +\|/gm)].map(m => m[1]);
+      expect(documented).toEqual(supported);
+      expect(step(r, "no block marker")).toMatchObject({
+        ...typeError,
+        message:
+          'objc: block type encoding "v@:" must start with the return type followed by "@?" for the block itself',
+      });
+      expect(step(r, "invalid types")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/^objc: block type encoding "\{\{" is not a valid type encoding \(/),
+      });
+      expect(step(r, "not a function")).toMatchObject({
+        ...typeError,
+        message: "objc.block(fn, types): fn must be a function",
+      });
+      expect(step(r, "types not a string")).toMatchObject({
+        ...typeError,
+        message: "objc.block(fn, types): types must be a string",
+      });
+      expect(step(r, "unsupported known")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(
+          /enumerateSubstringsInRange:options:usingBlock:\]: argument 2 takes a block of type v@\?@\{_NSRange=QQ\}\{_NSRange=QQ\}\^B, which is not one a JavaScript function can be called through/,
+        ),
+      });
+      expect(step(r, "unknown selector")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(
+          /loadValuesAsynchronouslyForKeys:completionHandler:\]: argument 1 is a block whose type the bridge does not know for this method; pass objc\.block\(fn, types\)/,
+        ),
+      });
+      expect(step(r, "not a block object")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(
+          /enumerateObjectsUsingBlock:\]: argument 0 must be a function or a block made with objc\.block\(\) \(@\?\), got an object of class NSObject/,
+        ),
+      });
+      // The bridge knows -[NSArray enumerateObjectsUsingBlock:] takes v@?@Q^B, and the block says what it is.
+      expect(step(r, "wrong block type")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(
+          /enumerateObjectsUsingBlock:\]: argument 0 must be a block of type v@\?@Q\^B, got a block of type q@\?@@$/,
+        ),
+      });
+      // -[NSOperation completionBlock] runs on a secondary thread, so the bridge does not offer it.
+      // A property setter BridgeSupport omits, read from the header: accepted (an unstarted operation never calls it).
+      expect(step(r, "completion block")).toEqual({ step: "completion block", threw: false });
+      expect(step(r, "invoke non-block")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/-\[NSObject invoke\]: unrecognized selector|does not respond/),
+      });
+      expect(step(r, "message to block")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/Block__ className\]: the receiver is a block/),
+      });
+      expect(step(r, "null block")).toMatchObject({ threw: true, code: "ERR_OBJC_EXCEPTION" });
+      // Two functions go once their blocks are released (one on a background thread); the third once Foundation lets go.
+      expect(step(r, "lifetime")).toEqual({ step: "lifetime", whileHeld: 2, afterRemoval: 3 });
+      expect(step(r, "done")).toEqual({ step: "done" });
+      expect(r.signal).toBeNull();
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
+  test.concurrent(
+    "objc: out-parameters, constants, enums, one handle per object, inspect, in/keys, using, for...of, NSData/NSDate",
+    async () => {
+      const r = await runFixture("objc-ergonomics.ts", { timeoutMs: 40_000 });
+      if (r.skipped) return;
+      // NSError ** is filled on failure and left nil on success; a plain {} works like objc.out().
+      expect(step(r, "out error"), r.stderr).toEqual({
+        step: "out error",
+        failed: null,
+        errorClass: true,
+        domain: "NSCocoaErrorDomain",
+        code: 260,
+        plainCode: 260,
+        unusedIsNull: true,
+        rootIsDictionary: true,
+        withNull: null,
+        omitted: null,
+      });
+      // Only out-parameters may be left off; anything else is still counted.
+      expect(step(r, "omitted non-out")).toMatchObject({
+        threw: true,
+        isTypeError: true,
+        message: expect.stringMatching(/compare:\]: expected 1 argument\(s\), got 0/),
+      });
+      expect(step(r, "out scalars")).toEqual({
+        step: "out scalars",
+        scanned: [true, true, true, true],
+        d: 3.25,
+        q: -17,
+        hex: 255,
+        word: "word",
+        again: false,
+        exhausted: 7.5,
+      });
+      expect(step(r, "out struct")).toEqual({
+        step: "out struct",
+        font: null,
+        range: { location: 0, length: 5 },
+        lineEnd: 3,
+      });
+      // A defined method sees the caller's initial value and the caller sees what it wrote.
+      expect(step(r, "out defined")).toEqual({
+        step: "out defined",
+        counter: 42,
+        wasNull: true,
+        text: "filled",
+        textIsString: true,
+        withNull: true,
+        presetReadsNull: true,
+        frame: { origin: { x: 1, y: 2 }, size: { width: 42, height: 4 } },
+      });
+      const typeError = { threw: true, isTypeError: true };
+      expect(step(r, "out number")).toMatchObject({ ...typeError, message: expect.stringMatching(/objc\.out\(\)/) });
+      expect(step(r, "out handle")).toMatchObject({ ...typeError, message: expect.stringMatching(/objc\.out\(\)/) });
+      expect(step(r, "out bad initial")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/scanDouble:\]: argument 0 must be a number \(d\), got a string/),
+      });
+      // C arrays and buffers (declared as arrays in the SDK, const pointers, non-const char *) take only null.
+      for (const [name, pattern] of [
+        ["array objects", /getObjects:range:\]: argument 0 must be null, .*C array.*bun:ffi.*, got an object/],
+        ["array unichar", /getCharacters:range:\]: argument 0 .*bun:ffi/],
+        ["array char", /getCString:maxLength:encoding:\]: argument 0 .*bun:ffi.*, got a string/],
+        ["array const", /arrayWithObjects:count:\]: argument 0 .*bun:ffi/],
+        ["array no count", /getComponents:\]: argument 0 .*bun:ffi/],
+        ["array read", /read:maxLength:\]: argument 0 .*bun:ffi/],
+      ] as const) {
+        expect(step(r, name)).toMatchObject({ ...typeError, message: expect.stringMatching(pattern) });
+      }
+      expect(step(r, "array null")).toEqual({
+        step: "array null",
+        getCharacters: undefined,
+        constChar: "hi",
+        utf8: "abc",
+      });
+      // A class cluster's alloc is sent when the init is looked up, but the handle stays an alloc until an init succeeds.
+      expect(step(r, "cluster bad init")).toMatchObject({
+        ...typeError,
+        message: expect.stringMatching(/initWithString:\]: expected 1 argument\(s\), got 0/),
+      });
+      expect(step(r, "cluster not initialized")).toMatchObject({
+        ...typeError,
+        message: "this object came from alloc(); call an init… method on it first",
+      });
+      expect(step(r, "cluster alloc")).toEqual({
+        step: "cluster alloc",
+        inspect: "[objc NSAttributedString alloc]",
+        keys: 0,
+        length: 2,
+        consumed: true,
+      });
+      expect(step(r, "constants")).toEqual({
+        step: "constants",
+        fontAttribute: "NSFont",
+        didResize: "NSWindowDidResizeNotification",
+        runLoopMode: "kCFRunLoopDefaultMode",
+        cached: true,
+        viaFunction: true,
+        weightRegular: 0,
+        weightBoldPositive: true,
+        typed: 0,
+        noIntrinsicMetric: -1,
+        zeroRect: { origin: { x: 0, y: 0 }, size: { width: 0, height: 0 } },
+        zeroSize: { width: 0, height: 0 },
+        string: "[objc.constants]",
+        afterUsing: "NSFont",
+        otherFramework: "vide",
+      });
+      const wider = step(r, "constants wider");
+      expect(wider).toMatchObject({
+        step: "constants wider",
+        since1970: 978307200,
+        pageSize: true,
+        identity: { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 },
+        debugEnabled: false,
+        callbacks: { threw: true, isTypeError: true },
+        stdinp: { threw: true, isTypeError: true },
+        environ: { threw: true, isTypeError: true },
+        explicit: { threw: true, isTypeError: true },
+      });
+      expect(wider.callbacks.message).toBe(
+        'objc: the constant NSObjectMapKeyCallBacks does not hold an Objective-C object; pass its C type, as in objc.constant("NSObjectMapKeyCallBacks", { type: "d" }) for a double or { type: "{CGRect=dddd}" } for a struct',
+      );
+      expect(step(r, "structs")).toEqual({
+        step: "structs",
+        identityKeys: "m11,m12,m13,m14,m21,m22,m23,m24,m31,m32,m33,m34,m41,m42,m43,m44",
+        identityDiagonal: [1, 1, 1, 1],
+        moved: [5, 6, 7],
+        spread: 9,
+        cmTime: [90, 30, 1, 0],
+        cmTimeText: true,
+        rangeFromArray: { location: 3, length: 4 },
+        badLength: {
+          threw: true,
+          isTypeError: true,
+          message:
+            "-[CALayer setTransform:]: argument 0 must be a {m11, m12, m13, m14, m21, m22, m23, m24, m31, m32, m33, m34, m41, m42, m43, m44} object ({CATransform3D=dddddddddddddddd}), 16 of them, got an array of 3",
+        },
+        badMember: {
+          threw: true,
+          isTypeError: true,
+          code: "ERR_INVALID_ARG_TYPE",
+          message: "+[NSValue valueWithCMTime:] argument 0.[1] must be a number",
+        },
+        badBigint: {
+          threw: true,
+          isTypeError: true,
+          message:
+            "+[NSValue valueWithCMTime:]: argument 0 must be an array of 4 numbers ({?=qiIq}) with [1] from -2147483648 to 2147483647, got 1099511627776",
+        },
+        fraction: {
+          threw: true,
+          isTypeError: true,
+          message:
+            "+[NSValue valueWithRange:]: argument 0 must be a {location, length} object ({_NSRange=QQ}) with location an integer from 0 to 2^53, or a bigint, got location 1.5",
+        },
+      });
+      // An object constant is read each time, so one that was nil earlier is the object once it exists.
+      expect(step(r, "NSApp")).toEqual({ step: "NSApp", early: true, now: true });
+      expect(step(r, "constant unknown")).toMatchObject({
+        ...typeError,
+        message:
+          'objc: no constant named "NSDefinitelyNotAConstant" is exported by AppKit, Foundation or any other library loaded in the process',
+      });
+      expect(step(r, "constant function")).toMatchObject({
+        ...typeError,
+        message: "objc: NSBeep is a function, not a constant; call it through bun:ffi",
+      });
+      expect(step(r, "constant prototype name")).toMatchObject({
+        ...typeError,
+        message:
+          'objc: no constant named "constructor" is exported by AppKit, Foundation or any other library loaded in the process',
+      });
+      expect(step(r, "constant void")).toMatchObject({
+        ...typeError,
+        message: "constant NSFontAttributeName: cannot be read as nothing (v)",
+      });
+      expect(step(r, "constant bad name")).toMatchObject(typeError);
+      expect(step(r, "constants read-only")).toMatchObject(typeError);
+      expect(step(r, "enums")).toEqual({
+        step: "enums",
+        titled: 1,
+        resizable: 8,
+        fullName: 32768,
+        flat: 1,
+        keyDown: 10,
+        png: 4,
+        kvoNew: 1,
+        byWordWrapping: 0,
+        centerMatches: true,
+        stateOn: 1,
+        stateMixed: -1,
+        modalOK: 1,
+        upArrow: 0xf700,
+        utf8: 4,
+        undefinedComponent: true,
+        notFound: true,
+        frozen: true,
+        has: [true, true, false],
+        // Five members, each under its short and its full name.
+        keyCount: 10,
+        same: true,
+        tag: "[object NSWindowStyleMask]",
+        windowMask: 1,
+      });
+      // The prefix a short name drops is the part shared with the type name (plurals count);
+      // a leading acronym is lower-cased whole; members outside the pattern keep only the full name.
+      expect(step(r, "enum names")).toEqual({
+        step: "enum names",
+        byTruncatingTail: 4,
+        initial: 4,
+        jpeg2000: 5,
+        slideUp: 16,
+        dtdKind: 8,
+        scaleToFitFull: 1,
+        scaleAxesIndependently: 1,
+        scaleToFitShort: false,
+        layerLeftEdge: 1,
+        kCALayerLeftEdge: 1,
+        constraintMinX: 0,
+        bgra8Unorm: 80,
+        depth32Float: 252,
+        edgeMask: true,
+      });
+      expect(step(r, "enum unknown")).toMatchObject({
+        ...typeError,
+        message:
+          'objc.enums: no enum or constant named "NSDefinitelyNotAnEnum" in the Foundation, AppKit, QuartzCore or Metal headers',
+      });
+      expect(step(r, "enum prototype name")).toMatchObject({
+        ...typeError,
+        message:
+          'objc.enums: no enum or constant named "hasOwnProperty" in the Foundation, AppKit, QuartzCore or Metal headers',
+      });
+      expect(step(r, "enums read-only")).toMatchObject(typeError);
+      // The same object read twice is the same JavaScript object; a class is always the class handle.
+      expect(step(r, "identity")).toEqual({
+        step: "identity",
+        element: true,
+        window: true,
+        classFromMessage: true,
+        classFromArray: true,
+        classTag: "[object ObjCClass]",
+        self: true,
+        receiver: true,
+        afterRelease: true,
+        same: [true, false, false],
+      });
+      // An argument's own `value` (a -value method, a frozen record) is not mistaken for an out-parameter.
+      expect(step(r, "value arguments")).toEqual({
+        step: "value arguments",
+        queryItem: false,
+        frozen: false,
+        stillItem: "b",
+      });
+      expect(step(r, "inspect")).toEqual({
+        step: "inspect",
+        string: expect.stringMatching(/^\[objc \w*String: hi\]$/),
+        util: expect.stringMatching(/^\[objc \w*String: hi\]$/),
+        klass: "[objc class NSString]",
+        released: "[objc released]",
+        alloc: "[objc NSString alloc]",
+        custom: expect.stringMatching(/^\[objc \w*String: hi\]$/),
+        inArray: "[\n  [objc class NSString]\n]",
+      });
+      expect(step(r, "traps")).toEqual({
+        step: "traps",
+        hasCount: true,
+        hasSetter: true,
+        hasNope: false,
+        hasThen: false,
+        hasMsgSend: true,
+        hasPointer: true,
+        hasIterator: true,
+        objectHasIterator: false,
+        classHasRelease: false,
+        keysIncludeCount: true,
+        keysExcludePrivate: true,
+        keysUnique: true,
+        manyKeys: true,
+        classKeys: true,
+        descriptor: "function",
+        releasedHas: false,
+        releasedKeys: 0,
+      });
+      expect(step(r, "dispose")).toEqual({
+        step: "dispose",
+        use: { threw: true, isTypeError: false, code: "ERR_INVALID_STATE", message: "ObjCObject has been released" },
+        classDispose: "undefined",
+        sameHandle: true,
+        stillUsable: { threw: false, value: 4 },
+        afterTwoReleases: true,
+      });
+      // Boxed integers keep 64 bits: bigint above 2^53 like every other integer the bridge returns.
+      expect(step(r, "numbers")).toEqual({
+        step: "numbers",
+        notFound: true,
+        maxUnsigned: "18446744073709551615",
+        maxUnsignedType: "bigint",
+        small: 3,
+        negative: -7,
+        fraction: 2.5,
+        unsignedType: "Q",
+        bool: true,
+        json: '{"n":12}',
+      });
+      expect(step(r, "iterate")).toEqual({
+        step: "iterate",
+        array: ["a", "b", "c"],
+        dictionary: ["x", "y"],
+        set: ["p", "q"],
+        indexes: [0, 2],
+        emptyIndexes: [],
+        enumerator: ["c", "b", "a"],
+        arrayFrom: ["a", "b", "c"],
+        identity: true,
+      });
+      expect(step(r, "iterate object")).toMatchObject({ ...typeError, message: expect.stringMatching(/iterable/) });
+      expect(step(r, "data date")).toEqual({
+        step: "data date",
+        dataClass: true,
+        dataLength: 3,
+        back: "1,2,3",
+        dateClass: true,
+        seconds: 1,
+        date: 1000,
+        argument: 2000,
+        nestedDate: 0,
+        nestedBuffer: "9",
+        nestedView: "7,8",
+        empty: 0,
+        json: '{"when":"1970-01-01T00:00:00.000Z"}',
+      });
+      expect(step(r, "done")).toEqual({ step: "done" });
+      expect(r.signal).toBeNull();
+      expect(r.exitCode).toBe(0);
+    },
+  );
+
   test.concurrent("bad prop values throw TypeErrors that name the prop; misuse of the tree throws", async () => {
     const r = await runFixture("errors.ts");
     if (r.skipped) return;
     for (const [name, prop] of [
       ["slider.value=string", "value"],
       ["text.lineLimit=object", "lineLimit"],
-      ["button.kind=bogus", "kind"],
+      ["button.bezelStyle=bogus", "bezelStyle"],
     ] as const) {
       const e = step(r, name);
       expect(e).toMatchObject({ step: name, threw: true, isTypeError: true });
       expect(e.message).toContain(prop);
     }
+    // The common props of a bridge-built control are checked natively and still name the element.
+    expect(step(r, "button.width=string")).toMatchObject({
+      threw: true,
+      isTypeError: true,
+      code: "ERR_INVALID_ARG_TYPE",
+    });
+    expect(step(r, "button.width=string").message).toStartWith("Button.width must be");
+    expect(step(r, "switch.hidden=string")).toMatchObject({
+      threw: true,
+      isTypeError: true,
+      code: "ERR_INVALID_ARG_TYPE",
+    });
+    expect(step(r, "switch.hidden=string").message).toStartWith("Switch.hidden must be");
     expect(step(r, "text.background=badcolor")).toMatchObject({ threw: true });
     expect(step(r, "text.background=badcolor").message).toMatch(/colou?r/i);
     expect(step(r, "text.background=rgb(nan)")).toMatchObject({
@@ -1071,29 +2883,70 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
     expect(step(r, "window width 3e9")).toMatchObject({ threw: true, isTypeError: true });
     expect(step(r, "window width 3e9").message).toMatch(/Window\.width must be .*no larger than/);
     expect(step(r, "window width 3e9 leak")).toEqual({ step: "window width 3e9 leak", leaked: 0 });
+    expect(step(r, "window released content")).toMatchObject({ threw: true, code: "ERR_INVALID_STATE" });
+    expect(step(r, "window released content").message).toMatch(/released/);
+    expect(step(r, "window released content onClose")).toBeUndefined();
+    expect(step(r, "window released content leak")).toEqual({ step: "window released content leak", leaked: 0 });
     expect(step(r, "window x 1e15")).toMatchObject({ threw: true, isTypeError: true });
     expect(step(r, "window x 1e15").message).toMatch(/Window\.x must be .*no larger than/);
     expect(step(r, "shown text width 3e9")).toMatchObject({ threw: true, isTypeError: true });
     expect(step(r, "shown text width 3e9").message).toMatch(/Text\.width must be .*no larger than/);
-    expect(step(r, "window create-only after create")).toMatchObject({ threw: true, isTypeError: true });
-    expect(step(r, "window create-only after create").message).toMatch(
-      /resizable cannot be changed after the window is created/,
-    );
+    expect(step(r, "window resizable=string")).toMatchObject({
+      threw: true,
+      isTypeError: true,
+      code: "ERR_INVALID_ARG_TYPE",
+    });
+    expect(step(r, "window resizable=string").message).toStartWith("Window.resizable must be");
     const closedWindow = { threw: true, isTypeError: false, code: "ERR_INVALID_STATE" };
     expect(step(r, "hide after close")).toMatchObject(closedWindow);
     expect(step(r, "hide after close").message).toMatch(/closed/);
     expect(step(r, "title after close")).toMatchObject(closedWindow);
+    expect(step(r, "resizable after close")).toMatchObject(closedWindow);
     expect(step(r, "content after close")).toMatchObject(closedWindow);
     expect(step(r, "content after close").message).toMatch(/closed/);
     expect(step(r, "content after close state")).toEqual({ step: "content after close state", content: true });
     expect(step(r, "menu action without colon")).toMatchObject({ threw: true, isTypeError: true });
     expect(step(r, "menu action without colon").message).toMatch(/selector/);
-    expect(step(r, "menu action outside the standard list")).toMatchObject({
+    // Any one-argument action method is a menu action; AppKit validates it against the responder chain.
+    expect(step(r, "menu action outside the standard list")).toEqual({
+      step: "menu action outside the standard list",
+      threw: false,
+    });
+    const badType = { threw: true, isTypeError: true, code: "ERR_INVALID_ARG_TYPE" };
+    const badValue = { threw: true, isTypeError: true, code: "ERR_INVALID_ARG_VALUE" };
+    expect(step(r, "metal.clearColor=number")).toMatchObject({
+      ...badType,
+      message: "MetalView.clearColor must be a color string or null",
+    });
+    expect(step(r, "metal.clearColor=bogus")).toMatchObject({
+      ...badValue,
+      message: 'MetalView.clearColor: invalid color "bogus"',
+    });
+    expect(step(r, "metal.clearColor=rgb(nan)")).toMatchObject(badValue);
+    expect(step(r, "metal.running=string")).toMatchObject(badType);
+    expect(step(r, "metal.running=string").message).toStartWith("MetalView.running must be");
+    expect(step(r, "metal.preferredFPS=string")).toMatchObject(badType);
+    expect(step(r, "metal.preferredFPS=string").message).toStartWith("MetalView.preferredFPS must be");
+    expect(step(r, "metal.onFrame=number")).toMatchObject({
       threw: true,
       isTypeError: true,
-      code: "ERR_INVALID_ARG_VALUE",
+      message: "MetalView.onFrame must be a function",
     });
-    expect(step(r, "menu action outside the standard list").message).toMatch(/not a supported menu action/);
+    expect(step(r, "metal props")).toEqual({
+      step: "metal props",
+      afterRejected: "#0000ff",
+      accepted: {
+        red: "red",
+        " windowBackground ": " windowBackground ",
+        "rgba(0, 0, 255, 0.5)": "rgba(0, 0, 255, 0.5)",
+        "#fff": "#fff",
+        null: "#000000",
+      },
+      running: true,
+      preferredFPS: 30,
+      onFrame: null,
+      unknown: 'Unknown property "colour" for MetalView',
+    });
     expect(r.exitCode).toBe(0);
   });
 
@@ -1230,6 +3083,18 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
         gpuStatus: "completed",
       });
       expect(step(r, "two vertex buffers")).toEqual({ step: "two vertex buffers", center: [0, 255, 0, 255] });
+      // A colour string clears like the array form (BGRA bytes); a bad one is refused before anything is encoded.
+      expect(step(r, "string clear")).toEqual({
+        step: "string clear",
+        red: [0, 0, 255, 255],
+        white: [255, 255, 255, 255],
+      });
+      expect(step(r, "bad clear string")).toMatchObject({
+        threw: true,
+        isTypeError: true,
+        code: "ERR_INVALID_ARG_VALUE",
+        message: 'frame.renderPass() clear: invalid color "nope"',
+      });
       expect(step(r, "attribute described twice")).toMatchObject({ threw: true, isCompileError: true });
       expect(step(r, "bind offset equal to length")).toMatchObject({ threw: true, isRangeError: true });
       expect(step(r, "bind offset misaligned")).toMatchObject({ threw: true, isTypeError: true });
@@ -1299,6 +3164,20 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
       expect(frames.passes).toEqual(["ok", "ok"]);
       expect(frames.drawableSize).toEqual({ width: expect.any(Number), height: expect.any(Number) });
       expect(step(r, "cleared")).toEqual({ step: "cleared", count: 2 });
+      expect(step(r, "string clear")).toEqual({
+        step: "string clear",
+        passes: {
+          white: "ok",
+          "rgba(255, 0, 0, 0.5)": "ok",
+          nope: { message: 'frame.renderPass() clear: invalid color "nope"', code: "ERR_INVALID_ARG_VALUE" },
+          7: {
+            message: expect.stringMatching(/clear must be an \[r, g, b, a\] array or a color string/),
+            code: "ERR_INVALID_ARG_TYPE",
+          },
+        },
+        clamped: [240, 240],
+        live: 24,
+      });
       expect(step(r, "outside onFrame").outside).toEqual({
         message: expect.stringMatching(/onFrame/),
         code: "ERR_INVALID_STATE",
@@ -1315,265 +3194,6 @@ describe.skipIf(!isMacOS)("Bun.AppKit", () => {
       expect(r.exitCode).toBe(0);
     });
   });
-
-  describe("react", () => {
-    beforeAll(() => {
-      for (const [alias, name] of reactModules) {
-        const from = dirname(require.resolve(alias));
-        const to = join(reactApp, "node_modules", name);
-        rmSync(to, { recursive: true, force: true });
-        cpSync(from, to, { recursive: true, dereference: true });
-      }
-    });
-
-    test.concurrent("react: Button click updates state and re-renders a Text", async () => {
-      const r = await runFixture("react-counter.tsx", { cwd: reactApp });
-      if (r.skipped) return;
-      expect(step(r, "rendered")).toEqual({ step: "rendered", windows: 1, hasWindow: true });
-      expect(step(r, "tree")).toEqual({
-        step: "tree",
-        kinds: ["Text", "Button"],
-        text: "Count: 0",
-        title: "0 clicks",
-        kind: "primary",
-      });
-      expect(step(r, "clicked-once")).toEqual({ step: "clicked-once", text: "Count: 1", title: "1 clicks" });
-      expect(step(r, "clicked-thrice")).toMatchObject({ step: "clicked-thrice", text: "Count: 3" });
-      expect(step(r, "clicked-thrice").snapshotBytes).toBeGreaterThan(100);
-      expect(step(r, "unmounted")).toMatchObject({ step: "unmounted", windows: 0 });
-      expect(step(r, "unknown-element")).toEqual({
-        step: "unknown-element",
-        errors: ["Unknown AppKit element <constructor>"],
-      });
-      expect(r.exitCode).toBe(0);
-    });
-
-    test.concurrent("react: a rejected render never leaves a native window behind", async () => {
-      const r = await runFixture("react-placement.tsx", { cwd: reactApp, timeoutMs: 5_000 });
-      if (r.skipped) return;
-      // React renders the failing tree twice before giving up; neither attempt may leave a window behind.
-      expect(step(r, "nested-window"), r.stderr).toEqual({
-        step: "nested-window",
-        errors: [expect.stringMatching(/<Window> must be rendered at the root, not inside <VStack>/)],
-        windows: 0,
-      });
-      expect(step(r, "view-at-root")).toEqual({
-        step: "view-at-root",
-        errors: [expect.stringMatching(/<VStack> must be inside a <Window>/)],
-        windows: 0,
-      });
-      expect(step(r, "window-then-view-at-root")).toEqual({
-        step: "window-then-view-at-root",
-        errors: [expect.stringMatching(/<VStack> must be inside a <Window>/)],
-        windows: 0,
-      });
-      expect(step(r, "sibling-throws")).toEqual({ step: "sibling-throws", errors: ["boom"], windows: 0 });
-      expect(step(r, "two-children")).toEqual({
-        step: "two-children",
-        errors: [expect.stringMatching(/<Window> accepts a single child/)],
-        windows: 0,
-      });
-      expect(step(r, "title-and-children")).toEqual({
-        step: "title-and-children",
-        errors: [expect.stringMatching(/either as the title prop or as children/)],
-        windows: 0,
-      });
-      expect(step(r, "text-source")).toEqual({
-        step: "text-source",
-        errors: [],
-        titles: ["from-children", "from-prop", "xy", "", "from-prop-again", "nothing-rendered"],
-      });
-      expect(step(r, "titled-group")).toEqual({
-        step: "titled-group",
-        errors: [],
-        titles: ["first", "second"],
-        kinds: ["VStack", "Text"],
-      });
-      // "A" is inserted before the <VStack/> and the <Button/> before the "B" piece:
-      // each lands ahead of its anchor among its own kind.
-      expect(step(r, "group-anchors")).toEqual({
-        step: "group-anchors",
-        errors: [],
-        before: { title: "B", kinds: ["VStack", "Text"] },
-        after: { title: "AB", kinds: ["VStack", "Button", "Text"] },
-        restored: { title: "B", kinds: ["VStack", "Text"] },
-      });
-      // A leaked hidden window would keep the process alive until the SIGKILL timeout.
-      expect(r.signal).toBeNull();
-      expect(r.exitCode).toBe(0);
-    });
-
-    test.concurrent(
-      "react: keyed children reorder, replace, hide and empty in place; deleted views are freed",
-      async () => {
-        const r = await runFixture("react-reorder.tsx", { cwd: reactApp });
-        if (r.skipped) return;
-        expect(step(r, "initial")).toEqual({ step: "initial", order: ["a", "b", "c", "d"] });
-        expect(step(r, "reordered")).toEqual({ step: "reordered", order: ["d", "a", "c", "b"], sameViews: true });
-        expect(step(r, "replaced")).toEqual({
-          step: "replaced",
-          order: ["c", "btn", "e", "a"],
-          kinds: ["Text", "Button", "Text", "Text"],
-        });
-        const freed = {
-          text: expect.any(String),
-          frame: { x: 0, y: 0, width: 0, height: 0 },
-          setter: "ERR_INVALID_STATE",
-        };
-        expect(step(r, "released"), r.stderr).toEqual({
-          step: "released",
-          a: false,
-          b: freed,
-          d: freed,
-          liveViewsDelta: 0,
-        });
-        expect(step(r, "hidden")).toEqual({ step: "hidden", hidden: [false, false, false, true] });
-        expect(step(r, "emptied")).toEqual({ step: "emptied", order: [] });
-        expect(r.exitCode).toBe(0);
-      },
-    );
-
-    test.concurrent("react: a user-closed <Window> keeps taking updates without tearing down the root", async () => {
-      const r = await runFixture("react-closed-window.tsx", { cwd: reactApp });
-      if (r.skipped) return;
-      expect(step(r, "rerender"), r.stderr).toEqual({
-        step: "rerender",
-        errors: [],
-        mainClosed: false,
-        mainTitle: "main 1",
-        panelClosed: true,
-      });
-      expect(step(r, "toggle-visible")).toEqual({ step: "toggle-visible", errors: [], mainClosed: false });
-      expect(step(r, "unmounted")).toEqual({ step: "unmounted", errors: [], windows: 0 });
-      expect(r.exitCode).toBe(0);
-    });
-
-    test.concurrent("react: .native of a view React deleted throws; a handle taken earlier keeps working", async () => {
-      const r = await runFixture("react-objc-native.tsx", { cwd: reactApp });
-      if (r.skipped) return;
-      expect(step(r, "released"), r.stderr).toEqual({
-        step: "released",
-        mounted: { isTextField: true, stringValue: "mounted", identity: true },
-        released: true,
-        native: { threw: true, code: "ERR_INVALID_STATE", message: "Invalid state: Text has been released" },
-        handleStillWorks: "mounted",
-        windowNative: { threw: false },
-      });
-      expect(step(r, "unmounted")).toEqual({
-        step: "unmounted",
-        windows: 0,
-        closedNative: { threw: true, code: "ERR_INVALID_STATE", message: "Invalid state: window is closed" },
-      });
-      expect(r.exitCode).toBe(0);
-    });
-
-    test.concurrent("react: a render error with no handlers is an uncaught exception", async () => {
-      const r = await runFixture("react-throw.tsx", { cwd: reactApp, expectFailure: true });
-      if (r.skipped) return;
-      expect(r.stderr).toContain("error: boom");
-      expect(r.exitCode).toBe(1);
-    });
-
-    test.concurrent("react: a render error outside any boundary goes to onUncaughtError only", async () => {
-      const r = await runFixture("react-throw.tsx", { cwd: reactApp, args: ["uncaught"] });
-      if (r.skipped) return;
-      expect(step(r, "after-render"), r.stderr).toEqual({
-        step: "after-render",
-        uncaught: ["boom"],
-        caught: [],
-        recoverable: [],
-        windows: 0,
-        text: null,
-      });
-      expect(r.exitCode).toBe(0);
-    });
-
-    test.concurrent("react: a render error under an error boundary goes to onCaughtError only", async () => {
-      const r = await runFixture("react-throw.tsx", { cwd: reactApp, args: ["caught"] });
-      if (r.skipped) return;
-      expect(step(r, "after-render"), r.stderr).toEqual({
-        step: "after-render",
-        uncaught: [],
-        caught: ["boom"],
-        recoverable: [],
-        windows: 1,
-        text: "fallback",
-      });
-      expect(r.exitCode).toBe(0);
-    });
-
-    test.concurrent(
-      "react: a render error React recovers from goes to onRecoverableError and is not fatal",
-      async () => {
-        const r = await runFixture("react-throw.tsx", { cwd: reactApp, args: ["flaky"] });
-        if (r.skipped) return;
-        const after = step(r, "after-render");
-        expect(after, r.stderr).toMatchObject({
-          step: "after-render",
-          uncaught: [],
-          caught: [],
-          windows: 1,
-          text: "ok",
-        });
-        expect(after.recoverable).toEqual([expect.stringContaining("React was able to recover")]);
-        expect(r.exitCode).toBe(0);
-      },
-    );
-
-    test.concurrent(
-      "react: a bad prop value or a create-only Window option in an update is reported and skipped",
-      async () => {
-        const r = await runFixture("react-bad-update.tsx", { cwd: reactApp });
-        if (r.skipped) return;
-        const quiet = { uncaught: [], caught: [], recoverable: [] };
-        expect(step(r, "bad-value"), r.stderr).toEqual({
-          step: "bad-value",
-          ...quiet,
-          windows: 2,
-          titles: ["main 1", "other 1"],
-          texts: [
-            { text: "colored 1", background: "red" },
-            { text: "sibling 1", background: null },
-          ],
-        });
-        expect(r.stderr).toContain("<Text> background:");
-        expect(r.stderr).toContain("The background update was skipped");
-        expect(step(r, "create-only")).toEqual({
-          step: "create-only",
-          ...quiet,
-          windows: 2,
-          titles: ["main 2", "other 2"],
-        });
-        expect(r.stderr).toContain("<Window> resizable cannot change after the window is created");
-        expect(step(r, "recovered")).toEqual({
-          step: "recovered",
-          ...quiet,
-          windows: 2,
-          texts: [
-            { text: "colored 3", background: "blue" },
-            { text: "sibling 3", background: null },
-          ],
-        });
-        expect(r.exitCode).toBe(0);
-      },
-    );
-
-    test.concurrent("react: modules hands the renderer the app's own React; every root shares it", async () => {
-      const r = await runFixture("react-modules.tsx", { cwd: reactApp });
-      if (r.skipped) return;
-      expect(step(r, "modules"), r.stderr).toEqual({
-        step: "modules",
-        early: "early",
-        badShape: expect.stringMatching(/modules must be \{ react, reconciler, constants \}/),
-        text: "from modules",
-        windows: 1,
-        again: null,
-        implicit: null,
-        otherReact: expect.stringMatching(/already using another copy of React/),
-      });
-      expect(r.exitCode).toBe(0);
-    });
-  });
 });
 
 type DeclaredClass = { members: Set<string>; defaults: Record<string, unknown>; isView: boolean };
@@ -1587,8 +3207,7 @@ type DeclaredClass = { members: Set<string>; defaults: Record<string, unknown>; 
 function declaredSurface() {
   const source = readFileSync(join(import.meta.dir, "../../../../packages/bun-types/appkit.d.ts"), "utf8");
   const start = source.indexOf('declare module "bun:appkit" {');
-  const end = source.indexOf('declare module "bun:appkit/react"');
-  const lines = source.slice(start, end).split("\n");
+  const lines = source.slice(start).split("\n");
 
   type Block = {
     kind: "class" | "interface";

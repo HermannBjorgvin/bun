@@ -15,7 +15,7 @@ use bun_appkit::gpu::{
     SamplerMipFilter, Storage, Texture, TextureDesc, TextureUsage, VertexAttribute,
     VertexBufferLayout, VertexFormat, VertexLayout, VertexStepFunction, Winding,
 };
-use bun_appkit::{Color, Kind, Named, NsStr, View};
+use bun_appkit::{Named, NsStr, View};
 use bun_jsc::{
     ArrayBuffer, CallFrame, JSGlobalObject, JSUint8Array, JSValue, JsClass, JsError, JsResult,
     StringJsc, Strong,
@@ -23,7 +23,7 @@ use bun_jsc::{
 
 use super::conv::{self, JsStr};
 use super::slots::{JsSlots, SlotOutcome};
-use super::view::AppKitView;
+use super::view::{AppKitView, clear_color};
 
 use crate::generated_classes::js_AppKitView as js_view;
 
@@ -66,8 +66,8 @@ fn gpu_error_instance(
 }
 
 /// The JavaScript exception for a `bun_appkit` error.
-fn throw(global: &JSGlobalObject, err: &bun_appkit::Error) -> JsError {
-    match gpu_error_instance(global, err) {
+fn throw(global: &JSGlobalObject, err: bun_appkit::Error) -> JsError {
+    match gpu_error_instance(global, &err) {
         Ok(Some(instance)) => global.throw_value(instance),
         Ok(None) => conv::throw(global, err),
         Err(pending) => pending,
@@ -75,7 +75,7 @@ fn throw(global: &JSGlobalObject, err: &bun_appkit::Error) -> JsError {
 }
 
 fn check<T>(global: &JSGlobalObject, result: bun_appkit::Result<T>) -> JsResult<T> {
-    result.map_err(|e| throw(global, &e))
+    result.map_err(|e| throw(global, e))
 }
 
 // ───────────────────────────── argument readers ─────────────────────────────
@@ -264,41 +264,6 @@ const OPAQUE_BLACK: ClearColor = ClearColor {
     a: 1.0,
 };
 
-/// `[r, g, b, a]` (0–1 each) or an rgb()/hex colour string.
-fn clear_color(global: &JSGlobalObject, value: JSValue, what: What<'_>) -> JsResult<ClearColor> {
-    if value.is_array() {
-        if value.get_length(global)? != 4 {
-            return Err(
-                global.throw_invalid_arguments(format_args!("{what} array form is [r, g, b, a]"))
-            );
-        }
-        let channel = |i: u32| {
-            conv::number(
-                global,
-                value.get_index(global, i)?,
-                format_args!("{what}[{i}]"),
-            )
-        };
-        return Ok(ClearColor {
-            r: channel(0)?,
-            g: channel(1)?,
-            b: channel(2)?,
-            a: channel(3)?,
-        });
-    }
-    match conv::color(global, value, what)? {
-        Some(Color::Rgba { r, g, b, a }) => Ok(ClearColor {
-            r: f64::from(r),
-            g: f64::from(g),
-            b: f64::from(b),
-            a: f64::from(a),
-        }),
-        _ => Err(global.throw_invalid_arguments(format_args!(
-            "{what} must be an [r, g, b, a] array or an rgb()/hex color string"
-        ))),
-    }
-}
-
 /// A user-visible name kept on the wrapper so the getter answers without a
 /// round trip; Metal gets its own copy for Xcode captures and error messages.
 #[derive(Default)]
@@ -427,7 +392,7 @@ impl AppKitGpu {
         let height = required("height")?;
         let format = opts
             .one_of::<PixelFormat>("format", what)?
-            .unwrap_or(PixelFormat::BGRA8Unorm);
+            .unwrap_or(bun_appkit::PIXEL_FORMAT);
         let usage = match opts.get("usage")? {
             None => TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
             Some(list) => texture_usage(global, list, format_args!("{what} usage"))?,
@@ -496,7 +461,7 @@ impl AppKitGpu {
             None => None,
         };
         let color_formats = match opts.get("colorFormats")? {
-            None => vec![(PixelFormat::BGRA8Unorm, blend)],
+            None => vec![(bun_appkit::PIXEL_FORMAT, blend)],
             Some(list) => {
                 if !list.is_array() {
                     return Err(global.throw_invalid_arguments(format_args!(
@@ -835,7 +800,7 @@ impl GpuBuffer {
         };
         let out = check(global, buffer.read(offset, length))?;
         drop(buffer);
-        Ok(JSUint8Array::from_bytes(global, out.into_boxed_slice()))
+        JSUint8Array::from_bytes(global, out.into_boxed_slice())
     }
 
     /// Releases the Metal buffer now. Frames already encoded keep it alive
@@ -941,7 +906,7 @@ impl GpuTexture {
         let texture = self.get(global)?;
         let out = check(global, texture.read_pixels())?;
         drop(texture);
-        Ok(JSUint8Array::from_bytes(global, out.into_boxed_slice()))
+        JSUint8Array::from_bytes(global, out.into_boxed_slice())
     }
 
     /// As [`GpuBuffer::destroy`].
@@ -1245,7 +1210,7 @@ impl GpuFrame {
         frame.watch();
         drop(slot);
         if let Err(err) = result {
-            let _ = bun_jsc::task::report_error_or_terminate(global, throw(global, &err));
+            let _ = bun_jsc::task::report_error_or_terminate(global, throw(global, err));
         }
     }
 
@@ -1337,13 +1302,7 @@ impl GpuFrame {
         let what = format_args!("frame.renderPass()");
         let target = frame.argument(0);
         if let Some(view) = target.as_class_ref::<AppKitView>() {
-            let view = view.native(global)?;
-            if view.kind() != Kind::MetalView {
-                return Err(global.throw_invalid_arguments(format_args!(
-                    "{what} target must be a MetalView, not a {}",
-                    view.kind().name()
-                )));
-            }
+            let view = view.view();
             let opts = Opts::new(global, frame.argument(1), format_args!("{what} options"))?;
             // Left out: the first pass into the view this frame clears to the
             // view's clearColor (depth 1.0) and later ones keep what is there.
@@ -1942,7 +1901,7 @@ impl GpuFrame {
 
 // ─────────────────────────────── MetalView frames ─────────────────────────────
 
-/// Clears [`View::begin_frame`]'s mark however `deliver_frame` returns.
+/// Clears [`View::begin_frame`]'s mark however `render_frame` returns.
 struct InFrame<'a>(&'a View);
 
 impl<'a> InFrame<'a> {
@@ -1959,14 +1918,25 @@ impl Drop for InFrame<'_> {
 }
 
 /// Runs a MetalView's `onFrame(frame, { time, dt, width, height })` for one
-/// `drawInMTKView:`. Whatever the handler leaves open is committed (and the
-/// drawable presented) when it returns; if it throws, the frame is dropped
-/// unsubmitted. Without a handler the view is just cleared to its `clearColor`.
-/// Frames committed earlier that the GPU has since failed are reported first,
-/// the way an exception thrown from the handler is.
-pub(super) fn deliver_frame(slots: &JsSlots, view: &View) {
+/// `drawInMTKView:`; `this` is the view's wrapper. Whatever the handler
+/// leaves open is committed (and the drawable presented) when it returns; if
+/// it throws, the frame is dropped unsubmitted. Without a handler the view is
+/// just cleared to its `clearColor`. Frames committed earlier that the GPU
+/// has since failed are reported first, the way an exception thrown from the
+/// handler is.
+pub(super) fn deliver_frame(slots: &JsSlots, this: JSValue) {
+    let Some(wrapper) = this.as_class_ref::<AppKitView>() else {
+        return;
+    };
+    // `view` is borrowed out of the wrapper, which nothing else roots while
+    // the handler and the error reports below run JavaScript.
+    render_frame(slots, wrapper.view());
+    this.ensure_still_alive();
+}
+
+fn render_frame(slots: &JsSlots, view: &View) {
     let global = slots.global();
-    let report = |err: &bun_appkit::Error| {
+    let report = |err: bun_appkit::Error| {
         let _ = bun_jsc::task::report_error_or_terminate(global, throw(global, err));
     };
     // The placeholder view of a machine without Metal never draws.
@@ -1974,11 +1944,11 @@ pub(super) fn deliver_frame(slots: &JsSlots, view: &View) {
         return;
     };
     for err in gpu.take_errors() {
-        report(&err);
+        report(err);
     }
     let mut frame = match gpu.frame() {
         Ok(frame) => frame,
-        Err(err) => return report(&err),
+        Err(err) => return report(err),
     };
     let _in_frame = InFrame::new(view);
     let has_handler = slots
@@ -1997,14 +1967,14 @@ pub(super) fn deliver_frame(slots: &JsSlots, view: &View) {
                 .and_then(|()| frame.commit());
             match cleared {
                 Ok(()) => frame.watch(),
-                Err(err) => report(&err),
+                Err(err) => report(err),
             }
         }
         return;
     }
 
     let size = view.drawable_size().unwrap_or_default();
-    let (time, dt) = view.frame_timing().unwrap_or_default();
+    let (time, dt) = view.frame_timing();
     let info = JSValue::create_empty_object(global, 4);
     info.put(global, b"time", JSValue::js_number(time));
     info.put(global, b"dt", JSValue::js_number(dt));
