@@ -2020,8 +2020,7 @@ std::optional<bool> specialObjectsDequal(JSC::JSGlobalObject* globalObject, Mark
     return std::nullopt;
 }
 
-// The other combinations are instantiated by their uses in this file. These two are
-// only reached from `Bun.deepEquals(a, b)` and `Bun.deepEquals(a, b, true, true)` in BunObject.cpp.
+// Explicit instantiations for BunObject.cpp; nothing in this file uses these two combinations.
 template bool Bun__deepEquals<false, false, false, false>(JSC::JSGlobalObject*, JSValue, JSValue, MarkedArgumentBuffer&, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>&, ThrowScope&, bool);
 template bool Bun__deepEquals<true, false, false, true>(JSC::JSGlobalObject*, JSValue, JSValue, MarkedArgumentBuffer&, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>&, ThrowScope&, bool);
 
