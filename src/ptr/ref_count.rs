@@ -665,6 +665,29 @@ pub fn destroy_box_with<T>(this: *mut T, before: impl FnOnce(&T)) {
     }
 }
 
+/// [`destroy_box_with`] for a `T` whose storage is not a `Box` (a pool slot, a
+/// C-side owner): run `finalize(&*this)`, then — once that borrow has ended —
+/// hand the root pointer and whatever `finalize` returned to `release`, which
+/// gives the storage back.
+///
+/// Same contract as [`destroy_box_with`]: only a `#[ref_count(destroy = …)]`
+/// target may call this, forwarding the pointer the generated
+/// [`CellRefCounted::destroy`] received (sole owner, refcount zero).
+#[inline]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn destroy_with<T, R>(
+    this: *mut T,
+    finalize: impl FnOnce(&T) -> R,
+    release: impl FnOnce(NonNull<T>, R),
+) {
+    let ptr = NonNull::new(this).expect("destroy_with: null");
+    // SAFETY: `CellRefCounted::destroy` contract — `this` is the sole live
+    // owner of an initialized `T`; `finalize` only observes it shared, and that
+    // borrow ends before `release` may free the storage.
+    let r = finalize(unsafe { ptr.as_ref() });
+    release(ptr, r);
+}
+
 /// No-op [`DebugDataOps`] for [`CellRefCounted`] types — they carry no
 /// `DebugData` field, so [`RefPtr`]'s acquire/release tracking degrades to
 /// a stub.
@@ -1007,6 +1030,20 @@ where
     #[inline]
     pub fn forget(self) {
         let _ = core::mem::ManuallyDrop::new(self);
+    }
+}
+
+impl<T: AnyRefCounted> From<RefPtr<T>> for ScopedRef<T>
+where
+    T::DestructorCtx: Default,
+{
+    /// Hand the ref a `RefPtr` owns to a guard that releases it on `Drop`: for
+    /// a ref taken out of its holder's slot at the top of a frame that must
+    /// keep the pointee alive to the end of that frame.
+    #[inline]
+    fn from(r: RefPtr<T>) -> Self {
+        // SAFETY: `into_raw` transfers the ref `r` owned; the pointee is live.
+        unsafe { ScopedRef::adopt(r.into_raw()) }
     }
 }
 
