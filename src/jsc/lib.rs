@@ -354,7 +354,7 @@ pub use self::uuid::{UUID, UUID5, UUID7};
 pub use self::js_function::JSFunction;
 pub use self::js_module_loader::JSModuleLoader;
 pub use self::strong::{Optional as StrongOptional, Strong};
-pub use self::weak::{Weak, WeakOwner, WeakRefType};
+pub use self::weak::{Weak, WeakRefType};
 
 pub use self::exception::Exception;
 pub use self::js_type::JSType;
@@ -1239,7 +1239,7 @@ pub mod virtual_machine;
 pub mod vm_handle;
 pub use self::virtual_machine as VirtualMachine;
 pub use self::virtual_machine::InitOptions as VirtualMachineInitOptions;
-pub use self::vm_handle::{ConcurrentPoster, LoopKind, Posted, Ticket, VmHandle};
+pub use self::vm_handle::{ConcurrentPoster, InFlightTicket, LoopKind, Posted, Ticket, VmHandle};
 
 #[path = "ModuleLoader.rs"]
 pub mod module_loader;

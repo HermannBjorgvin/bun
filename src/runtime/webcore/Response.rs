@@ -1,9 +1,8 @@
 use core::cell::Cell;
-use core::ffi::c_void;
 use core::mem;
 
 use bun_jsc::JsCell;
-use bun_jsc::{AbortSignal, AbortSignalRef, GlobalRef};
+use bun_jsc::{AbortSignal, GlobalRef};
 
 use crate::webcore::jsc::{
     BuiltinName, CallFrame, HTTPHeaderName, JSGlobalObject, JSType, JSValue, JsError, JsRef,
@@ -27,8 +26,9 @@ pub use bun_jsc::fetch_headers::HeadersRef;
 
 /// Errors the owning fetch `Response`'s body on abort (Fetch spec "abort a fetch" step 4).
 pub(crate) struct BodyAbortListener {
-    signal: AbortSignalRef,
-    /// `Response` owns `Box<Self>`, so a ref-counted pointer here would cycle.
+    /// Our listener on the signal (and reference on it); dropped with the Response.
+    registration: Cell<Option<bun_jsc::AbortListenerRegistration>>,
+    /// `Response` owns this, so a ref-counted pointer here would cycle.
     response: bun_ptr::ParentRef<Response>,
     global: GlobalRef,
 }
@@ -48,17 +48,14 @@ impl ResponseRef {
 
     /// Install a [`BodyAbortListener`] so abort reaches this body after `FetchTasklet` has detached.
     pub(crate) fn attach_abort_signal(&self, global: &JSGlobalObject, signal: &AbortSignal) {
-        let signal_ref = signal.retain();
-        signal.pending_activity_ref();
-        let mut listener = Box::new(BodyAbortListener {
-            signal: signal_ref,
+        let listener = bun_ptr::OwnedThis::new(BodyAbortListener {
+            registration: Cell::new(None),
             response: bun_ptr::ParentRef::from(core::ptr::NonNull::from(self.0)),
             global: GlobalRef::new(global),
         });
-        signal.add_listener(
-            core::ptr::from_mut(&mut *listener).cast::<c_void>(),
-            BodyAbortListener::on_abort,
-        );
+        listener
+            .registration
+            .set(Some(signal.listen_native(listener.this_ptr().into())));
         self.abort_listener.set(Some(listener));
     }
 }
@@ -77,16 +74,13 @@ impl Drop for ResponseRef {
     }
 }
 
-impl BodyAbortListener {
-    unsafe extern "C" fn on_abort(ctx: *mut c_void, reason: JSValue) {
+impl bun_jsc::NativeAbortListener for BodyAbortListener {
+    fn on_abort(this: bun_ptr::ThisPtr<Self>, reason: JSValue) {
         reason.ensure_still_alive();
-        // SAFETY: `ctx` is the `Box<BodyAbortListener>` registered in
-        // `attach_abort_signal`; `clean_native_bindings` removes it before the
-        // box is dropped, so it is live here. Copy out up front: erroring a
-        // still-streaming body can re-enter `Response::unref` via
-        // `FetchTasklet::ignore_remaining_response_body` and destroy this box.
-        let (response, global) =
-            unsafe { ((*ctx.cast::<Self>()).response, (*ctx.cast::<Self>()).global) };
+        // Copy out up front: erroring a still-streaming body can re-enter
+        // `Response::unref` via `FetchTasklet::ignore_remaining_response_body`
+        // and destroy this listener.
+        let (response, global) = (this.response, this.global);
         let _keepalive = ResponseRef::retain(response);
         if !matches!(
             response.get_body_value(),
@@ -107,14 +101,6 @@ impl BodyAbortListener {
             // R-2: re-derive after `error()` ran JS.
             let _ = response.get_body_value().to_error_instance(err, &global);
         }
-    }
-}
-
-impl Drop for BodyAbortListener {
-    fn drop(&mut self) {
-        let ctx = core::ptr::from_mut(self).cast::<c_void>();
-        self.signal.clean_native_bindings(ctx);
-        self.signal.pending_activity_unref();
     }
 }
 
@@ -174,7 +160,7 @@ pub struct Response {
     reported_estimated_size: Cell<usize>,
 
     /// Fetch's `AbortSignal` listener; survives `FetchTasklet` teardown so a fully-buffered body is still errored.
-    abort_listener: JsCell<Option<Box<BodyAbortListener>>>,
+    abort_listener: JsCell<Option<bun_ptr::OwnedThis<BodyAbortListener>>>,
 }
 
 impl Default for Response {

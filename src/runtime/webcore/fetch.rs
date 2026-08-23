@@ -245,8 +245,9 @@ fn bun_fetch_preconnect(
     }
 
     // bun.handleOom(url_str.toOwnedSlice(...)) → to_owned_slice() aborts on OOM.
-    let href: Box<[u8]> = url_str.to_owned_slice().into_boxed_slice();
-    let url = ZigURL::parse(&href);
+    let preconnect =
+        http::async_http::PreparedPreconnect::new(url_str.to_owned_slice().into_boxed_slice());
+    let url = preconnect.url();
 
     if !url.is_http() && !url.is_https() && !url.is_s3() {
         return Err(
@@ -267,8 +268,7 @@ fn bun_fetch_preconnect(
         return Err(global_object.throw_invalid_arguments(format_args!("Invalid port")));
     }
 
-    // `preconnect_owned` re-parses and owns `href` for the request's lifetime.
-    http::async_http::preconnect_owned(href);
+    preconnect.start();
     Ok(JSValue::UNDEFINED)
 }
 
@@ -440,11 +440,6 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
     } else {
         None
     };
-    macro_rules! request_mut {
-        () => {
-            request
-        };
-    }
 
     // If it's NOT a Request or a subclass of Request, treat the first argument as a URL.
     let url_str_optional = if first_arg.as_::<Request>().is_none() {
@@ -478,7 +473,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             break 'extract_url str;
         }
 
-        if let Some(req) = request_mut!() {
+        if let Some(req) = request {
             let _ = req.ensure_url(); // bun.handleOom — aborts on OOM
             break 'extract_url req.url.get().dupe_ref();
         }
@@ -570,7 +565,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             }
         }
 
-        if let Some(req) = request_mut!() {
+        if let Some(req) = request {
             break 'extract_method Some(req.method);
         }
 
@@ -841,7 +836,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
     // redirect: "follow" | "error" | "manual" | undefined;
     redirect_type = 'extract_redirect_type: {
         // First, try to use the Request object's redirect if available
-        if let Some(req) = request_mut!() {
+        if let Some(req) = request {
             redirect_type = req.flags.redirect;
         }
 
@@ -1097,7 +1092,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             }
         }
 
-        if let Some(req) = request_mut!() {
+        if let Some(req) = request {
             if let Some(signal_) = req.abort_signal() {
                 break 'extract_signal Some(signal_.clone());
             }
@@ -1157,7 +1152,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             }
         }
 
-        if let Some(req) = request_mut!() {
+        if let Some(req) = request {
             let body_value = req.get_body_value();
             let already_used = match body_value {
                 BodyValue::Used => true,
@@ -1271,7 +1266,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                 }
             }
 
-            if let Some(req) = request_mut!() {
+            if let Some(req) = request {
                 if let Some(head) = req.get_fetch_headers_unless_empty() {
                     break 'brk Some(head.as_ptr());
                 }

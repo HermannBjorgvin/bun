@@ -864,7 +864,7 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
                 Global::exit(1);
             }
 
-            bun_http::async_http::preconnect(url, false);
+            bun_http::async_http::preconnect(url);
         }
     }
 

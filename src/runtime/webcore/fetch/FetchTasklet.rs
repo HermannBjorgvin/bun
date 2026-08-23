@@ -1,11 +1,12 @@
 use core::cell::Cell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::Arc;
 
 use bun_cares_sys::c_ares_draft as c_ares;
 use bun_core::{MutableString, OwnedString, String as BunString, ZigStringSlice};
-use bun_event_loop::{ConcurrentTask::ConcurrentTask, ManagedTask::ManagedTask, Task};
+use bun_event_loop::task_tag;
+use bun_event_loop::{ConcurrentTask::ConcurrentTask, ReusableConcurrentTask, Task, TaskHop};
 use bun_http as http;
 use bun_http::Method;
 use bun_http::{
@@ -40,9 +41,6 @@ const UNOBSERVED_BODY_HIGH_WATER_MARK: usize = 256 * 1024;
 
 bun_output::declare_scope!(FetchTasklet, visible);
 
-// `Bun__FetchResponse_finalize` (below) is `WeakRefType::FetchResponse`'s callback.
-bun_jsc::weak_owner!(FetchTasklet, FetchResponse);
-
 /// Upper bound on the Content-Length-driven `reserve_exact` in `on_result()`.
 const SCHEDULED_PRERESERVE_MAX: usize = 256 * 1024 * 1024;
 
@@ -54,9 +52,7 @@ pub(crate) struct FetchRequestStorage {
     /// url + proxy href, back to back.
     url_proxy_buffer: Box<[u8]>,
     url_len: usize,
-    /// Hop-0 proxy href resolved from the proxy settings.
-    proxy_href: Option<Box<[u8]>>,
-    headers: Headers,
+    headers_buf: Vec<u8>,
     hostname: Option<Box<[u8]>>,
     /// The in-memory request body (`HTTPRequestBody::AnyBlob`); empty otherwise.
     body: AnyBlob,
@@ -76,11 +72,10 @@ pub(crate) struct SharedState {
     pub(crate) metadata: Option<HTTPResponseMetadata>,
     /// buffer used to stream response to JS
     pub(crate) scheduled_response_buffer: MutableString,
-    /// For Http Client requests
-    /// when Content-Length is provided this represents the whole size of the request
-    /// If chunked encoded this will represent the total received size (ignoring the chunk headers)
-    /// If is not chunked encoded and Content-Length is not provided this will be unknown
-    pub(crate) body_size: http::BodySize,
+    /// The HTTP thread is done with the fetch (terminal result delivered): the
+    /// progress update that sees this releases `http_ref` too. Fetches with a
+    /// streaming request body post a `HandBackHop` instead (see `on_result`).
+    handed_back: bool,
     /// `process.exit()` interrupted the request on the HTTP thread
     /// (`release_at_shutdown`): nothing more will arrive, so the next progress
     /// update only releases the tasklet.
@@ -101,36 +96,59 @@ pub(crate) struct FetchShared {
     /// thread, under `state`'s lock): the body is being accumulated in
     /// `scheduled_response_buffer` for a buffered consumer.
     is_buffering_body: AtomicBool,
-    /// The latest result's `is_http2`, for `skip_chunked_framing` (which runs
-    /// outside `state`'s lock): the streaming request body goes out unframed.
+    /// The latest result's `is_http2` (the streaming request body goes out
+    /// unframed): read by `write_request_data` for every request-body chunk
+    /// without taking `state`'s lock, which `on_progress_update` may be holding
+    /// on the same thread while it pumps that body.
     is_http2: AtomicBool,
-    /// The tasklet's address as the JS-thread hops carry it (tag
-    /// `task_tag::FetchTasklet`); set once in `queue`. The tasklet keeps itself
-    /// alive for those hops through `progress_ref` / `http_ref`.
-    tasklet: OnceLock<Task>,
-    /// Held while the request is out on the HTTP thread (`queue` until its
-    /// terminal result / `release_at_shutdown`): how that thread posts to the JS
-    /// thread, and what makes the VM wait for it.
-    ticket: Guarded<Option<jsc::Ticket>>,
+    /// The tasklet's address, which the JS-thread hops carry; set once in
+    /// `queue`. The tasklet keeps itself alive for them through `progress_ref`
+    /// / `http_ref`.
+    tasklet: AtomicPtr<FetchTasklet>,
+    /// The progress-update hop's queue node (at most one is queued at a time:
+    /// `has_schedule_callback`).
+    progress_task: ReusableConcurrentTask,
+    /// The hand-back hop's queue node (posted once, if `posts_drain_hops`).
+    hand_back_task: ReusableConcurrentTask,
+    /// Request-body drain hops are posted (a streaming request body), so the
+    /// hand-back must be its own hop, queued after them.
+    posts_drain_hops: bool,
+    /// How the HTTP thread posts to the JS thread, and what makes the VM wait
+    /// for it; handed back at the terminal result / `release_at_shutdown`.
+    ticket: jsc::InFlightTicket,
 }
 
 impl FetchShared {
-    fn tasklet_task(&self, tag: bun_event_loop::TaskTag) -> Task {
-        let task = *self.tasklet.get().expect("fetch queued");
-        Task::new(tag, task.ptr)
+    fn hop(&self, tag: bun_event_loop::TaskTag) -> Task {
+        Task::new(tag, self.tasklet.load(Ordering::Relaxed).cast::<()>())
     }
 
-    fn post(ticket: &jsc::Ticket, task: Task) {
-        ticket.post(ConcurrentTask::create(task));
+    /// Post the progress-update hop unless one is queued already.
+    fn post_progress_update(&self) {
+        if self
+            .has_schedule_callback
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let task = self.hop(task_tag::FetchTasklet);
+        // `has_schedule_callback` was clear, so the previous hop has run and its
+        // node was consumed; the heap node is only a fallback.
+        let node = self
+            .progress_task
+            .arm(task)
+            .unwrap_or_else(|| ConcurrentTask::create(task));
+        self.ticket.post(node);
     }
 }
 
 impl http::HTTPClientResultHandler for FetchShared {
     /// HTTP thread: fold `result` into the shared state and, unless one is
-    /// already queued, post a progress update to the JS thread. On the terminal
-    /// result the hand-back is posted first, so every request-body drain hop
-    /// precedes it; whichever of the hand-back and the terminal progress update
-    /// runs last releases the tasklet.
+    /// already queued, post a progress update to the JS thread. The terminal
+    /// result also hands the tasklet back: through `handed_back`, which the
+    /// progress update that sees it acts on, or — when request-body drain hops
+    /// may be queued — as a `HandBackHop` queued after them.
     fn on_result(&self, mut result: HTTPClientResult<'_>) {
         let is_done = !result.has_more;
         let mut state = self.state.lock();
@@ -176,8 +194,6 @@ impl http::HTTPClientResultHandler for FetchShared {
             state.result.metadata = None;
         }
 
-        state.body_size = state.result.body_size;
-
         let success = state.result.is_success();
 
         if self.signal_store.body_receive_mode() == BodyReceiveMode::Ignore {
@@ -190,7 +206,7 @@ impl http::HTTPClientResultHandler for FetchShared {
             }
         } else if success {
             let has_more = state.result.has_more;
-            let body_size = state.body_size;
+            let body_size = state.result.body_size;
             let scheduled = &mut state.scheduled_response_buffer;
             if body.is_empty() && !body_owned.is_empty() && scheduled.list.is_empty() {
                 scheduled.list = body_owned;
@@ -226,37 +242,15 @@ impl http::HTTPClientResultHandler for FetchShared {
             }
         }
 
-        let mut ticket_guard = self.ticket.lock();
-        // On the terminal result the ticket leaves with this call.
-        let terminal_ticket = if is_done { ticket_guard.take() } else { None };
-        let ticket = match terminal_ticket.as_ref().or(ticket_guard.as_ref()) {
-            Some(ticket) => ticket,
-            None => unreachable!("fetch on the HTTP thread holds a ticket"),
-        };
         if is_done {
-            Self::post(
-                ticket,
-                self.tasklet_task(bun_event_loop::task_tag::FetchTaskletHandBack),
-            );
+            self.hand_back(&mut state);
         }
-        if let Err(has_schedule_callback) = self.has_schedule_callback.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            if has_schedule_callback {
-                return;
-            }
-        }
-        Self::post(
-            ticket,
-            self.tasklet_task(bun_event_loop::task_tag::FetchTasklet),
-        );
-        drop(ticket_guard);
+        self.post_progress_update();
         drop(state);
-        // The HTTP thread is done with this fetch.
-        drop(terminal_ticket);
+        if is_done {
+            // The HTTP thread is done with this fetch.
+            self.ticket.hand_back();
+        }
     }
 
     /// Called from `dealloc_in_flight_for_exit` on the HTTP thread for each
@@ -272,44 +266,96 @@ impl http::HTTPClientResultHandler for FetchShared {
     /// fetches' tickets — i.e. for their terminal result — before the exiting
     /// main thread parks the HTTP thread.
     fn release_at_shutdown(&self) {
-        let queued_progress_update = self.has_schedule_callback.load(Ordering::Acquire);
         {
             let mut state = self.state.lock();
             // No JS-thread drain will reclaim it.
             state.scheduled_response_buffer = MutableString::default();
             state.released_at_shutdown = true;
+            self.hand_back(&mut state);
         }
-        let ticket = self
-            .ticket
-            .lock()
-            .take()
-            .expect("fetch on the HTTP thread holds a ticket");
-        Self::post(
-            &ticket,
-            self.tasklet_task(bun_event_loop::task_tag::FetchTaskletHandBack),
-        );
-        if !queued_progress_update {
-            Self::post(
-                &ticket,
-                self.tasklet_task(bun_event_loop::task_tag::FetchTasklet),
-            );
-        }
+        self.post_progress_update();
         // The HTTP thread is done with this fetch.
-        drop(ticket);
+        self.ticket.hand_back();
+    }
+}
+
+impl FetchShared {
+    /// HTTP thread, `state` locked, nothing more to deliver: let the JS thread
+    /// release `http_ref`.
+    fn hand_back(&self, state: &mut SharedState) {
+        if self.posts_drain_hops {
+            // Its own hop: FIFO after every `RequestBodyDrainHop` this thread
+            // posted, which is what keeps the tasklet alive for those.
+            let task = self.hop(task_tag::FetchTaskletHandBack);
+            let node = self
+                .hand_back_task
+                .arm(task)
+                .unwrap_or_else(|| ConcurrentTask::create(task));
+            self.ticket.post(node);
+        } else {
+            state.handed_back = true;
+        }
     }
 }
 
 impl http::DrainHandler for FetchShared {
     /// HTTP thread, with the request body buffer locked: it drained. Hop to the
-    /// JS thread to resume the request body stream.
+    /// JS thread to resume the request body stream. Carries no reference of its
+    /// own: the later `HandBackHop` from this thread is what releases `http_ref`.
     fn on_drain(&self) {
-        if let Some(ticket) = self.ticket.lock().as_ref() {
-            Self::post(
-                ticket,
-                self.tasklet_task(bun_event_loop::task_tag::FetchTaskletRequestDataDrain),
-            );
-        }
+        self.ticket.post(ConcurrentTask::create(
+            self.hop(task_tag::FetchTaskletRequestDataDrain),
+        ));
     }
+}
+
+/// `task_tag::FetchTasklet`: a progress update the HTTP thread posted.
+pub struct ProgressHop;
+impl TaskHop for ProgressHop {
+    type Target = FetchTasklet;
+    const TAG: bun_event_loop::TaskTag = task_tag::FetchTasklet;
+    fn run(this: ThisPtr<FetchTasklet>) -> JsResult<()> {
+        FetchTasklet::on_progress_update(this)
+    }
+    /// The VM is tearing down (its wait for the ticket is over, so the fetch was
+    /// handed back): release what the update would have.
+    fn release_unrun(this: ThisPtr<FetchTasklet>) {
+        let handed_back = this.shared.state.lock().handed_back;
+        if handed_back {
+            FetchTasklet::release(this, |t| &t.http_ref);
+        }
+        FetchTasklet::release(this, |t| &t.progress_ref);
+    }
+}
+
+/// `task_tag::FetchTaskletHandBack`: the HTTP thread is done with a fetch that
+/// streamed its request body (posted after its last touch of anything the
+/// tasklet can reach).
+pub struct HandBackHop;
+impl TaskHop for HandBackHop {
+    type Target = FetchTasklet;
+    const TAG: bun_event_loop::TaskTag = task_tag::FetchTaskletHandBack;
+    fn run(this: ThisPtr<FetchTasklet>) -> JsResult<()> {
+        FetchTasklet::release(this, |t| &t.http_ref);
+        Ok(())
+    }
+    fn release_unrun(this: ThisPtr<FetchTasklet>) {
+        FetchTasklet::release(this, |t| &t.http_ref);
+    }
+}
+
+/// `task_tag::FetchTaskletRequestDataDrain`: the streaming request body buffer
+/// drained; resume the stream feeding it.
+pub struct RequestBodyDrainHop;
+impl TaskHop for RequestBodyDrainHop {
+    type Target = FetchTasklet;
+    const TAG: bun_event_loop::TaskTag = task_tag::FetchTaskletRequestDataDrain;
+    fn run(this: ThisPtr<FetchTasklet>) -> JsResult<()> {
+        FetchTasklet::resume_request_data_stream(this);
+        Ok(())
+    }
+    /// Nothing held: the tasklet outlives this hop through `http_ref`.
+    fn release_unrun(_this: ThisPtr<FetchTasklet>) {}
 }
 
 /// The per-`fetch()` state machine. Lives on the JS thread; the HTTP thread
@@ -363,6 +409,9 @@ pub struct FetchTasklet {
     pub(crate) check_server_identity: JsCell<StrongOptional>,
     pub(crate) reject_unauthorized: bool,
     pub(crate) upgraded_connection: bool,
+    /// The user set Content-Length without Transfer-Encoding: a streamed
+    /// request body goes out unframed (`skip_chunked_framing`).
+    unframed_by_headers: bool,
     pub(crate) is_waiting_body: Cell<bool>,
     pub(crate) is_waiting_abort: Cell<bool>,
     pub(crate) is_waiting_request_stream_start: Cell<bool>,
@@ -370,8 +419,13 @@ pub struct FetchTasklet {
     /// The JS side's reference: released by the terminal progress update (or
     /// by its VM releasing that update unrun).
     progress_ref: JsCell<Option<RefPtr<FetchTasklet>>>,
+    /// The `fetch()` promise's settlement, run from its own event-loop task
+    /// (`PromiseSettleHop`, which holds `settle_ref`).
+    pending_settle: JsCell<Option<FetchTaskletPromiseSettle>>,
+    settle_ref: JsCell<Option<RefPtr<FetchTasklet>>>,
     /// The reference held while the request is out on the HTTP thread:
-    /// released by the hand-back hop.
+    /// released once it hands the request back (`SharedState::handed_back`,
+    /// or `HandBackHop` when the request body is streamed).
     http_ref: JsCell<Option<RefPtr<FetchTasklet>>>,
     /// Held while a request body stream is wired to `sink` (`start_request_stream`);
     /// released by `write_end_request`, or by the sink's `finalize` if that never ran.
@@ -954,6 +1008,7 @@ impl FetchTasklet {
         this.shared
             .has_schedule_callback
             .store(false, Ordering::Relaxed);
+        let handed_back = state.handed_back;
         let (after, result) = if state.released_at_shutdown {
             // `process.exit()` took the request off the HTTP thread: nothing
             // more arrives and there is nothing to deliver; just let go.
@@ -965,7 +1020,7 @@ impl FetchTasklet {
         drop(state);
         match after {
             AfterProgress::Pending => {}
-            AfterProgress::Release => Self::release_progress_ref(this),
+            AfterProgress::Release => Self::release(this, |t| &t.progress_ref),
             AfterProgress::Finish => {
                 // The HTTP response has been fully received. If the request body
                 // is still being uploaded, the HTTP layer will never drain/resume
@@ -974,36 +1029,26 @@ impl FetchTasklet {
                 this.cancel_request_body_sink(JSValue::UNDEFINED);
                 this.poll_ref
                     .with_mut(|poll_ref| poll_ref.unref(bun_io::js_vm_ctx()));
-                Self::release_progress_ref(this);
+                Self::release(this, |t| &t.progress_ref);
             }
+        }
+        if handed_back {
+            Self::release(this, |t| &t.http_ref);
         }
         result
     }
 
-    fn release_progress_ref(this: ThisPtr<FetchTasklet>) {
-        let progress_ref = this.progress_ref.replace(None);
-        if let Some(progress_ref) = progress_ref {
-            progress_ref.deref();
+    /// Release the reference in `slot`, if held. May free the tasklet.
+    fn release(
+        this: ThisPtr<FetchTasklet>,
+        slot: fn(&FetchTasklet) -> &JsCell<Option<RefPtr<FetchTasklet>>>,
+    ) {
+        let held = slot(this.get()).replace(None);
+        if let Some(held) = held {
+            held.deref();
         }
     }
 
-    /// The queued progress update will never run (its VM is tearing down):
-    /// release what it held.
-    pub(crate) fn release_progress_update_unrun(this: ThisPtr<FetchTasklet>) {
-        Self::release_progress_ref(this);
-    }
-
-    /// The HTTP thread is done with the fetch (posted after its last touch of
-    /// anything the tasklet can reach): release the reference held for it.
-    pub(crate) fn on_http_handed_back(this: ThisPtr<FetchTasklet>) {
-        let http_ref = this.http_ref.replace(None);
-        if let Some(http_ref) = http_ref {
-            http_ref.deref();
-        }
-    }
-
-    /// `this.shared.state` is locked (`state`); returns what to do once it is
-    /// unlocked, mirroring where the lock used to be released.
     fn progress_update_locked(
         &self,
         state: &mut SharedState,
@@ -1143,7 +1188,7 @@ impl FetchTasklet {
             // the connection already closed/failed the resume is a no-op
             // (keyed through the abort tracker).
             if let Some(id) = self.async_http_id() {
-                http::http_thread().schedule_cert_check_resume_by_id(id);
+                http::http_thread().schedule_cert_check_resume(id);
             }
             // Fall through. The common case (certificate-only update) returns
             // at the metadata-less early return below; the #27275 coalesced
@@ -1226,15 +1271,17 @@ impl FetchTasklet {
 
         promise_value.ensure_still_alive();
 
-        let holder = Box::new(FetchTaskletPromiseSettle {
+        self.pending_settle.set(Some(FetchTaskletPromiseSettle {
             held: result,
             // we need the promise to be alive until the task is done
             promise: self.promise.with_mut(jsc::JSPromiseStrong::take),
             global_object: global_this,
             success,
-        });
+        }));
+        self.settle_ref
+            .set(Some(RefPtr::from_this(self.this_ptr())));
         vm.event_loop_mut()
-            .enqueue_task(ManagedTask::new_boxed(holder));
+            .enqueue_task(PromiseSettleHop::task(self.this_ptr()));
 
         bun_output::scoped_log!(FetchTasklet, "onProgressUpdate: promise_value is not null");
         tracker.did_dispatch(&global_this);
@@ -1707,7 +1754,7 @@ impl FetchTasklet {
     }
 
     fn get_size_hint(state: &SharedState) -> BlobSizeType {
-        match state.body_size {
+        match state.result.body_size {
             http::BodySize::ContentLength(n) => n as BlobSizeType,
             http::BodySize::TotalReceived(n) => n as BlobSizeType,
             http::BodySize::Unknown => 0,
@@ -2002,9 +2049,10 @@ impl FetchTasklet {
         // the body can still be settled if JS drops the Response.
         let (response_js, native_response) = response.to_js_retained(&global_this);
         response_js.ensure_still_alive();
-        self.response.set(jsc::Weak::<FetchTasklet>::create_for(
+        self.response.set(jsc::Weak::<FetchTasklet>::create(
             response_js,
             &global_this,
+            jsc::WeakRefType::FetchResponse,
             BackRef::new(self),
         ));
         // Response-owned listener so abort still errors the body after this tasklet detaches its own.
@@ -2051,14 +2099,20 @@ impl FetchTasklet {
             compress,
         } = fetch_options;
 
+        let is_stream = matches!(body, HTTPRequestBody::ReadableStream(_));
+        // Out on the HTTP thread from `start` below until it hands the request
+        // back: the VM waits for it (the ticket) and aborts it at teardown (registry).
         let shared = Arc::new(FetchShared {
             state: Guarded::new(SharedState::default()),
             signal_store: http::signals::Store::default(),
             has_schedule_callback: AtomicBool::new(false),
             is_buffering_body: AtomicBool::new(false),
             is_http2: AtomicBool::new(false),
-            tasklet: OnceLock::new(),
-            ticket: Guarded::new(None),
+            tasklet: AtomicPtr::new(core::ptr::null_mut()),
+            progress_task: ReusableConcurrentTask::default(),
+            hand_back_task: ReusableConcurrentTask::default(),
+            posts_drain_hops: is_stream,
+            ticket: global_this.bun_vm().ticket().in_flight(),
         });
         let mut signals = shared.signal_store.to_with_backpressure();
         if check_server_identity.has() && reject_unauthorized {
@@ -2075,7 +2129,6 @@ impl FetchTasklet {
             .header_progress
             .store(true, Ordering::Relaxed);
 
-        let is_stream = matches!(body, HTTPRequestBody::ReadableStream(_));
         let (in_memory_body, request_body) = match body {
             HTTPRequestBody::AnyBlob(blob) => (blob, HTTPRequestBody::default()),
             other => (AnyBlob::Blob(Blob::default()), other),
@@ -2100,16 +2153,16 @@ impl FetchTasklet {
         } else {
             http::ProxySettings::from_env(env)
         };
-        let proxy_href: Option<Box<[u8]>> = proxy_settings
-            .as_deref()
-            .and_then(|s| s.resolve(&ZigURL::parse(&url_proxy_buffer[..url_len])))
-            .map(Box::from);
-
+        let framed_by_headers =
+            headers.get(b"content-length").is_some() && headers.get(b"transfer-encoding").is_none();
+        let Headers {
+            entries: header_entries,
+            buf: headers_buf,
+        } = headers;
         let storage = FetchRequestStorage {
             url_proxy_buffer,
             url_len,
-            proxy_href,
-            headers,
+            headers_buf,
             hostname,
             body: in_memory_body,
         };
@@ -2135,11 +2188,14 @@ impl FetchTasklet {
             check_server_identity: JsCell::new(check_server_identity),
             reject_unauthorized,
             upgraded_connection,
+            unframed_by_headers: framed_by_headers,
             is_waiting_body: Cell::new(false),
             is_waiting_abort: Cell::new(false),
             is_waiting_request_stream_start: Cell::new(is_stream),
             tracker: AsyncTaskTracker::init(global_this.bun_vm().as_mut()),
             progress_ref: JsCell::new(None),
+            pending_settle: JsCell::new(None),
+            settle_ref: JsCell::new(None),
             http_ref: JsCell::new(None),
             request_stream_ref: JsCell::new(None),
         });
@@ -2148,10 +2204,7 @@ impl FetchTasklet {
         // The reference `RefPtr::new` created is the JS side's.
         this_ptr.progress_ref.set(Some(this));
         let this = this_ptr;
-        let _ = shared.tasklet.set(Task::new(
-            bun_event_loop::task_tag::FetchTasklet,
-            this.as_ptr().cast::<()>(),
-        ));
+        shared.tasklet.store(this.as_ptr(), Ordering::Relaxed);
 
         this.tracker.did_schedule(global_this);
 
@@ -2176,20 +2229,18 @@ impl FetchTasklet {
         let mut request = OwnedRequest::new(storage, |storage| {
             let url = storage.url();
             debug_assert!(sendfile.is_none() || url.is_http());
-            // `MultiArrayList` owns its
-            // allocation, so clone; AsyncHTTP::init clones again for the client.
-            let header_entries = bun_core::handle_oom(storage.headers.entries.clone());
             AsyncHTTP::init(
                 method,
                 url,
                 header_entries,
-                storage.headers.buf.as_slice(),
+                storage.headers_buf.as_slice(),
                 storage.body.slice(),
                 // handles response events (on headers, on body, etc.)
                 http::HTTPClientResultCallback::from_handler(handler_arc),
                 redirect_type,
                 http::async_http::Options {
-                    http_proxy: storage.proxy_href.as_deref().map(ZigURL::parse),
+                    // Hop 0's proxy is resolved from `proxy_settings` too.
+                    http_proxy: None,
                     proxy_settings,
                     proxy_headers,
                     hostname: storage.hostname.as_deref(),
@@ -2231,11 +2282,8 @@ impl FetchTasklet {
 
         this.poll_ref
             .with_mut(|poll_ref| poll_ref.ref_(bun_io::js_vm_ctx()));
-        // Out on the HTTP thread from here until it hands the request back: it
-        // holds a reference (`http_ref`), the VM aborts it at teardown
-        // (registry) and waits for it (the ticket).
+        // The HTTP thread's reference, from `start` until it hands the request back.
         this.http_ref.set(Some(RefPtr::from_this(this)));
-        *shared.ticket.lock() = Some(global_this.bun_vm().ticket());
         crate::jsc_hooks::ActiveHandle::Fetch(NonNull::from(this)).register();
         let mut batch = bun_threading::thread_pool::Batch::default();
         this.request.set(Some(request.start(&mut batch)));
@@ -2264,10 +2312,7 @@ impl FetchTasklet {
     pub(crate) fn skip_chunked_framing(&self) -> bool {
         self.upgraded_connection
             || self.shared.is_http2.load(Ordering::Relaxed)
-            || self.request_storage().is_some_and(|storage| {
-                storage.headers.get(b"content-length").is_some()
-                    && storage.headers.get(b"transfer-encoding").is_none()
-            })
+            || self.unframed_by_headers
     }
 
     /// Called from `FetchRequestBodySink::write_*`; `high_water_mark` is the
@@ -2332,7 +2377,7 @@ impl FetchTasklet {
             // wakeup the http thread to write the data
             if let Some(id) = self.async_http_id() {
                 http::http_thread()
-                    .schedule_request_write_by_id(id, http::http_thread::WriteMessageType::Data);
+                    .schedule_request_write(id, http::http_thread::WriteMessageType::Data);
             }
         }
 
@@ -2387,7 +2432,7 @@ impl FetchTasklet {
             }
             if let Some(id) = self.async_http_id() {
                 http::http_thread()
-                    .schedule_request_write_by_id(id, http::http_thread::WriteMessageType::End);
+                    .schedule_request_write(id, http::http_thread::WriteMessageType::End);
             }
         }
     }
@@ -2395,10 +2440,7 @@ impl FetchTasklet {
     /// The sink's fallback release of `request_stream_ref` (its `finalize`).
     /// May free the tasklet.
     pub(crate) fn release_request_stream_ref(this: ThisPtr<FetchTasklet>) {
-        let request_stream_ref = this.request_stream_ref.replace(None);
-        if let Some(request_stream_ref) = request_stream_ref {
-            request_stream_ref.deref();
-        }
+        Self::release(this, |t| &t.request_stream_ref);
     }
 
     fn abort_task(&self) {
@@ -2461,9 +2503,8 @@ impl FetchTasklet {
     }
 }
 
-/// `Bun__FetchResponse_finalize`: the Response's JS wrapper was collected
-/// (the `response` weak handle's finalize callback). Inside a GC sweep:
-/// decide from native state only.
+/// `WeakRefType::FetchResponse`'s finalize callback: the Response's JS wrapper
+/// (`response`) was collected. Inside a GC sweep: decide from native state only.
 // HOST_EXPORT(Bun__FetchResponse_finalize, c)
 pub fn on_response_finalize(this: &crate::webcore::fetch::FetchTasklet) {
     bun_output::scoped_log!(FetchTasklet, "onResponseFinalize");
@@ -2605,7 +2646,29 @@ pub(crate) struct FetchTaskletPromiseSettle {
     success: bool,
 }
 
-impl bun_event_loop::ManagedTask::RunOnce for FetchTaskletPromiseSettle {
+/// `task_tag::FetchTaskletPromiseSettle`: settle the `fetch()` promise
+/// (`FetchTasklet::pending_settle`).
+pub struct PromiseSettleHop;
+impl TaskHop for PromiseSettleHop {
+    type Target = FetchTasklet;
+    const TAG: bun_event_loop::TaskTag = task_tag::FetchTaskletPromiseSettle;
+    fn run(this: ThisPtr<FetchTasklet>) -> JsResult<()> {
+        let settle = this.pending_settle.replace(None);
+        let result = match settle {
+            Some(settle) => settle.run(),
+            None => Ok(()),
+        };
+        FetchTasklet::release(this, |t| &t.settle_ref);
+        result
+    }
+    /// Drop the held value and promise handle without settling.
+    fn release_unrun(this: ThisPtr<FetchTasklet>) {
+        this.pending_settle.set(None);
+        FetchTasklet::release(this, |t| &t.settle_ref);
+    }
+}
+
+impl FetchTaskletPromiseSettle {
     fn run(mut self) -> JsResult<()> {
         let prom = self.promise.value_or_empty().as_any_promise().unwrap();
         let res = self.held.swap();

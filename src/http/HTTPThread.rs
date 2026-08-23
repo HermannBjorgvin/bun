@@ -924,11 +924,7 @@ impl HttpThread {
         self.wakeup();
     }
 
-    pub fn schedule_cert_check_resume(&mut self, http: &AsyncHttp) {
-        self.schedule_cert_check_resume_by_id(http.async_http_id);
-    }
-
-    pub fn schedule_cert_check_resume_by_id(&mut self, async_http_id: u32) {
+    pub fn schedule_cert_check_resume(&mut self, async_http_id: u32) {
         bun_core::scoped_log!(HTTPThread, "scheduleCertCheckResume {}", async_http_id);
         {
             let _guard = self.queued_cert_check_resumes_lock.lock_guard();
@@ -938,11 +934,7 @@ impl HttpThread {
         self.wakeup();
     }
 
-    pub fn schedule_request_write(&mut self, http: &AsyncHttp, kind: WriteMessageType) {
-        self.schedule_request_write_by_id(http.async_http_id, kind);
-    }
-
-    pub fn schedule_request_write_by_id(&mut self, async_http_id: u32, kind: WriteMessageType) {
+    pub fn schedule_request_write(&mut self, async_http_id: u32, kind: WriteMessageType) {
         {
             let _guard = self.queued_writes_lock.lock_guard();
             self.queued_writes.push(WriteMessage {
@@ -985,14 +977,11 @@ impl HttpThread {
         let release_unstarted = |http: NonNull<AsyncHttp<'static>>| {
             // SAFETY: heap-owned by the caller, alive until its completion,
             // and never touched by us again after this.
-            let release = unsafe {
-                (*http.as_ptr()).handed_back.store(true, Ordering::Release);
-                (*http.as_ptr()).result_callback
+            unsafe {
+                (*http.as_ptr())
+                    .result_callback
+                    .hand_back_at_shutdown(http.as_ptr())
             };
-            if let Some(f) = release.release_at_shutdown {
-                // SAFETY: paired ctx/fn from `HTTPClientResultCallback::new_with_release`.
-                unsafe { f(release.ctx) };
-            }
         };
         for http in core::mem::take(&mut self.deferred_tasks) {
             release_unstarted(http);
@@ -1028,12 +1017,11 @@ impl HttpThread {
                     ctx.deref();
                 }
                 drop(core::mem::take(&mut client.state));
-                if let Some(real) = (*nn.as_ptr()).async_http.real {
-                    (*real.as_ptr()).handed_back.store(true, Ordering::Release);
-                }
-                if let Some(f) = release.release_at_shutdown {
-                    f(release.ctx);
-                }
+                let real = (*nn.as_ptr())
+                    .async_http
+                    .real
+                    .expect("in-flight copy has an original");
+                release.hand_back_at_shutdown(real.as_ptr());
                 std::alloc::dealloc(
                     nn.as_ptr().cast::<u8>(),
                     std::alloc::Layout::new::<crate::ThreadlocalAsyncHttp<'static>>(),

@@ -322,9 +322,7 @@ non-transferring path UAFs at GC.
 it trips `wasRemoved` in `AtomStringImpl::remove()`. If a `bun_core::String`
 may be dropped from a non-JS thread (HTTP worker, threadpool, dying VM), build
 it via `String::clone_utf8` (a plain `WTFStringImpl` with an atomic refcount),
-not from an interned/atomized JS string. See the comment in
-`src/runtime/webcore/fetch/FetchTasklet.rs` near `Response::init` for the
-canonical example of this bug class and its fix.
+not from an interned/atomized JS string.
 
 ## Common Patterns
 

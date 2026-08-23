@@ -552,32 +552,6 @@ impl<'a> HTTPClientResult<'a> {
             certificate_info: self.certificate_info,
         }
     }
-
-    /// Widen the borrow to `'static` for self-referential storage.
-    ///
-    /// `body` is the only lifetime-carrying field; it borrows the HTTP
-    /// thread's `decoded_body` scratch buffer, which is cleared immediately
-    /// after the callback returns, so the stored form carries `body: &[]`.
-    ///
-    /// # Safety
-    /// Caller must not read `.body` from the returned value.
-    #[inline]
-    pub unsafe fn detach_lifetime(self) -> HTTPClientResult<'static> {
-        HTTPClientResult {
-            body: &[],
-            body_owned: self.body_owned,
-            has_more: self.has_more,
-            redirected: self.redirected,
-            can_stream: self.can_stream,
-            is_http2: self.is_http2,
-            fail: self.fail,
-            dns_error: self.dns_error,
-            dns_hostname: self.dns_hostname,
-            metadata: self.metadata,
-            body_size: self.body_size,
-            certificate_info: self.certificate_info,
-        }
-    }
 }
 
 pub type HTTPClientResultCallbackFunction =
@@ -602,6 +576,40 @@ pub struct HTTPClientResultCallback {
 impl HTTPClientResultCallback {
     pub(crate) fn run(self, async_http: *mut AsyncHTTP<'static>, result: HTTPClientResult<'_>) {
         (self.function)(self.ctx, async_http, result);
+    }
+
+    /// The terminal result for the HTTP thread's copy `clone`: nothing touches
+    /// the caller's original after this, so mark it handed back, then deliver.
+    ///
+    /// # Safety
+    /// `clone` is the HTTP thread's live `ThreadlocalAsyncHTTP` copy.
+    pub(crate) unsafe fn hand_back(
+        self,
+        clone: *mut AsyncHTTP<'static>,
+        result: HTTPClientResult<'_>,
+    ) {
+        debug_assert!(!result.has_more);
+        // SAFETY: fn contract; `real` outlives the copy.
+        if let Some(real) = unsafe { (*clone).real } {
+            // SAFETY: as above.
+            unsafe { (*real.as_ptr()).handed_back.store(true, Ordering::Release) };
+        }
+        self.run(clone, result);
+    }
+
+    /// `process.exit()` with the request still out: mark the caller's
+    /// `original` handed back and run the owner's shutdown release, if any.
+    ///
+    /// # Safety
+    /// `original` is the caller's live `AsyncHTTP`; the HTTP thread never
+    /// touches it again.
+    pub(crate) unsafe fn hand_back_at_shutdown(self, original: *mut AsyncHTTP<'static>) {
+        // SAFETY: fn contract.
+        unsafe { (*original).handed_back.store(true, Ordering::Release) };
+        if let Some(release) = self.release_at_shutdown {
+            // SAFETY: paired ctx/fn from `new_with_release` / `from_handler`.
+            unsafe { release(self.ctx) };
+        }
     }
 
     // Type-erases a typed callback behind a raw context pointer.
@@ -678,58 +686,70 @@ impl HTTPClientResultCallback {
 }
 
 /// An [`AsyncHTTP`] together with the storage its request borrows (URL, header
-/// buffer, body bytes, hostname, ...) point into.
-pub struct OwnedRequest<S: 'static> {
-    /// Borrows `*storage`: declared first so it is dropped first.
-    http: AsyncHTTP<'static>,
-    storage: Box<S>,
+/// buffer, body bytes, hostname, ...) point into, in one allocation.
+pub struct OwnedRequest<S: 'static>(Box<RequestCell<S>>);
+
+struct RequestCell<S: 'static> {
+    /// Borrows `storage`: declared first so it is dropped first. `None` only
+    /// while `OwnedRequest::new` builds it and after `into_storage`.
+    http: Option<AsyncHTTP<'static>>,
+    storage: S,
 }
 
 impl<S: 'static> OwnedRequest<S> {
     /// Build the request from borrows of `storage`.
-    pub fn new(storage: S, build: impl for<'a> FnOnce(&'a S) -> AsyncHTTP<'a>) -> Box<Self> {
-        let storage = Box::new(storage);
-        let http = build(&storage);
-        // SAFETY: `http` borrows only `*storage`, which is heap-pinned, never lent
-        // out `&mut`, and outlives `http` (field order); every accessor re-ties
-        // the lifetime to a borrow of `self`.
+    pub fn new(storage: S, build: impl for<'a> FnOnce(&'a S) -> AsyncHTTP<'a>) -> Self {
+        let mut cell = Box::new(RequestCell {
+            http: None,
+            storage,
+        });
+        let http = build(&cell.storage);
+        // SAFETY: `http` borrows only `cell.storage`, which stays in this heap
+        // cell, is never lent out `&mut` or moved while `http` is alive, and is
+        // dropped after it; every accessor re-ties the lifetime to a borrow of
+        // `self`.
         let http = unsafe { core::mem::transmute::<AsyncHTTP<'_>, AsyncHTTP<'static>>(http) };
-        Box::new(Self { http, storage })
+        cell.http = Some(http);
+        Self(cell)
     }
 
     pub fn storage(&self) -> &S {
-        &self.storage
+        &self.0.storage
     }
 
     /// Drop the request and take the storage back.
-    pub fn into_storage(self) -> S {
-        let OwnedRequest { http, storage } = self;
-        drop(http);
-        *storage
+    pub fn into_storage(mut self) -> S {
+        self.0.http = None;
+        self.0.storage
     }
 
     pub fn http(&self) -> &AsyncHTTP<'_> {
-        &self.http
+        self.0.http.as_ref().expect("built")
     }
 
     /// Adjust the request before it is started.
     pub fn with_http_mut<R>(&mut self, f: impl for<'a> FnOnce(&mut AsyncHTTP<'a>) -> R) -> R {
+        let http = self.0.http.as_mut().expect("built");
         // SAFETY: `'a` is fresh for `f` and outlives the `&mut`, so `f` can
         // store into the request only `'static` data or what it already
-        // borrows (`*self.storage`); see `new`.
-        f(unsafe {
-            core::mem::transmute::<&mut AsyncHTTP<'static>, &mut AsyncHTTP<'_>>(&mut self.http)
-        })
+        // borrows (`self.0.storage`); see `new`.
+        f(unsafe { core::mem::transmute::<&mut AsyncHTTP<'static>, &mut AsyncHTTP<'_>>(http) })
     }
 
     /// Queue the request on `batch` for the HTTP thread. The request stays
     /// allocated, untouched by this thread, until the HTTP thread hands it back.
-    pub fn start(self: Box<Self>, batch: &mut bun_threading::thread_pool::Batch) -> InFlight<S> {
-        let id = self.http.async_http_id;
-        let ptr = NonNull::from(Box::leak(self));
+    pub fn start(self, batch: &mut bun_threading::thread_pool::Batch) -> InFlight<S> {
+        let id = self.http().async_http_id;
+        let ptr = NonNull::from(Box::leak(self.0));
         // SAFETY: `ptr` is the live allocation just leaked; the HTTP thread takes
         // it over from `schedule` until it sets `handed_back`.
-        unsafe { (*ptr.as_ptr()).http.schedule(batch) };
+        unsafe {
+            (*ptr.as_ptr())
+                .http
+                .as_mut()
+                .expect("built")
+                .schedule(batch)
+        };
         InFlight { ptr, id }
     }
 }
@@ -738,7 +758,7 @@ impl<S: 'static> OwnedRequest<S> {
 /// `HTTPThread::schedule_*` calls, and the way to take it back once the HTTP
 /// thread is done with it. Dropping it before then leaks the request.
 pub struct InFlight<S: 'static> {
-    ptr: NonNull<OwnedRequest<S>>,
+    ptr: NonNull<RequestCell<S>>,
     id: u32,
 }
 
@@ -755,6 +775,8 @@ impl<S: 'static> InFlight<S> {
         unsafe {
             (*self.ptr.as_ptr())
                 .http
+                .as_ref()
+                .expect("built")
                 .handed_back
                 .load(Ordering::Acquire)
         }
@@ -768,13 +790,13 @@ impl<S: 'static> InFlight<S> {
     }
 
     /// Take the request back; `Err(self)` while the HTTP thread still has it.
-    pub fn reclaim(self) -> Result<Box<OwnedRequest<S>>, Self> {
+    pub fn reclaim(self) -> Result<OwnedRequest<S>, Self> {
         if !self.handed_back() {
             return Err(self);
         }
         let this = core::mem::ManuallyDrop::new(self);
         // SAFETY: `start` leaked exactly this box, and the HTTP thread is done with it.
-        Ok(unsafe { Box::from_raw(this.ptr.as_ptr()) })
+        Ok(OwnedRequest(unsafe { Box::from_raw(this.ptr.as_ptr()) }))
     }
 }
 
