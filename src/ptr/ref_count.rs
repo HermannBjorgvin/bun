@@ -789,17 +789,17 @@ impl<T: AnyRefCounted> RefPtr<T> {
         unsafe { Self::adopt_ref(bun_core::heap::into_raw(Box::new(init_data))) }
     }
 
-    /// [`new`](Self::new) for a `T` that stores its own root back-reference
-    /// (to hand out [`ThisPtr`](crate::ThisPtr)s from `&self` entry points):
-    /// `init` receives that back-reference before the value exists and must
-    /// only store it — the pointee is uninitialized until `init` returns.
-    pub fn new_cyclic(init: impl FnOnce(crate::BackRef<T, crate::Root>) -> T) -> Self {
-        let slot = Box::<core::mem::MaybeUninit<T>>::new_uninit();
+    /// [`new`](Self::new) for a `T` that stores its own root pointer (to hand
+    /// out [`ThisPtr`](crate::ThisPtr)s from `&self` entry points). `init`
+    /// receives a [`SelfRoot`](crate::SelfRoot) to store in the value; the
+    /// token cannot be dereferenced on its own, only through the `&T` that
+    /// exists once construction is done.
+    pub fn new_cyclic(init: impl FnOnce(crate::SelfRoot<T>) -> T) -> Self {
+        let slot = Box::<T>::new_uninit();
         let raw: *mut T = bun_core::heap::into_raw(slot).cast::<T>();
-        // SAFETY: `raw` is the allocation's root pointer; `init` may only store
-        // the back-reference (documented), and it becomes valid below.
-        let this = unsafe { crate::BackRef::from_root(raw) };
-        let value = init(this);
+        // SAFETY: `raw` is non-null (fresh allocation).
+        let token = crate::SelfRoot(unsafe { core::ptr::NonNull::new_unchecked(raw) });
+        let value = init(token);
         // SAFETY: `raw` is a live, uninitialized, properly aligned `T` slot.
         unsafe { raw.write(value) };
         // SAFETY: freshly written, ref_count == 1 (from `T`'s initializer).
