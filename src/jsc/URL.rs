@@ -102,3 +102,27 @@ impl URL {
         URL__pathname(self)
     }
 }
+
+/// A `WTF::URL` parsed on the C++ heap and owned here; destroyed on drop.
+pub struct OwnedURL(NonNull<URL>);
+
+impl OwnedURL {
+    /// Parse `str`; `None` if it is not a valid URL.
+    pub fn parse(str: String) -> Option<Self> {
+        URL::from_string(str).map(OwnedURL)
+    }
+}
+
+impl core::ops::Deref for OwnedURL {
+    type Target = URL;
+    fn deref(&self) -> &URL {
+        URL::opaque_ref(self.0.as_ptr())
+    }
+}
+
+impl Drop for OwnedURL {
+    fn drop(&mut self) {
+        // SAFETY: `from_string` returned an owned C++ allocation, freed once.
+        unsafe { URL::destroy(self.0.as_ptr()) }
+    }
+}
