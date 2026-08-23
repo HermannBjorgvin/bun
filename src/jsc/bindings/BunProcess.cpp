@@ -2888,7 +2888,7 @@ enum class BunProcessStdinFdType : int32_t {
 };
 extern "C" BunProcessStdinFdType Bun__Process__getStdinFdType(void*, int fd);
 
-extern "C" void Bun__ForceFileSinkToBeSynchronousForProcessObjectStdio(JSC::JSGlobalObject*, JSC::EncodedJSValue);
+extern "C" void Bun__ForceFileSinkToBeSynchronousForProcessObjectStdio(void* fileSink);
 // node:worker_threads worker: process.stdout/stderr forward to the parent Worker's
 // worker.stdout/stderr over a MessagePort; process.stdin is port-fed for { stdin: true }
 // and otherwise an already-ended Readable (never the process-wide fd 0). fd 0/1/2 selects the port.
@@ -2955,7 +2955,11 @@ static JSValue constructStdioWriteStream(JSC::JSGlobalObject* globalObject, JSC:
     forceSync = true;
 #endif
     if (forceSync) {
-        Bun__ForceFileSinkToBeSynchronousForProcessObjectStdio(globalObject, JSValue::encode(resultObject->getIndex(globalObject, 1)));
+        // FileSink__fromJS: 0 = detached, 1 = not a FileSink.
+        void* fileSink = FileSink__fromJS(JSValue::encode(resultObject->getIndex(globalObject, 1)));
+        if (reinterpret_cast<uintptr_t>(fileSink) > 1) {
+            Bun__ForceFileSinkToBeSynchronousForProcessObjectStdio(fileSink);
+        }
     }
 
     return resultObject->getIndex(globalObject, 0);

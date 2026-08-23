@@ -479,17 +479,15 @@ impl Subprocess<'_> {
     pub(crate) fn on_close_io(&self, kind: StdioKind) {
         match kind {
             StdioKind::Stdin => self.stdin.with_mut(|stdin| match stdin {
-                Writable::Pipe(pipe) => {
-                    let pipe = *pipe;
-                    // `source` is a `JsCell`, so the shared `&FileSink` from the
-                    // centralised `pipe_sink` accessor suffices for `with_mut`.
-                    Writable::pipe_sink(pipe).source.with_mut(|s| s.clear());
-                    *stdin = Writable::Ignore;
-                    // `Writable::Pipe` owns one intrusive ref; release it now
-                    // that the variant has been overwritten. Ordered after the
-                    // assignment so any re-entrant `on_stdin_destroyed` from
-                    // `deinit` observes `.Ignore`.
-                    Writable::pipe_release(pipe);
+                Writable::Pipe(_) => {
+                    let Writable::Pipe(pipe) = core::mem::replace(stdin, Writable::Ignore) else {
+                        unreachable!()
+                    };
+                    pipe.source.with_mut(|s| s.clear());
+                    // `Writable::Pipe` owns one ref; release it now that the
+                    // variant has been overwritten, so any re-entrant
+                    // `on_stdin_destroyed` from the sink's drop observes `.Ignore`.
+                    pipe.deref();
                 }
                 Writable::Buffer(_) => {
                     let Writable::Buffer(buffer) = core::mem::replace(stdin, Writable::Ignore)
@@ -1019,8 +1017,7 @@ impl Subprocess<'_> {
             && self.flags.get().contains(Flags::IS_STDIN_A_READABLE_STREAM)
         {
             if let Writable::Pipe(pipe) = self.stdin.get() {
-                // Writable::Pipe already stores `NonNull<FileSink>`; just copy it.
-                Some(*pipe)
+                Some(pipe.data)
             } else {
                 unreachable!()
             }
@@ -1103,8 +1100,7 @@ impl Subprocess<'_> {
             // `pipe_ptr` came from a live FileSink (either `self.stdin.pipe`'s
             // +1-intrusive ref or the cached JS sink kept live by GC) and
             // outlives this scope on the single mutator thread — `BackRef`
-            // invariant. Shared deref via `BackRef::Deref`; the one mutable
-            // call below stays unsafe.
+            // invariant.
             let pipe = bun_ptr::BackRef::from(pipe_ptr);
 
             // Detach the source first so onAttachedProcessExit's sync FileSink.onClose cannot
@@ -1121,13 +1117,7 @@ impl Subprocess<'_> {
             let must_deref = self.flags.get().contains(Flags::DEREF_ON_STDIN_DESTROYED);
             self.update_flags(|f| f.remove(Flags::DEREF_ON_STDIN_DESTROYED));
 
-            // `pipe_ptr` is live (see `pipe` borrow above) and is the canonical
-            // `*mut FileSink` from `FileSink::create*`; pass it straight through —
-            // `on_attached_process_exit` re-enters via the writer backref and may
-            // free `this`, so no `&mut FileSink` is materialized at the boundary.
-            // SAFETY: `pipe_ptr` is the canonical heap pointer with write+dealloc
-            // provenance, held live by the `Writable::Pipe`/cache +1.
-            unsafe { FileSink::on_attached_process_exit(pipe_ptr.as_ptr(), status) };
+            FileSink::on_attached_process_exit(pipe.this_ptr(), status);
 
             if must_deref {
                 self.deref();
