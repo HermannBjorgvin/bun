@@ -189,7 +189,7 @@ pub use self::js_value::{
 // and is wired into `event_loop::tick` directly at link time. No fn-pointer
 // hook is re-exported from the crate root.
 pub use self::array_buffer::{
-    ArrayBuffer, BinaryType, JSCArrayBuffer, MarkedArrayBuffer, TypedArrayType,
+    ArrayBuffer, BinaryType, JSCArrayBuffer, MarkedArrayBuffer, PinnedArrayBuffer, TypedArrayType,
 };
 pub use self::console_object as ConsoleObject;
 pub use self::console_object::Formatter;
@@ -1604,6 +1604,21 @@ pub unsafe fn zig_string_to_external_u16(
     global: &JSGlobalObject,
 ) -> JSValue {
     // SAFETY: caller upholds `to_external_u16`'s contract.
+    unsafe { crate::zig_string::to_external_u16(ptr, len, global) }
+}
+
+/// Hand an owned UTF-16 buffer to JSC as an external string (freed by JSC's
+/// finalizer). Throws `STRING_TOO_LONG` and returns `.zero` if it is too long.
+pub fn external_string_utf16(buf: Vec<u16>, global: &JSGlobalObject) -> JSValue {
+    let len = buf.len();
+    if len == 0 {
+        // `to_external_u16` frees nothing for an empty string; don't strand the capacity.
+        drop(buf);
+        return crate::ZigString::EMPTY.to_js(global);
+    }
+    // Spare capacity goes with the allocation (mi_free needs no size); no shrink-copy.
+    let ptr = buf.leak().as_ptr();
+    // SAFETY: a non-empty global-allocator `Vec<u16>` just released; JSC owns it now.
     unsafe { crate::zig_string::to_external_u16(ptr, len, global) }
 }
 
