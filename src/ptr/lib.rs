@@ -165,7 +165,19 @@ impl<T: ?Sized> BackRef<T, Mut> {
     }
 }
 
-impl<T, P> BackRef<T, P> {
+/// Provenance markers a placeholder [`BackRef::dangling`] may carry. Not
+/// [`Root`]: a `Root` back-reference can hand out a [`ThisPtr`], so it is
+/// only ever minted from a real one (see [`RefPtr::new_cyclic`]).
+pub trait DanglingOk: sealed::Sealed {}
+impl DanglingOk for Shared {}
+impl DanglingOk for Mut {}
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Shared {}
+    impl Sealed for super::Mut {}
+}
+
+impl<T, P: DanglingOk> BackRef<T, P> {
     #[inline]
     pub const fn dangling() -> Self {
         BackRef(core::ptr::NonNull::dangling(), core::marker::PhantomData)

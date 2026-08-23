@@ -1374,7 +1374,7 @@ pub struct CronJob {
     ref_count: Cell<u32>,
     /// Set from the allocating `RefPtr` so `&self` host fns can reach the
     /// `ThisPtr`-taking paths that may release refs.
-    self_ref: Cell<BackRef<CronJob, bun_ptr::Root>>,
+    self_ref: BackRef<CronJob, bun_ptr::Root>,
     // pub: `bun_core::from_field_ptr!(CronJob, event_loop_timer)` needs `offset_of!` visibility.
     // `JsCell` is `#[repr(transparent)]`, so the byte offset of the inner
     // `EventLoopTimer` is identical and the dispatch.rs `owner!` macro works
@@ -1673,7 +1673,7 @@ impl CronJob {
 
     #[bun_jsc::host_fn(method)]
     pub(crate) fn stop(&self, _global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
-        Self::self_stop(self.self_ref.get().this_ptr(), self.global.bun_vm());
+        Self::self_stop(self.self_ref.this_ptr(), self.global.bun_vm());
         Ok(frame.this())
     }
 
@@ -1727,9 +1727,9 @@ impl CronJob {
 
         let vm = global.bun_vm().as_mut();
 
-        let job = RefPtr::new(CronJob {
+        let job = RefPtr::new_cyclic(|self_ref| CronJob {
             ref_count: Cell::new(1),
-            self_ref: Cell::new(BackRef::dangling()),
+            self_ref,
             event_loop_timer: JsCell::new(EventLoopTimer::init_paused(EventLoopTimerTag::CronJob)),
             global: GlobalRef::from(global),
             parsed,
@@ -1741,7 +1741,6 @@ impl CronJob {
             pending_ref: JsCell::new(None),
             in_fire: Cell::new(false),
         });
-        job.self_ref.set(BackRef::from(job.this_ptr()));
 
         let Some(next_time) = job.compute_next_timespec() else {
             job.deref();

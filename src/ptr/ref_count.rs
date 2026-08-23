@@ -789,6 +789,23 @@ impl<T: AnyRefCounted> RefPtr<T> {
         unsafe { Self::adopt_ref(bun_core::heap::into_raw(Box::new(init_data))) }
     }
 
+    /// [`new`](Self::new) for a `T` that stores its own root back-reference
+    /// (to hand out [`ThisPtr`](crate::ThisPtr)s from `&self` entry points):
+    /// `init` receives that back-reference before the value exists and must
+    /// only store it — the pointee is uninitialized until `init` returns.
+    pub fn new_cyclic(init: impl FnOnce(crate::BackRef<T, crate::Root>) -> T) -> Self {
+        let slot = Box::<core::mem::MaybeUninit<T>>::new_uninit();
+        let raw: *mut T = bun_core::heap::into_raw(slot).cast::<T>();
+        // SAFETY: `raw` is the allocation's root pointer; `init` may only store
+        // the back-reference (documented), and it becomes valid below.
+        let this = unsafe { crate::BackRef::from_root(raw) };
+        let value = init(this);
+        // SAFETY: `raw` is a live, uninitialized, properly aligned `T` slot.
+        unsafe { raw.write(value) };
+        // SAFETY: freshly written, ref_count == 1 (from `T`'s initializer).
+        unsafe { Self::adopt_ref(raw) }
+    }
+
     /// Initialize a newly allocated pointer, returning a RefPtr to it.
     /// Care must be taken when using non-default allocators.
     ///
