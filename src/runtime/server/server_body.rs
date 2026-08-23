@@ -1112,10 +1112,11 @@ impl ServePlugins {
             route.deref();
         }
         if let Some(server) = dev_server {
-            if let Some(r) =
-                server.with_dev_server_mut(|dev| dev.on_plugins_resolved(Some(plugin.as_ptr())))
-            {
-                bun_core::handle_oom(r);
+            if let Some(dev) = server.dev_server_cell() {
+                bun_core::handle_oom(crate::bake::DevServer::DevServer::on_plugins_resolved(
+                    &dev,
+                    Some(plugin.as_ptr()),
+                ));
             }
         }
     }
@@ -1140,8 +1141,8 @@ impl ServePlugins {
             route.deref();
         }
         if let Some(server) = dev_server {
-            if let Some(r) = server.with_dev_server_mut(|dev| dev.on_plugins_rejected()) {
-                bun_core::handle_oom(r);
+            if let Some(requests) = server.with_dev_server_mut(|dev| dev.on_plugins_rejected()) {
+                crate::bake::DevServer::DevServer::abort_deferred_requests(requests);
             }
         }
 
