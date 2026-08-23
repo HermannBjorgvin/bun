@@ -354,7 +354,7 @@ pub use self::uuid::{UUID, UUID5, UUID7};
 pub use self::js_function::JSFunction;
 pub use self::js_module_loader::JSModuleLoader;
 pub use self::strong::{Optional as StrongOptional, Strong};
-pub use self::weak::{Weak, WeakRefType};
+pub use self::weak::{Weak, WeakOwner, WeakRefType};
 
 pub use self::exception::Exception;
 pub use self::js_type::JSType;
@@ -765,7 +765,9 @@ pub use self::dom_form_data::DOMFormData;
 pub use self::url::URL;
 pub use self::zig_stack_frame::ZigStackFrame;
 pub use self::zig_stack_trace::ZigStackTrace;
-pub use abort_signal::{AbortSignal, AbortSignalRef};
+pub use abort_signal::{
+    AbortListenerRegistration, AbortSignal, AbortSignalRef, NativeAbortListener,
+};
 
 // `VM` / `JSGlobalObject` — opaque FFI handles to C++-owned objects. Defined
 // once in their dedicated port files (`VM.rs` / `JSGlobalObject.rs`) and
@@ -883,7 +885,7 @@ pub use self::resolved_source_tag::ResolvedSourceTag;
 // ──────────────────────────────────────────────────────────────────────────
 #[path = "FetchHeaders.rs"]
 pub mod fetch_headers;
-pub use self::fetch_headers::{FetchHeaders, HTTPHeaderName};
+pub use self::fetch_headers::{FetchHeaders, HTTPHeaderName, HeadersRef};
 
 /// `BuiltinName` — fast-path property keys preallocated as `JSC::Identifier`s
 /// in C++ (`BunBuiltinNames.h`). Passed to `JSValue::fast_get` as a `u8` index

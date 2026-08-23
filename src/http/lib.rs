@@ -63,7 +63,7 @@ pub use internal_state::InternalState;
 pub use proxy_tunnel::ProxyTunnel;
 pub use send_file::SendFile;
 pub use signals::Signals;
-pub use thread_safe_stream_buffer::ThreadSafeStreamBuffer;
+pub use thread_safe_stream_buffer::{DrainHandler, ThreadSafeStreamBuffer};
 #[path = "ssl_config.rs"]
 pub mod ssl_config;
 pub use ssl_config::SSLConfig;
@@ -170,6 +170,7 @@ pub use bun_http_types::{ETag, MimeType};
 use bun_core::MutableString;
 use bun_http_types::FetchRedirect::CommonAbortReason;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq, Default)]
@@ -532,6 +533,26 @@ impl<'a> HTTPClientResult<'a> {
         }
     }
 
+    /// The result without its borrowed `body` view (the bytes, if any, are in
+    /// `body_owned` on the terminal callback), for keeping past the callback.
+    #[inline]
+    pub fn into_owned(self) -> HTTPClientResult<'static> {
+        HTTPClientResult {
+            body: &[],
+            body_owned: self.body_owned,
+            has_more: self.has_more,
+            redirected: self.redirected,
+            can_stream: self.can_stream,
+            is_http2: self.is_http2,
+            fail: self.fail,
+            dns_error: self.dns_error,
+            dns_hostname: self.dns_hostname,
+            metadata: self.metadata,
+            body_size: self.body_size,
+            certificate_info: self.certificate_info,
+        }
+    }
+
     /// Widen the borrow to `'static` for self-referential storage.
     ///
     /// `body` is the only lifetime-carrying field; it borrows the HTTP
@@ -574,6 +595,7 @@ pub struct HTTPClientResultCallback {
     /// allocator); the JS thread is parked in `shutdown_for_exit` waiting
     /// for the ack. `None` ⇒ no-op (the default for callers whose `ctx`
     /// is process-lifetime or whose code path never reaches `global_exit`).
+    /// Set by `new_with_release` and `from_handler`.
     pub(crate) release_at_shutdown: Option<unsafe fn(*mut ())>,
 }
 
@@ -609,6 +631,164 @@ impl HTTPClientResultCallback {
         let mut cb = Self::new(this, callback);
         cb.release_at_shutdown = Some(release);
         cb
+    }
+}
+
+/// The receiving end of a request started through
+/// [`HTTPClientResultCallback::from_handler`], called on the HTTP thread.
+pub trait HTTPClientResultHandler: Send + Sync + 'static {
+    /// A progress (`result.has_more`) or terminal result. By the terminal one
+    /// the request has already been handed back, so nothing of it is passed.
+    fn on_result(&self, result: HTTPClientResult<'_>);
+    /// The process is exiting with the request still out: nothing more will be
+    /// delivered. HTTP thread; the JS thread is parked.
+    fn release_at_shutdown(&self) {}
+}
+
+impl HTTPClientResultCallback {
+    /// Deliver results to `handler`, which the request holds until its terminal
+    /// result (or shutdown release) has been delivered.
+    pub fn from_handler<H: HTTPClientResultHandler>(handler: Arc<H>) -> Self {
+        fn on_result<H: HTTPClientResultHandler>(
+            ctx: *mut (),
+            async_http: *mut AsyncHTTP<'static>,
+            result: HTTPClientResult<'_>,
+        ) {
+            let _ = async_http;
+            let terminal = !result.has_more;
+            // SAFETY: `ctx` is the `Arc<H>` `from_handler` leaked, released only
+            // below / in `release`.
+            unsafe { (*ctx.cast_const().cast::<H>()).on_result(result) };
+            if terminal {
+                // SAFETY: the terminal result is delivered once; this is that ref.
+                drop(unsafe { Arc::from_raw(ctx.cast_const().cast::<H>()) });
+            }
+        }
+        unsafe fn release<H: HTTPClientResultHandler>(ctx: *mut ()) {
+            // SAFETY: as in `on_result`; no result follows a shutdown release.
+            let handler = unsafe { Arc::from_raw(ctx.cast_const().cast::<H>()) };
+            handler.release_at_shutdown();
+        }
+        Self {
+            ctx: Arc::into_raw(handler).cast_mut().cast::<()>(),
+            function: on_result::<H>,
+            release_at_shutdown: Some(release::<H>),
+        }
+    }
+}
+
+/// An [`AsyncHTTP`] together with the storage its request borrows (URL, header
+/// buffer, body bytes, hostname, ...) point into.
+pub struct OwnedRequest<S: 'static> {
+    /// Borrows `*storage`: declared first so it is dropped first.
+    http: AsyncHTTP<'static>,
+    storage: Box<S>,
+}
+
+impl<S: 'static> OwnedRequest<S> {
+    /// Build the request from borrows of `storage`.
+    pub fn new(storage: S, build: impl for<'a> FnOnce(&'a S) -> AsyncHTTP<'a>) -> Box<Self> {
+        let storage = Box::new(storage);
+        let http = build(&storage);
+        // SAFETY: `http` borrows only `*storage`, which is heap-pinned, never lent
+        // out `&mut`, and outlives `http` (field order); every accessor re-ties
+        // the lifetime to a borrow of `self`.
+        let http = unsafe { core::mem::transmute::<AsyncHTTP<'_>, AsyncHTTP<'static>>(http) };
+        Box::new(Self { http, storage })
+    }
+
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    /// Drop the request and take the storage back.
+    pub fn into_storage(self) -> S {
+        let OwnedRequest { http, storage } = self;
+        drop(http);
+        *storage
+    }
+
+    pub fn http(&self) -> &AsyncHTTP<'_> {
+        &self.http
+    }
+
+    /// Adjust the request before it is started.
+    pub fn with_http_mut<R>(&mut self, f: impl for<'a> FnOnce(&mut AsyncHTTP<'a>) -> R) -> R {
+        // SAFETY: `'a` is fresh for `f` and outlives the `&mut`, so `f` can
+        // store into the request only `'static` data or what it already
+        // borrows (`*self.storage`); see `new`.
+        f(unsafe {
+            core::mem::transmute::<&mut AsyncHTTP<'static>, &mut AsyncHTTP<'_>>(&mut self.http)
+        })
+    }
+
+    /// Queue the request on `batch` for the HTTP thread. The request stays
+    /// allocated, untouched by this thread, until the HTTP thread hands it back.
+    pub fn start(self: Box<Self>, batch: &mut bun_threading::thread_pool::Batch) -> InFlight<S> {
+        let id = self.http.async_http_id;
+        let ptr = NonNull::from(Box::leak(self));
+        // SAFETY: `ptr` is the live allocation just leaked; the HTTP thread takes
+        // it over from `schedule` until it sets `handed_back`.
+        unsafe { (*ptr.as_ptr()).http.schedule(batch) };
+        InFlight { ptr, id }
+    }
+}
+
+/// The caller's handle on a started [`OwnedRequest`]: its id for the
+/// `HTTPThread::schedule_*` calls, and the way to take it back once the HTTP
+/// thread is done with it. Dropping it before then leaks the request.
+pub struct InFlight<S: 'static> {
+    ptr: NonNull<OwnedRequest<S>>,
+    id: u32,
+}
+
+impl<S: 'static> InFlight<S> {
+    pub fn async_http_id(&self) -> u32 {
+        self.id
+    }
+
+    /// Whether the HTTP thread has handed the request back (its terminal result
+    /// or shutdown release was delivered).
+    pub fn handed_back(&self) -> bool {
+        // SAFETY: the allocation is live until `reclaim`/`drop`; `handed_back`
+        // is atomic and the HTTP thread only ever reads the bytes around it.
+        unsafe {
+            (*self.ptr.as_ptr())
+                .http
+                .handed_back
+                .load(Ordering::Acquire)
+        }
+    }
+
+    /// The request's storage. The HTTP thread is reading the bytes `http`
+    /// borrowed from it: `S` must not free or reallocate those through `&S`.
+    pub fn storage(&self) -> &S {
+        // SAFETY: live until `reclaim`/`drop`; never written while in flight.
+        unsafe { &(*self.ptr.as_ptr()).storage }
+    }
+
+    /// Take the request back; `Err(self)` while the HTTP thread still has it.
+    pub fn reclaim(self) -> Result<Box<OwnedRequest<S>>, Self> {
+        if !self.handed_back() {
+            return Err(self);
+        }
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `start` leaked exactly this box, and the HTTP thread is done with it.
+        Ok(unsafe { Box::from_raw(this.ptr.as_ptr()) })
+    }
+}
+
+impl<S: 'static> Drop for InFlight<S> {
+    fn drop(&mut self) {
+        if self.handed_back() {
+            // SAFETY: as in `reclaim`.
+            drop(unsafe { Box::from_raw(self.ptr.as_ptr()) });
+        } else {
+            debug_assert!(
+                false,
+                "InFlight request dropped before the HTTP thread handed it back"
+            );
+        }
     }
 }
 
@@ -2605,12 +2785,11 @@ impl<'a> HTTPClient<'a> {
 
         // Decided before unix_socket_path is forgotten below: a unix-socket connection must not be pooled.
         let keep_alive_possible = self.is_keep_alive_possible();
-        // There is no struct copy-back
-        // (`sync_progress_from` skips owned fields) and the original retains
-        // its own `Owned(Vec)` aliasing the same allocation (the HTTP-thread
-        // clone was created via `ptr::read`). Dropping it here would
-        // double-free when the original later runs `clear_data()`. Forget the
-        // clone's view; the original is the sole owner.
+        // There is no struct copy-back and the original retains its own
+        // `Owned(Vec)` aliasing the same allocation (the HTTP-thread clone was
+        // created via `ptr::read`). Dropping it here would double-free when
+        // the original is later dropped. Forget the clone's view; the original
+        // is the sole owner.
         let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut self.unix_socket_path));
         // TODO: what we do with stream body?
         let request_body: &[u8] = if self.state.flags.resend_request_body_on_redirect

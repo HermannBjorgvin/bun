@@ -925,21 +925,28 @@ impl HttpThread {
     }
 
     pub fn schedule_cert_check_resume(&mut self, http: &AsyncHttp) {
-        bun_core::scoped_log!(HTTPThread, "scheduleCertCheckResume {}", http.async_http_id);
+        self.schedule_cert_check_resume_by_id(http.async_http_id);
+    }
+
+    pub fn schedule_cert_check_resume_by_id(&mut self, async_http_id: u32) {
+        bun_core::scoped_log!(HTTPThread, "scheduleCertCheckResume {}", async_http_id);
         {
             let _guard = self.queued_cert_check_resumes_lock.lock_guard();
-            self.queued_cert_check_resumes.push(CertCheckResumeMessage {
-                async_http_id: http.async_http_id,
-            });
+            self.queued_cert_check_resumes
+                .push(CertCheckResumeMessage { async_http_id });
         }
         self.wakeup();
     }
 
     pub fn schedule_request_write(&mut self, http: &AsyncHttp, kind: WriteMessageType) {
+        self.schedule_request_write_by_id(http.async_http_id, kind);
+    }
+
+    pub fn schedule_request_write_by_id(&mut self, async_http_id: u32, kind: WriteMessageType) {
         {
             let _guard = self.queued_writes_lock.lock_guard();
             self.queued_writes.push(WriteMessage {
-                async_http_id: http.async_http_id,
+                async_http_id,
                 kind,
             });
         }
@@ -978,7 +985,10 @@ impl HttpThread {
         let release_unstarted = |http: NonNull<AsyncHttp<'static>>| {
             // SAFETY: heap-owned by the caller, alive until its completion,
             // and never touched by us again after this.
-            let release = unsafe { (*http.as_ptr()).result_callback };
+            let release = unsafe {
+                (*http.as_ptr()).handed_back.store(true, Ordering::Release);
+                (*http.as_ptr()).result_callback
+            };
             if let Some(f) = release.release_at_shutdown {
                 // SAFETY: paired ctx/fn from `HTTPClientResultCallback::new_with_release`.
                 unsafe { f(release.ctx) };
@@ -1018,6 +1028,9 @@ impl HttpThread {
                     ctx.deref();
                 }
                 drop(core::mem::take(&mut client.state));
+                if let Some(real) = (*nn.as_ptr()).async_http.real {
+                    (*real.as_ptr()).handed_back.store(true, Ordering::Release);
+                }
                 if let Some(f) = release.release_at_shutdown {
                     f(release.ctx);
                 }

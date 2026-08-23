@@ -189,6 +189,14 @@ pub(crate) fn run_task(
             task.ptr.cast::<$ty>()
         };
     }
+    /// `ThisPtr<T>` for entry points that may free the pointee.
+    macro_rules! cast_this {
+        ($ty:ty) => {{
+            // SAFETY: §Dispatch — as `cast!`; the pointee keeps itself alive
+            // for the queued task and is not touched here after the call.
+            unsafe { bun_ptr::ThisPtr::new(cast_ptr!($ty)) }
+        }};
+    }
     /// `CompressionStream::<T>::run_from_js_thread` takes `*mut T` (full
     /// allocation provenance — R-2) so its trailing `T::deref()` may free the box.
     macro_rules! compression_arm {
@@ -243,15 +251,6 @@ pub(crate) fn run_task(
             crate::api::js_bundle_completion_task::JSBundleCompletionTask::on_complete_anytask(
                 cast_ptr!(crate::api::js_bundle_completion_task::JSBundleCompletionTask),
             )?;
-        }
-        task_tag::FetchTaskletPromiseSettle => {
-            // SAFETY: boxed at the fetch completion site; the arm consumes it.
-            let holder = unsafe {
-                bun_core::heap::take(cast_ptr!(
-                    crate::webcore::fetch::fetch_tasklet::FetchTaskletPromiseSettle
-                ))
-            };
-            holder.run()?;
         }
         task_tag::DuplexUpgradeContext => {
             // SAFETY: tag identifies pointee; the queue owns the live context
@@ -333,16 +332,16 @@ pub(crate) fn run_task(
         | task_tag::ShellYesTask => run_task_cold(task),
 
         // ── fetch / S3 ───────────────────────────────────────────────────
+        // The three fetch hops carry the tasklet, which keeps itself alive for
+        // them (`progress_ref` / `http_ref`); each may free it.
         task_tag::FetchTasklet => {
-            cast!(FetchTasklet).on_progress_update()?;
+            FetchTasklet::on_progress_update(cast_this!(FetchTasklet))?;
         }
-        task_tag::FetchTaskletDeinit => {
-            // SAFETY: posted by `deref_from_thread` with the last ref.
-            unsafe {
-                crate::webcore::fetch::FetchTaskletDeinitHop::run(cast_ptr!(
-                    crate::webcore::fetch::FetchTaskletDeinitHop
-                ))
-            };
+        task_tag::FetchTaskletHandBack => {
+            FetchTasklet::on_http_handed_back(cast_this!(FetchTasklet));
+        }
+        task_tag::FetchTaskletRequestDataDrain => {
+            FetchTasklet::resume_request_data_stream(cast_this!(FetchTasklet));
         }
         // `cast_ptr!` yields the heap-allocated S3 task; JS-thread dispatch
         // is the sole owner here.
@@ -1219,6 +1218,13 @@ fn __bun_release_task_unrun(task: bun_event_loop::Task) {
             unsafe { <$ty as Taskable>::release_unrun(task.ptr.cast::<$ty>()) }
         }};
     }
+    /// `ThisPtr<T>` to the queued pointee, for typed release entry points.
+    macro_rules! this {
+        ($ty:ty) => {{
+            // SAFETY: as `release!`.
+            unsafe { bun_ptr::ThisPtr::new(task.ptr.cast::<$ty>()) }
+        }};
+    }
     match task.tag {
         task_tag::AnyTaskJob => {
             // The one erased tag: every payload is a `Job<C>` reached through its header.
@@ -1235,11 +1241,10 @@ fn __bun_release_task_unrun(task: bun_event_loop::Task) {
         task_tag::ShellYesTask => release!(ShellYesTask),
         task_tag::CppTask => release!(CppTask),
         task_tag::DuplexUpgradeContext => release!(crate::socket::DuplexUpgradeContext),
-        task_tag::FetchTasklet => release!(FetchTasklet),
-        task_tag::FetchTaskletDeinit => release!(crate::webcore::fetch::FetchTaskletDeinitHop),
-        task_tag::FetchTaskletPromiseSettle => {
-            release!(crate::webcore::fetch::fetch_tasklet::FetchTaskletPromiseSettle)
-        }
+        task_tag::FetchTasklet => FetchTasklet::release_progress_update_unrun(this!(FetchTasklet)),
+        task_tag::FetchTaskletHandBack => FetchTasklet::on_http_handed_back(this!(FetchTasklet)),
+        // Nothing held: the tasklet outlives this hop through `http_ref`.
+        task_tag::FetchTaskletRequestDataDrain => {}
         task_tag::FSWatchTask => release!(FSWatchTask),
         task_tag::HotReloadTask => release!(hot_reloader::HotReloadTask),
         task_tag::WatchReloadTask => release!(hot_reloader::WatchReloadTask),

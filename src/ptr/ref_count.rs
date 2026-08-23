@@ -665,6 +665,20 @@ pub fn destroy_box_with<T>(this: *mut T, before: impl FnOnce(&T)) {
     }
 }
 
+/// [`destroy_box_with`] for teardown that needs `&mut T` (the refcount hit
+/// zero, so the destroy path is the pointee's sole owner).
+#[inline]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn destroy_box_with_mut<T>(this: *mut T, before: impl FnOnce(&mut T)) {
+    debug_assert!(!this.is_null());
+    // SAFETY: `CellRefCounted::destroy` contract — `this` is the sole live
+    // owner of a `Box`-allocated `T`, so the exclusive borrow aliases nothing.
+    unsafe {
+        before(&mut *this);
+        drop(Box::from_raw(this));
+    }
+}
+
 /// No-op [`DebugDataOps`] for [`CellRefCounted`] types — they carry no
 /// `DebugData` field, so [`RefPtr`]'s acquire/release tracking degrades to
 /// a stub.

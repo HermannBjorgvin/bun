@@ -1426,7 +1426,6 @@ impl BlobExt for Blob {
                 proxy_url,
                 aws_options.request_payer,
                 None,
-                core::ptr::null_mut(),
             );
         }
 
@@ -4749,7 +4748,6 @@ pub(crate) fn write_file_with_source_destination(
                             proxy_url,
                             aws_options.request_payer,
                             None,
-                            core::ptr::null_mut(),
                         );
                     } else {
                         return Ok(JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
@@ -4849,7 +4847,6 @@ pub(crate) fn write_file_with_source_destination(
                         proxy_url,
                         aws_options.request_payer,
                         None,
-                        core::ptr::null_mut(),
                     );
                 } else {
                     return Ok(
@@ -5119,7 +5116,6 @@ pub(crate) fn write_file_internal(
                                 proxy_url,
                                 aws_options.request_payer,
                                 None,
-                                core::ptr::null_mut(),
                             )?));
                         }
                         destination_blob.detach();
@@ -5143,6 +5139,7 @@ pub(crate) fn write_file_internal(
                         unreachable!()
                     };
                     let producer_hook = locked.on_start_buffering.take().zip(locked.task);
+                    let producer = locked.producer;
                     locked.task = Some(NonNull::new(task).unwrap().cast::<c_void>());
                     locked.on_receive_value = Some(WriteFileWaitFromLockedValueTask::then_wrap);
                     // SAFETY: `task` was just heap-allocated; consumed in `then_wrap`.
@@ -5151,6 +5148,8 @@ pub(crate) fn write_file_internal(
                     // `then_wrap` may run and `*body_value` be replaced inside.
                     if let Some((on_start_buffering, producer_task)) = producer_hook {
                         on_start_buffering(producer_task);
+                    } else {
+                        producer.start_buffering();
                     }
                     Ok(ControlFlow::Break(promise))
                 }

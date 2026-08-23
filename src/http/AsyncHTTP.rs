@@ -1,5 +1,5 @@
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bun_ast::{Loc, Log};
 use bun_core::FeatureFlags;
@@ -51,6 +51,11 @@ pub struct AsyncHTTP<'a> {
     pub elapsed: u64,
 
     pub(crate) signals: Signals,
+
+    /// Set (release) by the HTTP thread on the caller's original right before
+    /// the terminal result callback / `release_at_shutdown`: from then on the
+    /// HTTP thread never touches the original again ([`crate::InFlight::reclaim`]).
+    pub(crate) handed_back: AtomicBool,
 }
 
 bun_threading::intrusive_work_task!(['a] AsyncHTTP<'a>, task);
@@ -81,22 +86,6 @@ const fn noop_callback() -> HTTPClientResultCallback {
         ctx: core::ptr::null_mut(),
         function: noop_result_callback,
         release_at_shutdown: None,
-    }
-}
-
-/// Free a `URL.href` slice that the caller marked as owned.
-///
-/// # Safety
-/// `href` must have been allocated via the global allocator as a `Box<[u8]>`
-/// and ownership ceded to this module via `is_url_owned = true`.
-#[inline]
-unsafe fn free_owned_href(href: &'static [u8]) {
-    if !href.is_empty() {
-        // SAFETY: caller guarantees `href` is the sole reference to a
-        // global-allocator `Box<[u8]>` allocation. The fat `*mut [u8]` is
-        // obtained directly from the borrowed slice — no need to round-trip
-        // through `(ptr, len)` + `from_raw_parts`.
-        unsafe { bun_core::heap::destroy(core::ptr::from_ref(href).cast_mut()) };
     }
 }
 
@@ -296,23 +285,6 @@ impl<'a> AsyncHTTP<'a> {
         );
     }
 
-    /// Copy HTTP-thread progress state into the JS-thread "real" instance.
-    ///
-    /// Copy exactly the fields the JS side observes between progress
-    /// callbacks: the post-redirect `url`, response/timing fields written by
-    /// `on_async_http_callback`, and the `client` flags/counters used for
-    /// shutdown decisions and error formatting. Owned allocations stay with
-    /// `src` (the HTTP-thread copy keeps running while `has_more`).
-    pub fn sync_progress_from(&mut self, src: &AsyncHTTP<'a>) {
-        self.url = src.url.clone();
-        self.elapsed = src.elapsed;
-        self.err = src.err;
-        self.response = src.response;
-        self.client.url = src.client.url.clone();
-        self.client.flags = src.client.flags;
-        self.client.remaining_redirect_count = src.client.remaining_redirect_count;
-    }
-
     pub fn clear_data(&mut self) {
         self.response = None;
         // Note: `ZigStringSlice` Drop releases WTF/owned variants;
@@ -330,7 +302,8 @@ struct Preconnect {
     // (late-init); `None` is never observed after `preconnect()` populates it.
     async_http: Option<AsyncHTTP<'static>>,
     url: URL<'static>,
-    is_url_owned: bool,
+    /// The href `url` borrows when the caller handed it over (`preconnect_owned`).
+    _owned_href: Option<Box<[u8]>>,
 }
 
 impl Preconnect {
@@ -343,25 +316,34 @@ impl Preconnect {
                 .as_mut()
                 .expect("Preconnect.async_http set in preconnect()")
                 .clear_data();
-            if (*this).is_url_owned {
-                // SAFETY: `is_url_owned` is the caller's promise that `url.href`
-                // is a global-allocator `Box<[u8]>` we now own.
-                free_owned_href((*this).url.href);
-            }
             // Reclaim and drop the heap allocation (runs Drop on `async_http`
-            // — which in turn drops `HTTPClient`).
+            // — which in turn drops `HTTPClient` — before `_owned_href`).
             drop(bun_core::heap::take(this));
         }
     }
 }
 
+/// [`preconnect`] for an href the request owns from here on.
+pub fn preconnect_owned(href: Box<[u8]>) {
+    // SAFETY: `href`'s heap bytes move into the same `Preconnect` as the `URL`
+    // that borrows them and are freed after it (field order in `on_result`).
+    let url = URL::parse(unsafe { bun_ptr::detach_lifetime(&href) });
+    preconnect_impl(url, Some(href));
+}
+
 pub fn preconnect(url: URL<'static>, is_url_owned: bool) {
+    let owned_href = if is_url_owned {
+        // SAFETY: `is_url_owned` is the caller's promise that `url.href` is a
+        // global-allocator `Box<[u8]>` we now own.
+        Some(unsafe { Box::from_raw(core::ptr::from_ref(url.href).cast_mut()) })
+    } else {
+        None
+    };
+    preconnect_impl(url, owned_href);
+}
+
+fn preconnect_impl(url: URL<'static>, owned_href: Option<Box<[u8]>>) {
     if !FeatureFlags::IS_FETCH_PRECONNECT_SUPPORTED {
-        if is_url_owned {
-            // SAFETY: `is_url_owned` is the caller's promise that `url.href` is a
-            // global-allocator `Box<[u8]>` we now own.
-            unsafe { free_owned_href(url.href) };
-        }
         return;
     }
 
@@ -376,7 +358,7 @@ pub fn preconnect(url: URL<'static>, is_url_owned: bool) {
     let this: *mut Preconnect = bun_core::heap::into_raw(Box::new(Preconnect {
         async_http: None,
         url,
-        is_url_owned,
+        _owned_href: owned_href,
     }));
 
     // SAFETY: `this` is a freshly Box-allocated, uniquely-owned pointer; we
@@ -461,6 +443,7 @@ impl<'a> AsyncHTTP<'a> {
             async_http_id,
             elapsed: 0,
             signals,
+            handed_back: AtomicBool::new(false),
         };
         if let Some(val) = options.unix_socket_path {
             debug_assert!(this.client.unix_socket_path.slice().is_empty());
@@ -771,6 +754,9 @@ impl<'a> AsyncHTTP<'a> {
                 }
                 let elapsed = (*this).elapsed;
                 bun_core::scoped_log!(AsyncHTTP, "onAsyncHTTPCallback: {:?}", elapsed);
+                if let Some(real) = (*this).real {
+                    (*real.as_ptr()).handed_back.store(true, Ordering::Release);
+                }
                 callback.run(async_http, result);
 
                 // SAFETY: `async_http` is the `async_http` field of a

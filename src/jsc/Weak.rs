@@ -76,6 +76,27 @@ unsafe extern "C" {
     safe fn Bun__WeakRef__clear(this: &WeakImpl);
 }
 
+/// The owner type a [`WeakRefType`]'s C++ finalize callback is handed
+/// (`Bun__WeakRef__new`'s `ctx`). Implemented through [`weak_owner!`], next to
+/// the exported callback that receives the owner.
+///
+/// # Safety
+/// `REF_TYPE`'s finalize callback must take a pointer to `Self`.
+pub unsafe trait WeakOwner {
+    const REF_TYPE: WeakRefType;
+}
+
+/// `weak_owner!(Owner, Variant)`: `Owner` is what `WeakRefType::Variant`'s
+/// finalize callback receives.
+#[macro_export]
+macro_rules! weak_owner {
+    ($owner:ty, $variant:ident) => {
+        unsafe impl $crate::weak::WeakOwner for $owner {
+            const REF_TYPE: $crate::weak::WeakRefType = $crate::weak::WeakRefType::$variant;
+        }
+    };
+}
+
 pub struct Weak<T> {
     r#ref: Option<NonNull<WeakImpl>>,
     _ctx: PhantomData<*mut T>,
@@ -116,6 +137,35 @@ impl<T> Weak<T> {
                     value,
                     ref_type,
                     Some(NonNull::from(ctx).cast::<c_void>()),
+                )),
+                _ctx: PhantomData,
+            };
+        }
+
+        Self {
+            r#ref: None,
+            _ctx: PhantomData,
+        }
+    }
+
+    /// [`create`](Self::create) for an owner reached through a back-reference:
+    /// the owner keeps the returned handle (dropping it clears the finalize
+    /// callback) for as long as it lives at that address.
+    pub fn create_for(
+        value: JSValue,
+        global_this: &JSGlobalObject,
+        owner: bun_ptr::BackRef<T>,
+    ) -> Self
+    where
+        T: WeakOwner,
+    {
+        if !value.is_empty() {
+            return Self {
+                r#ref: Some(WeakImpl::init(
+                    global_this,
+                    value,
+                    T::REF_TYPE,
+                    Some(NonNull::from(owner).cast::<c_void>()),
                 )),
                 _ctx: PhantomData,
             };

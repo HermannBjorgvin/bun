@@ -72,9 +72,9 @@ pub mod task_tag {
         Close,
         CppTask,
         DuplexUpgradeContext,
-        FetchTasklet,
-        FetchTaskletDeinit,
-        FetchTaskletPromiseSettle,
+        FetchTasklet,             // progress update (bun_runtime FetchTasklet)
+        FetchTaskletHandBack,     // the HTTP thread is done with the fetch
+        FetchTaskletRequestDataDrain, // the streaming request body buffer drained
         FSWatchTask,
         GetAddrInfoLibuvComplete,
         HotReloadTask,
@@ -131,6 +131,13 @@ pub struct Task {
     pub tag: TaskTag,
     pub ptr: *mut (),
 }
+
+// SAFETY: a `Task` is an inert (tag, address) pair built to cross threads in a
+// `ConcurrentTask`; nothing here dereferences `ptr` — only the owning thread's
+// dispatcher does, under its own contract.
+unsafe impl Send for Task {}
+// SAFETY: as above — `&Task` exposes two `Copy` scalars.
+unsafe impl Sync for Task {}
 
 /// What it takes to be queued as a [`Task`]: a tag, and how the task is
 /// freed when it will never run. Implement on every type that can be
