@@ -53,6 +53,11 @@ where
         .node_fs
         .with_mut(|nfs| NodeFS::dispatch::<R, A, F>(nfs, &args, Flavor::Sync));
     match result {
+        // The VM was asked to stop while the call ran (a parent's
+        // `terminate()`): a read-until-EOF loop gives up for it, and no
+        // other errno is the script's business either. Unwind with the
+        // termination, as the trap would at the next safepoint.
+        Err(_) if !vm.script_allowed() => Err(bun_jsc::Stopped.throw(global)),
         Err(ref err) => Err(global.throw_value(err.to_js(global))),
         Ok(ref mut res) => res.fs_to_js(global),
     }
@@ -406,7 +411,10 @@ pub(crate) fn create_binding(global: &JSGlobalObject) -> JSValue {
     let vm = global.bun_vm_ptr();
     // R-2: init-time write before the JS wrapper exists; `with_mut` here is
     // trivially un-aliased (sole owner of the fresh `Box`).
-    module.node_fs.with_mut(|nfs| nfs.vm = NonNull::new(vm));
+    module.node_fs.with_mut(|nfs| {
+        nfs.vm = NonNull::new(vm);
+        nfs.vm_handle = Some(global.bun_vm().handle());
+    });
 
     // `module` was `Box::new`-allocated; ownership transfers to the GC
     // wrapper, which calls `Binding::finalize` to reclaim it.
