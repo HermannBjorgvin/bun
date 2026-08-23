@@ -311,6 +311,13 @@ impl<'a> ArgumentsSlice<'a> {
         self.eat();
         Some(v)
     }
+
+    /// Consume the slice without unprotecting what `protect_eat` protected:
+    /// something else (a `ThreadSafe` argument set) now owns that protection
+    /// and will release it.
+    pub fn hand_off_protection(mut self) {
+        self.protected = IntegerBitSet::<32>::init_empty();
+    }
 }
 
 impl<'a> Drop for ArgumentsSlice<'a> {
