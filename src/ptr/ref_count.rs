@@ -748,7 +748,7 @@ impl<T: AnyRefCounted> RefPtr<T> {
         // SAFETY: caller contract
         unsafe { T::rc_ref(raw_ptr) };
         // SAFETY: caller contract
-        unsafe { Self::unchecked_and_unsafe_init(raw_ptr, return_address()) }
+        unsafe { Self::unchecked_and_unsafe_init(raw_ptr, caller_address()) }
     }
 
     // NOTE: would be nice to use a const for deref dispatch, but keep two
@@ -803,7 +803,7 @@ impl<T: AnyRefCounted> RefPtr<T> {
             unsafe { (*T::rc_debug_data(raw_ptr)).assert_valid_dyn() };
         }
         // SAFETY: caller contract
-        unsafe { Self::unchecked_and_unsafe_init(raw_ptr, return_address()) }
+        unsafe { Self::unchecked_and_unsafe_init(raw_ptr, caller_address()) }
     }
 
     /// A [`ThisPtr`](crate::ThisPtr) to the pointee, for the FFI-shaped call
@@ -905,7 +905,7 @@ impl<T: AnyRefCounted> RefPtr<T> {
             unsafe { (*T::rc_debug_data(raw_ptr)).assert_valid_dyn() };
         }
         // SAFETY: caller contract
-        unsafe { Self::unchecked_and_unsafe_init(raw_ptr, return_address()) }
+        unsafe { Self::unchecked_and_unsafe_init(raw_ptr, caller_address()) }
     }
 
     /// Extract the raw pointer, giving up ownership WITHOUT decrementing
@@ -1146,6 +1146,19 @@ impl<Count> DebugDataOps for DebugData<Count> {
 #[inline(always)]
 fn return_address() -> usize {
     bun_core::return_address()
+}
+
+/// [`return_address`] for the debug ref tracker; free in release builds.
+#[inline(always)]
+fn caller_address() -> usize {
+    #[cfg(debug_assertions)]
+    {
+        return_address()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        0
+    }
 }
 
 // `const unique_symbol = opaque {};` — type-identity marker for
