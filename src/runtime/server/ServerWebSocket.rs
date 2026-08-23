@@ -4,8 +4,8 @@ use core::mem;
 use core::ptr::NonNull;
 
 use bun_jsc::{ComptimeStringMapExt as _, JsCell};
-use bun_uws::{self as uws, AnyWebSocket, WebSocketBehavior};
-use bun_uws_sys::web_socket::{WebSocketHandler, WebSocketUpgradeServer, Wrap};
+use bun_uws::{self as uws, AnyWebSocket};
+use bun_uws_sys::web_socket::WebSocketHandler;
 use bun_uws_sys::{Opcode, SendStatus};
 
 use crate::server::WebSocketServerHandler;
@@ -798,15 +798,6 @@ impl ServerWebSocket {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn behavior<ServerType, const SSL: bool>(
-        opts: &WebSocketBehavior,
-    ) -> WebSocketBehavior
-    where
-        ServerType: WebSocketUpgradeServer<SSL>,
-    {
-        Wrap::<ServerType, Self, SSL>::apply(opts)
     }
 
     // No `#[bun_jsc::host_fn]` here — the constructor extern shim is
