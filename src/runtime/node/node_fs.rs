@@ -1374,10 +1374,9 @@ mod _async_tasks {
         /// enqueued once the count reaches zero, so subtasks still running on the
         /// thread pool never dereference a freed parent.
         pub(crate) subtask_count: AtomicUsize,
-        /// BACKREF — `Some` iff `IS_SHELL`. The shell `ShellCpTask` owns and
-        /// outlives this task; `ParentRef` gives a safe `&ShellCpTask` projection
-        /// for `cp_on_copy` and round-trips the `*mut` for `cp_on_finish`.
-        pub(crate) shelltask: Option<bun_ptr::ParentRef<ShellCpTask, bun_ptr::Mut>>,
+        /// `Some` iff `IS_SHELL`: the shell `cp` task this copy reports to
+        /// (`cp_on_copy` per file; handed back through `cp_on_finish`).
+        pub(crate) shelltask: Option<Box<ShellCpTask>>,
     }
 
     bun_threading::intrusive_work_task!([const IS_SHELL: bool] NewAsyncCpTask<IS_SHELL>, task);
@@ -1510,10 +1509,10 @@ mod _async_tasks {
             if !IS_SHELL {
                 return;
             }
-            // When IS_SHELL, `shelltask` is `Some` (ParentRef invariant: owner
-            // outlives this task). Shared borrow only — concurrent subtasks may
-            // call this in parallel; `cp_on_copy` serialises via its internal mutex.
+            // Shared borrow only — concurrent subtasks may call this in
+            // parallel; `cp_on_copy` serialises via its internal mutex.
             self.shelltask
+                .as_deref()
                 .expect("IS_SHELL ⇒ shelltask")
                 .cp_on_copy(src.as_ref(), dest.as_ref());
         }
@@ -1534,7 +1533,7 @@ mod _async_tasks {
                 EventLoopHandle::init(vm.event_loop.cast()),
                 bun_jsc::ConcurrentPoster::Js(vm.ticket()),
                 tracker,
-                core::ptr::null_mut(),
+                None,
             );
             // SAFETY: `schedule_new` returns a Box::leak'd pointer; valid until destroy()
             unsafe { &*task }.promise.value()
@@ -1547,16 +1546,16 @@ mod _async_tasks {
             cp_args: args::Cp,
             evtloop: EventLoopHandle,
             poster: bun_jsc::ConcurrentPoster,
-            shelltask: *mut ShellCpTask,
-        ) -> *mut Self {
+            shelltask: Box<ShellCpTask>,
+        ) {
             Self::schedule_new(
                 JSPromiseStrong::default(),
                 cp_args,
                 evtloop,
                 poster,
                 AsyncTaskTracker { id: 0 },
-                shelltask,
-            )
+                Some(shelltask),
+            );
         }
 
         fn schedule_new(
@@ -1565,7 +1564,7 @@ mod _async_tasks {
             evtloop: EventLoopHandle,
             poster: bun_jsc::ConcurrentPoster,
             tracker: AsyncTaskTracker,
-            shelltask: *mut ShellCpTask,
+            shelltask: Option<Box<ShellCpTask>>,
         ) -> *mut Self {
             let mut task = Box::new(Self {
                 promise,
@@ -1580,9 +1579,7 @@ mod _async_tasks {
                 r#ref: KeepAlive::default(),
                 tracker,
                 subtask_count: AtomicUsize::new(1),
-                // SAFETY: `shelltask` (when non-null) is the live heap-alloc'd `ShellCpTask`
-                // that owns and outlives this task; pointer carries write provenance.
-                shelltask: unsafe { bun_ptr::ParentRef::from_nullable_mut(shelltask) },
+                shelltask,
             });
             if !IS_SHELL {
                 task.r#ref.ref_(event_loop_handle_to_ctx(task.evtloop));
@@ -1681,14 +1678,11 @@ mod _async_tasks {
 
         pub(crate) fn run_from_js_thread(&mut self) -> JsResult<()> {
             if IS_SHELL {
-                // SAFETY: shelltask is set by create_for_shell and outlives this task
                 // Move the result out — `Maybe<ret::Cp>` (= `Maybe<()>`) has a cheap
                 // `Ok(())` placeholder.
                 let result = core::mem::replace(self.result.get_mut(), Ok(()));
-                let shelltask = self.shelltask.expect("IS_SHELL ⇒ shelltask").as_mut_ptr();
-                // SAFETY: shelltask is non-null in the IS_SHELL specialization and
-                // outlives this task; `cp_on_finish` reclaims it.
-                unsafe { ShellCpTask::cp_on_finish(shelltask, result) };
+                let shelltask = self.shelltask.take().expect("IS_SHELL ⇒ shelltask");
+                shelltask.cp_on_finish(result);
                 // SAFETY: self was Box::leak'd in create*(); destroyed exactly once here
                 unsafe { Self::destroy(std::ptr::from_mut::<Self>(self)) };
                 return Ok(());

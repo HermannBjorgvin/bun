@@ -416,53 +416,49 @@ impl ShellCpTask {
         }
     }
 
-    /// Called on the JS thread when the node:fs async cp completes (success or
-    /// first error). Records the error (if any) and finishes this `ShellCpTask`
-    /// in place so the interpreter can drain `verbose_output` / surface it.
-    ///
-    /// # Safety
-    /// `this` is the live task `run_on_pool` released to the
-    /// `ShellAsyncCpTask`; reclaimed here, not touched by the caller after.
-    pub(crate) unsafe fn cp_on_finish(this: *mut ShellCpTask, result: bun_sys::Maybe<()>) {
-        // SAFETY: caller contract — JS thread, from the `ShellAsyncCpTask`'s
-        // completion; `this` is live and ours (the box `run_on_pool` released
-        // to it). The pool side finished (and dropped its poster) when it
-        // handed the copy to that task, so continue in place rather than
-        // bouncing through the concurrent queue again.
-        let mut this = unsafe { bun_core::heap::take(this) };
+    /// Called on the JS thread by the node:fs async cp that owns this task,
+    /// when it completes (success or first error). Records the error (if any)
+    /// and finishes in place so the interpreter can drain `verbose_output` /
+    /// surface it.
+    pub(crate) fn cp_on_finish(mut self: Box<Self>, result: bun_sys::Maybe<()>) {
         if let Err(e) = result {
-            this.err = Some(ShellErr::new_sys(&e));
+            self.err = Some(ShellErr::new_sys(&e));
         }
-        ShellTask::run_from_main_thread::<ShellCpTask>(this);
+        ShellTask::run_from_main_thread::<ShellCpTask>(self);
     }
 
-    /// Pool-side body: run the impl, and on error post back immediately;
-    /// the success path hands the allocation to a `ShellAsyncCpTask`, whose
-    /// completion (`cp_on_finish`) reclaims it.
-    fn run_on_pool(this: Box<ShellCpTask>) {
-        let this = bun_core::heap::into_raw(this);
-        // SAFETY: `this` is the box just released; the worker thread has
-        // exclusive access until it is handed off. Raw because on success the
-        // `ShellAsyncCpTask` it now belongs to may free it from another thread
-        // at once.
-        unsafe {
-            // Moved out first: see above.
-            let poster = (*this)
-                .task
-                .poster
-                .take()
-                .expect("shell cp task on the pool is armed");
-            if let Some(e) = (*this).run_from_thread_pool_impl(&poster) {
-                (*this).err = Some(e);
-                (*this).task.poster = Some(poster);
-                ShellTask::on_finish::<ShellCpTask>(bun_core::heap::take(this));
-            } else {
-                // The copy now belongs to a `ShellAsyncCpTask` (holding its
-                // own poster, completing on the JS thread via `cp_on_finish`);
-                // this task's pool part is over.
-                drop(poster);
-            }
+    /// Pool-side body: resolve the operands, and on error post back
+    /// immediately; the success path hands this task to a `ShellAsyncCpTask`,
+    /// whose completion is [`cp_on_finish`](Self::cp_on_finish).
+    fn run_on_pool(mut this: Box<ShellCpTask>) {
+        if let Some(e) = this.resolve_operands() {
+            this.err = Some(e);
+            return ShellTask::on_finish::<ShellCpTask>(this);
         }
+        let args = crate::node::fs::args::Cp {
+            src: bun_jsc::node::PathLike::String(bun_ptr::cow_slice::CowSlice::init_unchecked(
+                this.src_absolute.as_deref().unwrap(),
+                false,
+            )),
+            dest: bun_jsc::node::PathLike::String(bun_ptr::cow_slice::CowSlice::init_unchecked(
+                this.tgt_absolute.as_deref().unwrap(),
+                false,
+            )),
+            flags: crate::node::fs::args::CpFlags {
+                recursive: this.opts.recursive,
+                force: true,
+                error_on_exist: false,
+            },
+        };
+        // Pool thread: hand the copy, and with it the loop and poster this
+        // shell task captured on its own thread, to an fs.cp task.
+        let poster = this
+            .task
+            .poster
+            .take()
+            .expect("shell cp task on the pool is armed");
+        let event_loop = this.task.event_loop;
+        crate::node::fs::ShellAsyncCpTask::create_for_shell(args, event_loop, poster, this);
     }
 
     fn has_trailing_sep(path: &[u8]) -> bool {
@@ -488,14 +484,10 @@ impl ShellCpTask {
         }
     }
 
-    /// Resolves src/tgt to absolute paths, classifies them per the three
-    /// POSIX `cp` synopses
-    /// (<https://man7.org/linux/man-pages/man1/cp.1p.html>), then hands off to
-    /// the node:fs async cp implementation.
-    fn run_from_thread_pool_impl(
-        &mut self,
-        poster: &bun_jsc::ConcurrentPoster,
-    ) -> Option<ShellErr> {
+    /// Resolves src/tgt to absolute paths (`src_absolute`/`tgt_absolute`),
+    /// classifying them per the three POSIX `cp` synopses
+    /// (<https://man7.org/linux/man-pages/man1/cp.1p.html>). Returns the error.
+    fn resolve_operands(&mut self) -> Option<ShellErr> {
         use resolve_path::{Platform, platform};
 
         let mut buf2 = bun_paths::PathBuffer::uninit();
@@ -609,32 +601,6 @@ impl ShellCpTask {
 
         self.src_absolute = Some(src.as_bytes().to_vec());
         self.tgt_absolute = Some(tgt.as_bytes().to_vec());
-
-        let args = crate::node::fs::args::Cp {
-            src: bun_jsc::node::PathLike::String(bun_ptr::cow_slice::CowSlice::init_unchecked(
-                self.src_absolute.as_deref().unwrap(),
-                false,
-            )),
-            dest: bun_jsc::node::PathLike::String(bun_ptr::cow_slice::CowSlice::init_unchecked(
-                self.tgt_absolute.as_deref().unwrap(),
-                false,
-            )),
-            flags: crate::node::fs::args::CpFlags {
-                recursive: self.opts.recursive,
-                force: true,
-                error_on_exist: false,
-            },
-        };
-
-        // Pool thread: hand the copy to an fs.cp task bound to the loop and
-        // poster this shell task captured on its own thread.
-        let _ = crate::node::fs::ShellAsyncCpTask::create_for_shell(
-            args,
-            self.task.event_loop,
-            poster.clone(),
-            std::ptr::from_mut::<ShellCpTask>(self),
-        );
-
         None
     }
 }
