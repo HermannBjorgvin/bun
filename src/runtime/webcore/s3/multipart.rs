@@ -340,8 +340,10 @@ impl UploadPart {
                 request_payer: ctx.request_payer,
                 ..Default::default()
             },
-            s3_simple_request::S3Callback::Part(Self::on_part_response),
-            std::ptr::from_ref::<Self>(self).cast_mut().cast::<c_void>(),
+            s3_simple_request::S3Callback::part(
+                Self::on_part_response,
+                std::ptr::from_ref::<Self>(self).cast_mut().cast::<c_void>(),
+            ),
         )
     }
 
@@ -432,8 +434,10 @@ impl MultiPartUpload {
                             request_payer: self_.request_payer,
                             ..Default::default()
                         },
-                        s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),
-                        this.cast::<c_void>(),
+                        s3_simple_request::S3Callback::upload(
+                            Self::single_send_upload_response,
+                            this.cast::<c_void>(),
+                        ),
                     )
                 } else {
                     scoped_log!(S3MultiPartUpload, "singleSendUploadResponse failed");
@@ -809,8 +813,10 @@ impl MultiPartUpload {
                 request_payer: self.request_payer,
                 ..Default::default()
             },
-            s3_simple_request::S3Callback::Commit(Self::on_commit_multi_part_request),
-            self.as_ctx_ptr(),
+            s3_simple_request::S3Callback::commit(
+                Self::on_commit_multi_part_request,
+                self.as_ctx_ptr(),
+            ),
         )
     }
 
@@ -839,8 +845,10 @@ impl MultiPartUpload {
                 request_payer: self.request_payer,
                 ..Default::default()
             },
-            s3_simple_request::S3Callback::Upload(Self::on_rollback_multi_part_request),
-            self.as_ctx_ptr(),
+            s3_simple_request::S3Callback::upload(
+                Self::on_rollback_multi_part_request,
+                self.as_ctx_ptr(),
+            ),
         )
     }
 
@@ -874,8 +882,10 @@ impl MultiPartUpload {
                     request_payer: self.request_payer,
                     ..Default::default()
                 },
-                s3_simple_request::S3Callback::Download(Self::start_multi_part_request_result),
-                self.as_ctx_ptr(),
+                s3_simple_request::S3Callback::download(
+                    Self::start_multi_part_request_result,
+                    self.as_ctx_ptr(),
+                ),
             )?;
         } else if self.state.get() == State::MultipartCompleted {
             part.start()?;
@@ -1007,8 +1017,10 @@ impl MultiPartUpload {
                     request_payer: self.request_payer,
                     ..Default::default()
                 },
-                s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),
-                self.as_ctx_ptr(),
+                s3_simple_request::S3Callback::upload(
+                    Self::single_send_upload_response,
+                    self.as_ctx_ptr(),
+                ),
             ); // TODO: properly propagate exception upwards
         } else {
             // we need to split

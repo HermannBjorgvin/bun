@@ -471,7 +471,8 @@ pub struct File {
     pub loader: Loader,
     pub contents: &'static ZStr,
     pub sourcemap: LazySourceMap,
-    pub cached_blob: Option<NonNull<Blob>>,
+    /// Set once (racing initializers keep the first); see `bun_runtime`'s `FileJsc::file_blob`.
+    pub cached_blob: core::sync::atomic::AtomicPtr<Blob>,
     pub encoding: Encoding,
     pub wtf_string: BunString,
     // BACKREF into the embedded section; JSC mutates the bytecode buffer in place.
@@ -760,7 +761,7 @@ impl StandaloneModuleGraph {
                     },
                     module_format: module.module_format,
                     side: module.side,
-                    cached_blob: None,
+                    cached_blob: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     encoding: module.encoding,
                     wtf_string: BunString::empty(),
                 },

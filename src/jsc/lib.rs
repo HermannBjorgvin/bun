@@ -1304,6 +1304,8 @@ pub type ZigStringSlice = bun_core::ZigStringSlice;
 // inseparable from `bun_runtime` (streams/fetch). Code that needs to downcast
 // a `JSValue` to `Request`/`Response` lives in `bun_runtime`.
 // ──────────────────────────────────────────────────────────────────────────
+#[path = "LinuxMemFdAllocator.rs"]
+pub mod linux_mem_fd_allocator;
 #[path = "node_path.rs"]
 pub mod node_path;
 #[path = "webcore_types.rs"]
@@ -1605,6 +1607,49 @@ pub unsafe fn zig_string_to_external_u16(
 ) -> JSValue {
     // SAFETY: caller upholds `to_external_u16`'s contract.
     unsafe { crate::zig_string::to_external_u16(ptr, len, global) }
+}
+
+/// Hand an owned UTF-16 buffer to JSC as an external string (freed by JSC's
+/// finalizer). Throws `STRING_TOO_LONG` and returns `.zero` if it is too long.
+pub fn external_string_utf16(buf: Vec<u16>, global: &JSGlobalObject) -> JSValue {
+    let len = buf.len();
+    let ptr = bun_core::heap::into_raw(buf.into_boxed_slice())
+        .cast::<u16>()
+        .cast_const();
+    // SAFETY: a global-allocator `Box<[u16]>` just released; JSC owns it now.
+    unsafe { crate::zig_string::to_external_u16(ptr, len, global) }
+}
+
+/// Hand an owned Latin-1/UTF-8 buffer to JSC as an external string (freed by
+/// JSC's finalizer). Throws `STRING_TOO_LONG` and returns `.zero` if it is
+/// too long.
+pub fn external_string_latin1(buf: Box<[u8]>, global: &JSGlobalObject) -> JSValue {
+    let len = buf.len();
+    let ptr = bun_core::heap::into_raw(buf).cast::<u8>().cast_const();
+    // SAFETY: `ptr[..len]` is the global-allocator buffer just released.
+    let mut str = bun_core::ZigString::init(unsafe { bun_core::ffi::slice(ptr, len) });
+    str.mark_global();
+    ZigStringJsc::to_external_value(&str, global)
+}
+
+/// A JS string over `store.shared_view()[range]` without copying: the ref
+/// `store` carries keeps the bytes alive until JSC finalizes the string.
+pub fn external_string_from_store(
+    global: &JSGlobalObject,
+    store: webcore_types::StoreRef,
+    range: core::ops::Range<usize>,
+) -> JSValue {
+    let str = bun_core::ZigString::init(&store.shared_view()[range]);
+    // SAFETY: the bytes belong to `store`, whose ref `into_raw` hands to JSC;
+    // `Store::external` releases exactly that ref.
+    unsafe {
+        ZigStringJsc::external(
+            &str,
+            global,
+            store.into_raw().cast::<core::ffi::c_void>(),
+            webcore_types::Store::external,
+        )
+    }
 }
 
 /// Extension trait providing JSC-aware methods on `bun_sys::Error` (`bun.sys.Error`).

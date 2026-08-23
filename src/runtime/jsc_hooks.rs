@@ -5199,7 +5199,7 @@ fn __bun_stdio_blob_store_new(fd: bun_sys::Fd, is_atty: bool, mode: bun_sys::Mod
         }),
         mime_type: bun_http_types::MimeType::NONE,
         ref_count: bun_ptr::ThreadSafeRefCount::init_exact_refs(2),
-        is_all_ascii: None,
+        is_all_ascii: Default::default(),
     });
     bun_core::heap::into_raw(store).cast()
 }

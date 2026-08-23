@@ -79,3 +79,58 @@ impl DOMFormData {
         WebCore__DOMFormData__count(self)
     }
 }
+
+/// One `FormData` entry as [`DOMFormData::for_each`] presents it. The
+/// strings and the blob belong to the `DOMFormData` and are valid for the
+/// callback only.
+pub enum FormDataEntry<'a> {
+    String(ZigString),
+    File {
+        blob: &'a crate::webcore_types::Blob,
+        filename: ZigString,
+    },
+}
+
+impl DOMFormData {
+    /// Call `f(name, entry)` for every entry, in order. C++ walks its own
+    /// list synchronously; nothing is retained past the call. `f` must not
+    /// run JS (which could mutate the `FormData` mid-iteration).
+    pub fn for_each<F: FnMut(ZigString, FormDataEntry<'_>)>(&mut self, mut f: F) {
+        type Thunk = extern "C" fn(*mut c_void, *mut ZigString, *mut c_void, *mut ZigString, u8);
+        unsafe extern "C" {
+            // safe: `this` is the exclusive borrow; `ctx`/`cb` are only used
+            // for the duration of the call.
+            safe fn DOMFormData__forEach(this: &mut DOMFormData, ctx: *mut c_void, cb: Thunk);
+        }
+        extern "C" fn thunk<F: FnMut(ZigString, FormDataEntry<'_>)>(
+            ctx: *mut c_void,
+            name: *mut ZigString,
+            value: *mut c_void,
+            filename: *mut ZigString,
+            is_blob: u8,
+        ) {
+            // SAFETY: `ctx` is the `&mut F` passed below, live for this
+            // synchronous callback; `name` (and `filename` when non-null) point
+            // at stack `ZigString`s in `DOMFormData__forEach`; `value` is a
+            // `ZigString*` for string entries and the entry's `JSBlob::m_ctx`
+            // (`Blob*`, alive with the entry) for file entries.
+            unsafe {
+                let f = &mut *ctx.cast::<F>();
+                let entry = if is_blob == 0 {
+                    FormDataEntry::String(*value.cast::<ZigString>())
+                } else {
+                    FormDataEntry::File {
+                        blob: &*value.cast::<crate::webcore_types::Blob>(),
+                        filename: if filename.is_null() {
+                            ZigString::EMPTY
+                        } else {
+                            *filename
+                        },
+                    }
+                };
+                f(*name, entry);
+            }
+        }
+        DOMFormData__forEach(self, (&raw mut f).cast::<c_void>(), thunk::<F>);
+    }
+}

@@ -2,8 +2,6 @@
 //! `standalone_graph/` (used by the bundler with no JS in the loop); only the
 //! `Blob` accessor that needs a `&JSGlobalObject` lives here.
 
-use core::ptr::NonNull;
-
 use bun_core::{self as bstring, strings};
 use bun_http::MimeType;
 use bun_jsc::JSGlobalObject;
@@ -18,17 +16,27 @@ use bun_standalone_graph::{File, StandaloneModuleGraph};
 
 /// Extension trait wiring JSC-dependent methods onto `standalone_graph::File`.
 pub(crate) trait FileJsc {
-    fn file_blob(&mut self, global: &JSGlobalObject) -> &mut Blob;
+    fn file_blob(&self, global: &JSGlobalObject) -> &Blob;
 }
 
 impl FileJsc for File {
-    fn file_blob(&mut self, global: &JSGlobalObject) -> &mut Blob {
-        if self.cached_blob.is_none() {
+    fn file_blob(&self, global: &JSGlobalObject) -> &Blob {
+        use core::sync::atomic::Ordering;
+        if self.cached_blob.load(Ordering::Acquire).is_null() {
             // `contents` is a `'static` slice into the embedded executable
             // section — borrow it directly (no copy) and hand it to a `Bytes`
-            // store with the default allocator. The leaked extra `ref_()` below
-            // pins the refcount ≥ 1 forever, so `Store::deref` never runs and
-            // the (otherwise UB) free of a static slice is unreachable.
+            // store whose allocator frees nothing (so it is never mistaken for
+            // a global-allocator buffer). The leaked extra `ref_()` below also
+            // pins the refcount ≥ 1 forever.
+            fn free_nothing(
+                _: *mut core::ffi::c_void,
+                _: &mut [u8],
+                _: bun_alloc::Alignment,
+                _: usize,
+            ) {
+            }
+            static STATIC_BYTES_VTABLE: bun_alloc::AllocatorVTable =
+                bun_alloc::AllocatorVTable::free_only(free_nothing);
             let contents = self.contents.as_bytes();
             // SAFETY: `contents` is `'static` and never freed (see above);
             // the const-cast is sound because Blob consumers only read via
@@ -38,7 +46,10 @@ impl FileJsc for File {
                     contents.as_ptr().cast_mut(),
                     contents.len() as SizeType,
                     contents.len() as SizeType,
-                    bun_alloc::basic::C_ALLOCATOR,
+                    bun_alloc::StdAllocator {
+                        ptr: core::ptr::null_mut(),
+                        vtable: &STATIC_BYTES_VTABLE,
+                    },
                 )
             };
             // Cannot use `..Default::default()` — `Store: Drop`
@@ -47,7 +58,7 @@ impl FileJsc for File {
                 data: Data::Bytes(bytes),
                 mime_type: MimeType::NONE,
                 ref_count: bun_ptr::ThreadSafeRefCount::init(),
-                is_all_ascii: None,
+                is_all_ascii: Default::default(),
             }));
             // make it never free
             store.ref_();
@@ -94,16 +105,20 @@ impl FileJsc for File {
             // `cached_blob` is typed against the lower crate's opaque `Blob`
             // newtype (it cannot name `webcore::Blob` without a dep cycle), so
             // erase via `.cast()` here and back below.
-            self.cached_blob = Some(
-                NonNull::new(Blob::new(b))
-                    .expect("Blob::new returned null")
-                    .cast(),
+            // A racing initializer that loses keeps the winner's blob; its own
+            // (a process-lifetime cache entry anyway) is left unreferenced.
+            let _ = self.cached_blob.compare_exchange(
+                core::ptr::null_mut(),
+                Blob::new(b).cast(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
             );
         }
 
         // SAFETY: populated above; pointer originates from `Blob::new` and is
         // never freed for the graph's lifetime (store is intentionally leaked
-        // via `.ref_()`). Cast restores the real `webcore::Blob` type.
-        unsafe { self.cached_blob.unwrap().cast::<Blob>().as_mut() }
+        // via `.ref_()`). Cast restores the real `webcore::Blob` type; shared
+        // access only — `Blob` state is `Cell`-based.
+        unsafe { &*self.cached_blob.load(Ordering::Acquire).cast::<Blob>() }
     }
 }
