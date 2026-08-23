@@ -559,8 +559,12 @@ impl<const SSL: bool> NewSocket<SSL> {
             + ssl_cost
     }
 
+    pub(crate) fn has_native_callback(&self) -> bool {
+        !matches!(self.native_callback.get(), NativeCallbacks::None)
+    }
+
     pub(crate) fn attach_native_callback(&self, callback: NativeCallbacks) -> bool {
-        if !matches!(self.native_callback.get(), NativeCallbacks::None) {
+        if self.has_native_callback() {
             return false;
         }
         // IntrusiveRc holds the +1 by construction (caller
