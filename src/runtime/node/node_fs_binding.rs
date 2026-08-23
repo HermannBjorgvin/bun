@@ -53,8 +53,7 @@ where
         .node_fs
         .with_mut(|nfs| NodeFS::dispatch::<R, A, F>(nfs, &args, Flavor::Sync));
     match result {
-        // The VM stopped under this call (a read loop gave up for it): unwind
-        // with the termination, as the trap would at the next safepoint.
+        // The VM stopped under this call: unwind with the termination, as the trap would.
         Err(_) if !vm.script_allowed() => Err(bun_jsc::Stopped.throw(global)),
         Err(ref err) => Err(global.throw_value(err.to_js(global))),
         Ok(ref mut res) => res.fs_to_js(global),
