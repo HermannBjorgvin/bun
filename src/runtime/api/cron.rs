@@ -29,7 +29,7 @@ use bun_jsc::{
 #[cfg(not(target_os = "macos"))]
 use bun_paths::PathBuffer;
 use bun_paths::{self as path};
-use bun_ptr::{BackRef, RefPtr, ThisPtr};
+use bun_ptr::{RefPtr, ThisPtr};
 use bun_resolver::fs::FileSystem;
 #[cfg(not(target_os = "macos"))]
 use bun_resolver::fs::RealFS;
@@ -1374,7 +1374,7 @@ pub struct CronJob {
     ref_count: Cell<u32>,
     /// Set from the allocating `RefPtr` so `&self` host fns can reach the
     /// `ThisPtr`-taking paths that may release refs.
-    self_ref: BackRef<CronJob, bun_ptr::Root>,
+    self_ref: bun_ptr::SelfRoot<CronJob>,
     // pub: `bun_core::from_field_ptr!(CronJob, event_loop_timer)` needs `offset_of!` visibility.
     // `JsCell` is `#[repr(transparent)]`, so the byte offset of the inner
     // `EventLoopTimer` is identical and the dispatch.rs `owner!` macro works
@@ -1673,7 +1673,7 @@ impl CronJob {
 
     #[bun_jsc::host_fn(method)]
     pub(crate) fn stop(&self, _global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
-        Self::self_stop(self.self_ref.this_ptr(), self.global.bun_vm());
+        Self::self_stop(self.self_ref.this_ptr(self), self.global.bun_vm());
         Ok(frame.this())
     }
 
