@@ -94,8 +94,8 @@ impl CurrentTime {
 /// the next `advanceTimersByTime` recomputes `Date.now` from the set time
 /// instead of the stale activation-time offset. No-op when fake timers are
 /// inactive or `ms` is NaN (the "clear override" sentinel).
-#[unsafe(no_mangle)]
-extern "C" fn Bun__FakeTimers__setSystemTime(ms: f64) {
+// HOST_EXPORT(Bun__FakeTimers__setSystemTime, c)
+pub fn set_system_time(ms: f64) {
     if ms.is_nan() {
         return;
     }
@@ -481,8 +481,7 @@ fn is_fake_timers(_global: &JSGlobalObject, _frame: &CallFrame) -> JsResult<JSVa
 }
 
 // `#[bun_jsc::host_fn]` emits a `__jsc_host_{name}` shim with the raw
-// `JSHostFn` ABI (`unsafe extern "C" fn(*mut JSGlobalObject, *mut CallFrame) -> JSValue`),
-// which is what `JSFunction::create` expects.
+// `JSHostFn` ABI, which is what `JSFunction::create` expects.
 const FAKE_TIMERS_FNS: &[(&str, u32, JSHostFn)] = &[
     ("useFakeTimers", 0, __jsc_host_use_fake_timers),
     ("useRealTimers", 0, __jsc_host_use_real_timers),

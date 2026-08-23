@@ -1,37 +1,32 @@
-use bun_jsc::{CallFrame, JSFunction, JSGlobalObject, JSValue, JsClass as _, JsResult};
+use core::cell::Cell;
+
 use bun_core::String as BunString;
+use bun_jsc::{CallFrame, JSFunction, JSGlobalObject, JSValue, JsClass as _, JsResult};
 
-use crate::test_runner::bun_test::{group_begin, BunTest, RefDataPtr};
+use crate::test_runner::bun_test::{BunTest, RefDataPtr, group_begin};
 
+// R-2 (host-fn re-entrancy): reached through `&self` from JS; both fields are
+// `Cell`s so the `done()` host fn and `run_test_callback` can update them
+// through the shared borrow `as_class_ref` hands out.
 #[bun_jsc::JsClass(no_construct, no_constructor)] // codegen wires to_js / from_js
 pub struct DoneCallback {
     /// Some = not called yet. None = done already called, no-op.
-    pub(crate) r#ref: Option<RefDataPtr>,
-    pub(crate) called: bool, // = false
+    pub(crate) r#ref: Cell<Option<RefDataPtr>>,
+    pub(crate) called: Cell<bool>, // = false
 }
 
 impl DoneCallback {
-    // Codegen's `host_fn_finalize` calls this via `|b| DoneCallback::finalize(b)`
-    // and requires `fn finalize(self: Box<Self>)`; clippy::boxed_local is a
-    // false positive on that contract.
-    #[allow(clippy::boxed_local)]
-    pub fn finalize(mut self: Box<Self>) {
+    pub fn finalize(self: Box<Self>) {
         let _g = group_begin!();
-
-        // `RefDataPtr` = `RefPtr<RefData>` has NO `Drop` impl (see
-        // src/ptr/ref_count.rs) — must explicitly decrement before the Box
-        // frees the allocation.
-        if let Some(r) = self.r#ref.take() {
-            r.deref();
-        }
+        drop(self);
     }
 
     pub(crate) fn create_unbound(global: &JSGlobalObject) -> JSValue {
         let _g = group_begin!();
 
         let done_callback = DoneCallback {
-            r#ref: None,
-            called: false,
+            r#ref: Cell::new(None),
+            called: Cell::new(false),
         };
 
         // `JsClass::to_js` boxes `self` and hands the raw pointer to the JS
@@ -45,7 +40,7 @@ impl DoneCallback {
         let call_fn = JSFunction::create(
             global,
             "done",
-            __jsc_host_bun_test_done_callback,
+            __jsc_host_call_done_callback,
             1,
             Default::default(),
         );
@@ -53,17 +48,10 @@ impl DoneCallback {
     }
 }
 
-// Raw C-ABI shim for [`BunTest::bun_test_done_callback`] so it can be passed
-// as a `JSHostFn` pointer to `JSFunction::create` (the thunk routes the result through
-// `to_js_host_fn_result` for `JsResult` → `JSValue` mapping + debug exception
-// assertions).
-bun_jsc::jsc_host_abi! {
-    unsafe fn __jsc_host_bun_test_done_callback(
-        g: *mut JSGlobalObject,
-        f: *mut CallFrame,
-    ) -> JSValue {
-        // SAFETY: JSC guarantees both pointers are live for the duration of the host call.
-        let (global, callframe) = unsafe { (&*g, &*f) };
-        bun_jsc::to_js_host_fn_result(global, BunTest::bun_test_done_callback(global, callframe))
-    }
+#[bun_jsc::host_fn]
+fn call_done_callback(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
+    let Some(this) = callframe.this().as_class_ref::<DoneCallback>() else {
+        return Err(global.throw(format_args!("Expected callee to be DoneCallback")));
+    };
+    BunTest::bun_test_done_callback(this, global, callframe)
 }
