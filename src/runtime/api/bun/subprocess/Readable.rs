@@ -168,7 +168,7 @@ impl Readable {
             Stdio::ArrayBuffer(..) | Stdio::Blob(..) => {
                 panic!("TODO: implement ArrayBuffer & Blob support in Stdio readable")
             }
-            Stdio::Capture(..) => panic!("TODO: implement capture support in Stdio readable"),
+            Stdio::Capture => panic!("TODO: implement capture support in Stdio readable"),
             // ReadableStream is handled separately
             Stdio::ReadableStream(..) => Readable::Ignore,
             // Rejected at i < 3 in Stdio::extract(); stdout/stderr never see this.

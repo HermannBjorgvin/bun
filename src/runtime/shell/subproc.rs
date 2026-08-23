@@ -1,5 +1,4 @@
 use core::cell::Cell;
-use std::sync::Arc;
 
 #[cfg(unix)]
 use crate::api::bun::process::SpawnResultExt as _;
@@ -9,8 +8,8 @@ use crate::api::bun::process::{
 #[cfg(windows)]
 use crate::api::bun::process::{WindowsOptions, WindowsStdioResult};
 use crate::api::bun::subprocess as JscSubprocess;
-use crate::shell::interpreter::{Interpreter, NodeId};
-use crate::shell::io_writer::{self, IOWriter};
+use crate::shell::interpreter::{ExitCode, Interpreter, NodeId};
+use crate::shell::io_writer::{self, IOWriterRef};
 use crate::shell::states::cmd::Cmd as ShellCmd;
 use crate::shell::{self as sh, Yield};
 use crate::webcore::{self, FileSink};
@@ -81,13 +80,13 @@ bun_output::define_scoped_log!(log, SHELL_SUBPROC, visible);
 /// Used for captured writer
 #[derive(Default)]
 pub struct ShellIO {
-    pub(crate) stdout: Option<Arc<IOWriter>>,
-    pub(crate) stderr: Option<Arc<IOWriter>>,
+    pub(crate) stdout: Option<IOWriterRef>,
+    pub(crate) stderr: Option<IOWriterRef>,
 }
 
-// Note: with `Arc<IOWriter>` the only correct way to
-// retain is to *clone the Arc and keep it*; a freestanding `ref()` that
-// discards the clone is a no-op. Callers hold their own `Arc` clones and
+// Note: with `Rc<IOWriter>` the only correct way to
+// retain is to *clone the Rc and keep it*; a freestanding `ref()` that
+// discards the clone is a no-op. Callers hold their own `Rc` clones and
 // `ShellIO`'s `Drop` releases them — no explicit ref/deref methods.
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -100,12 +99,10 @@ pub(crate) const DEFAULT_MAX_BUFFER_SIZE: u32 = 1024 * 1024 * 4;
 
 /// Backref from a heap-allocated [`ShellSubprocess`] to its owning `Cmd`.
 /// Spec stores `cmd_parent: *ShellCmd` directly. In the NodeId-arena port the
-/// `Cmd` lives **inline** in `Interpreter::nodes: Vec<Node>`, so a raw `*mut
-/// Cmd` taken at spawn time dangles the moment a later `alloc_node` grows the
-/// `Vec` (long pipelines hit this — every piped command pushes new Expansion /
-/// Cmd nodes while earlier subprocesses' PipeReaders are still registered in
-/// epoll). Store `(interp, NodeId)` instead and resolve through the arena at
-/// each use site.
+/// `Cmd` lives in `Interpreter::nodes`, so store `(interp, NodeId)` and resolve
+/// through the arena at each use site. `id` indexes a `Node::Cmd` slot for
+/// every caller: the subprocess / PipeReader callbacks fire strictly before
+/// `Cmd::deinit` recycles it.
 #[derive(Clone, Copy)]
 pub struct CmdHandle {
     pub(crate) interp: ParentRef<Interpreter>,
@@ -113,13 +110,23 @@ pub struct CmdHandle {
 }
 
 impl CmdHandle {
-    /// Resolve to the live `Cmd` slot. Single-threaded; the caller must not
-    /// hold the result across a call that re-enters the interpreter. `id`
-    /// indexes a `Node::Cmd` slot for every caller: the subprocess /
-    /// PipeReader callbacks fire strictly before `Cmd::deinit` recycles it.
     #[inline]
-    pub(crate) fn cmd_mut(&self) -> &mut ShellCmd {
-        self.interp.get().as_cmd_mut(self.id)
+    fn buffered_input_close(&self) {
+        ShellCmd::buffered_input_close(&self.interp, self.id);
+    }
+
+    #[inline]
+    fn buffered_output_close(&self, kind: OutKind, err: Option<SystemError>) -> Yield {
+        ShellCmd::buffered_output_close(&self.interp, self.id, kind, err)
+    }
+
+    /// Record the process exit unless a pipe error already set the code.
+    #[inline]
+    fn on_exit(&self, exit_code: ExitCode) {
+        let interp = self.interp.get();
+        if interp.as_cmd(self.id).exit_code.is_none() {
+            ShellCmd::on_exit(interp, self.id, exit_code);
+        }
     }
 }
 
@@ -179,7 +186,7 @@ impl ShellSubprocess {
             std::ptr::from_ref(self) as usize,
             self.cmd_parent.id
         );
-        self.cmd_parent.cmd_mut().buffered_input_close();
+        self.cmd_parent.buffered_input_close();
     }
 
     pub(crate) fn has_exited(&self) -> bool {
@@ -676,10 +683,7 @@ impl ShellSubprocess {
         if let Some(code) = exit_code {
             let handle = this.cmd_parent;
             // No borrow of `this` is live past this point.
-            let cmd = handle.cmd_mut();
-            if cmd.exit_code.is_none() {
-                cmd.on_exit(code.into());
-            }
+            handle.on_exit(code.into());
         }
     }
 }
@@ -783,7 +787,7 @@ impl Writable {
                 Stdio::Memfd(_) | Stdio::Path(_) | Stdio::Ignore => {
                     return Ok(Writable::Ignore);
                 }
-                Stdio::Ipc | Stdio::Capture(_) => {
+                Stdio::Ipc | Stdio::Capture => {
                     return Ok(Writable::Ignore);
                 }
                 Stdio::SocketFd => {
@@ -831,7 +835,7 @@ impl Writable {
                 Stdio::Fd(_) => Ok(Writable::Fd(result.unwrap())),
                 Stdio::Inherit => Ok(Writable::Inherit),
                 Stdio::Path(_) | Stdio::Ignore => Ok(Writable::Ignore),
-                Stdio::Ipc | Stdio::Capture(_) => Ok(Writable::Ignore),
+                Stdio::Ipc | Stdio::Capture => Ok(Writable::Ignore),
                 Stdio::ReadableStream(_) => {
                     // The shell never uses this
                     panic!("Unimplemented stdin readable_stream");
@@ -927,7 +931,7 @@ impl Readable {
     pub(crate) fn init(
         out_type: OutKind,
         stdio: Stdio,
-        shellio: Option<Arc<IOWriter>>,
+        shellio: Option<IOWriterRef>,
         event_loop: EventLoopHandle,
         process: ThisPtr<ShellSubprocess>,
         result: StdioResult,
@@ -963,7 +967,7 @@ impl Readable {
                     });
                     Readable::Pipe(pipe)
                 }
-                Stdio::Capture(_) => Readable::Pipe(PipeReader::create(
+                Stdio::Capture => Readable::Pipe(PipeReader::create(
                     event_loop, process, result, shellio, out_type, interp,
                 )),
                 Stdio::ReadableStream(_) => Readable::Ignore, // Shell doesn't use readable_stream
@@ -1003,7 +1007,7 @@ impl Readable {
                     });
                     Readable::Pipe(pipe)
                 }
-                Stdio::Capture(_) => Readable::Pipe(PipeReader::create(
+                Stdio::Capture => Readable::Pipe(PipeReader::create(
                     event_loop, process, result, shellio, out_type, interp,
                 )),
                 Stdio::ReadableStream(_) => Readable::Ignore, // Shell doesn't use readable_stream
@@ -1020,7 +1024,7 @@ impl Readable {
                 fd.close();
             }
             // .fd is borrowed from the shell's IOWriter (see IO.OutKind.to_subproc_stdio) or
-            // a CowFd redirect; the owner closes it.
+            // the Cmd's redirect fd; the owner closes it.
             Readable::Fd(_) => {
                 *self = Readable::Closed;
             }
@@ -1246,7 +1250,7 @@ impl Drop for BufferedOutput {
 pub struct CapturedWriter {
     pub(crate) dead: Cell<bool>,
     /// `None` iff `dead == true`.
-    pub(crate) writer: JsCell<Option<Arc<IOWriter>>>,
+    pub(crate) writer: JsCell<Option<IOWriterRef>>,
     pub(crate) written: Cell<usize>,
     pub(crate) err: JsCell<Option<SystemError>>,
 }
@@ -1266,7 +1270,7 @@ impl PipeReader {
     /// The `IOWriter` child handle for this reader's captured-output tee.
     #[inline]
     pub(crate) fn captured_child_ptr(this: ThisPtr<Self>) -> io_writer::ChildPtr {
-        io_writer::ChildPtr::subproc_capture(this.as_ptr().cast())
+        io_writer::ChildPtr::subproc_capture(this)
     }
 
     fn captured_do_write(this: ThisPtr<Self>, chunk: &[u8]) {
@@ -1403,13 +1407,13 @@ impl PipeReader {
         event_loop: EventLoopHandle,
         process: ThisPtr<ShellSubprocess>,
         result: StdioResult,
-        capture: Option<Arc<IOWriter>>,
+        capture: Option<IOWriterRef>,
         out_type: OutKind,
         interp: Option<ParentRef<Interpreter>>,
     ) -> RefPtr<PipeReader> {
         let captured_writer = CapturedWriter::default();
         if let Some(cap) = capture {
-            captured_writer.writer.set(Some(cap)); // dupeRef → Arc clone already happened on pass-in
+            captured_writer.writer.set(Some(cap)); // dupeRef → Rc clone already happened on pass-in
             captured_writer.dead.set(false);
         }
 
@@ -1599,10 +1603,10 @@ impl PipeReader {
         if let Some(proc) = process {
             let e: Option<SystemError> = this.take_captured_error();
             // `proc` is the `ShellSubprocess` freed only by `Cmd::deinit`,
-            // which runs strictly after every PipeReader has signalled done.
-            // `cmd_mut` resolves through the node arena (see `CmdHandle`).
+            // which runs strictly after every PipeReader has signalled done
+            // (see `CmdHandle`).
             let handle = proc.cmd_parent;
-            return handle.cmd_mut().buffered_output_close(out_type, e);
+            return handle.buffered_output_close(out_type, e);
         }
         Yield::Suspended
     }
@@ -1747,7 +1751,7 @@ impl Drop for PipeReader {
 
         // PipeReaderState::Done(Box<[u8]>) drops its buffer automatically.
 
-        // CapturedWriter's fields drop the err and writer Arc.
+        // CapturedWriter's fields drop the err and writer Rc.
 
         self.state.with_mut(|s| {
             if let PipeReaderState::Err(slot) = s {

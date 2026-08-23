@@ -254,6 +254,16 @@ impl WebWorker {
         unsafe { bun_core::ffi::slice(self.argv_ptr, self.argv_len) }
     }
 
+    /// [`argv`](Self::argv) as string impls.
+    #[inline]
+    pub fn argv_strings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &bun_core::WTFStringImplStruct> + '_ {
+        // SAFETY: every `argv` entry is a non-null `StringImpl*` owned by the
+        // C++ `WorkerOptions`, alive for `self`'s lifetime (see `argv`).
+        self.argv().iter().map(|s| unsafe { &**s })
+    }
+
     /// `None` when
     /// `inherit_exec_argv` (the worker inherits the parent's execArgv),
     /// otherwise `Some(slice)` (possibly empty) borrowed from C++ WorkerOptions.
