@@ -56,6 +56,7 @@ test("require(esm) defines __esModule as an own enumerable property", async () =
     "sorted.mjs": "export default 1; export const Alpha = 1; export const zzz = 2; export const _a = 3;\n",
     "noDefault.mjs": "export const x = 1;\n",
     "hasEsm.mjs": "export const __esModule = 'user-set'; export default 1;\n",
+    "hasUndefinedEsm.mjs": "export const __esModule = undefined; export default 1;\n",
     "p.cjs": `
 const assert = require("node:assert");
 
@@ -82,10 +83,16 @@ assert.deepStrictEqual(Object.getOwnPropertyNames(nd), ["x"]);
 assert.strictEqual(nd.__esModule, undefined);
 assert.strictEqual(Object.getPrototypeOf(nd), null);
 
-// module that explicitly exports __esModule keeps the user's value
+// module that explicitly exports __esModule keeps the user's value, even undefined
 const h = require("./hasEsm.mjs");
 assert.strictEqual(h.__esModule, "user-set");
 assert.strictEqual(Object.hasOwn(h, "__esModule"), true);
+const hu = require("./hasUndefinedEsm.mjs");
+assert.strictEqual(hu.__esModule, undefined);
+assert.deepStrictEqual(Object.getOwnPropertyNames(hu), ["__esModule", "default"]);
+assert.deepStrictEqual(Object.getOwnPropertyDescriptor(hu, "__esModule"), {
+  value: undefined, writable: true, enumerable: true, configurable: false,
+});
 
 console.log("ok");
 `,
