@@ -673,33 +673,6 @@ where
         // SAFETY: `ThisPtr::new` invariant — `self.0` points to a live `T`.
         unsafe { ScopedRef::new(self.0.as_ptr()) }
     }
-
-    /// Like [`ref_guard`](Self::ref_guard) but adopts a ref the caller already
-    /// owns (one taken earlier with [`ref_`](Self::ref_)) instead of taking a
-    /// new one: the guard only releases on `Drop`.
-    #[inline]
-    pub fn adopt_guard(self) -> ScopedRef<T> {
-        // SAFETY: `ThisPtr::new` invariant — `self.0` points to a live `T`.
-        unsafe { ScopedRef::adopt(self.0.as_ptr()) }
-    }
-
-    /// Take one ref on behalf of an untyped holder (a uSockets ext slot, a
-    /// C++ wrapper, an in-flight operation). Balanced by [`deref`](Self::deref)
-    /// or [`adopt_guard`](Self::adopt_guard).
-    #[inline]
-    pub fn ref_(self) {
-        // SAFETY: `ThisPtr::new` invariant — pointee is live.
-        unsafe { T::rc_ref(self.0.as_ptr()) }
-    }
-
-    /// Release one ref an untyped holder owned. May free the pointee; the same
-    /// accounting obligation as [`RefPtr::deref`].
-    #[inline]
-    pub fn deref(self) {
-        // SAFETY: `ThisPtr::new` invariant — pointee is live; `self.0` carries
-        // the allocation's root provenance for the destructor.
-        unsafe { T::rc_deref(self.0.as_ptr()) }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
