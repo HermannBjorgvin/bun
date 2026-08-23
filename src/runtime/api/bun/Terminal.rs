@@ -319,7 +319,7 @@ impl Drop for Options {
 /// (`js_value`) holds the initial ref; `terminal` is a back-reference the
 /// caller keeps alive by keeping `js_value` reachable.
 pub(crate) struct CreateResult {
-    pub terminal: bun_ptr::BackRef<Terminal, bun_ptr::Mut>,
+    pub terminal: bun_ptr::BackRef<Terminal, bun_ptr::Root>,
     pub js_value: JSValue,
 }
 
