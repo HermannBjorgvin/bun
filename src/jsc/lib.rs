@@ -126,6 +126,7 @@ pub mod exception_list {
         pub stack: StackTrace,
     }
 }
+pub mod aliased_struct;
 #[path = "array_buffer.rs"]
 pub mod array_buffer;
 #[path = "CommonStrings.rs"]
@@ -188,6 +189,7 @@ pub use self::js_value::{
 // tier (`bun_runtime::dispatch::tick_queue_with_count`) owns the `match` loop
 // and is wired into `event_loop::tick` directly at link time. No fn-pointer
 // hook is re-exported from the crate root.
+pub use self::aliased_struct::{AliasedCells, AliasedStruct};
 pub use self::array_buffer::{
     ArrayBuffer, BinaryType, JSCArrayBuffer, MarkedArrayBuffer, TypedArrayType,
 };
