@@ -255,7 +255,6 @@ CPP_DECL void JSC__JSValue__toZigException(JSC::EncodedJSValue JSValue0, JSC::JS
 
 CPP_DECL size_t JSC__VM__blockBytesAllocated(JSC::VM* arg0);
 CPP_DECL void JSC__VM__collectAsync(JSC::VM* arg0);
-CPP_DECL JSC::VM* JSC__VM__create(unsigned char HeapType0);
 CPP_DECL void JSC__VM__drainMicrotasks(JSC::VM* arg0);
 CPP_DECL bool JSC__VM__executionForbidden(JSC::VM* arg0);
 CPP_DECL size_t JSC__VM__heapSize(JSC::VM* arg0);
