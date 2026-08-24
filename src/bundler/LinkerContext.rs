@@ -1262,8 +1262,7 @@ pub struct LinkerOptions {
     pub(crate) css_chunking: bool,
     pub(crate) source_maps: SourceMapOption,
     pub(crate) target: Target,
-    /// Explicit browser targets for CSS downleveling (the `cssTarget` build
-    /// option). `None` means derive the CSS targets from `target`.
+    /// The `cssTarget` build option. `None`: derive the CSS targets from `target`.
     pub(crate) css_target: Option<bun_css::Browsers>,
     pub(crate) compile_mode: CompileMode,
     pub(crate) metafile: bool,
