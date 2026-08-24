@@ -348,7 +348,6 @@ JSModuleNamespaceObject* NodeVMModule::namespaceObject(JSC::JSGlobalObject* glob
     if (object) {
         namespaceObject(vm, object);
     }
-    RETURN_IF_EXCEPTION(scope, {});
 
     return object;
 }
