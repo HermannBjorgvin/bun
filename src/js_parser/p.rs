@@ -5376,6 +5376,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             | js_ast::ExprData::ENumber(_)
             | js_ast::ExprData::EBigInt(_)
             | js_ast::ExprData::EString(_)
+            | js_ast::ExprData::ENameOfSymbol(_)
             | js_ast::ExprData::EThis(_)
             | js_ast::ExprData::ERegExp(_)
             | js_ast::ExprData::EFunction(_)

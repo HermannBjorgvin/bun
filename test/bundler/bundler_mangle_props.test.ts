@@ -366,6 +366,25 @@ describe("bundler", () => {
     },
   });
 
+  itBundled("mangle-props/EnumWithPropertyKeyCommentValue", {
+    files: {
+      "/entry.ts": /* ts */ `
+        enum Keys { Foo = /* @__KEY__ */ "foo_", Plain = "plain" }
+        const o = { foo_: 1, plain: 2 };
+        console.log(JSON.stringify(Object.keys(Keys)), o[Keys.Foo], o[Keys.Plain]);
+      `,
+    },
+    mangleProps: /_$/,
+    // A mangled string is still a string: the enum is a string enum with no
+    // reverse mapping, and the mangled value matches the mangled key of "o".
+    run: { stdout: '["Foo","Plain"] 1 2' },
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect(code).toMatch(/\["Foo"\] = \/\* @__KEY__ \*\/ "(\w+)";/);
+      expect(code).not.toContain('] = "Foo"');
+    },
+  });
+
   itBundled("mangle-props/UseDefineForClassFieldsFalse", {
     files: {
       "/entry.ts": /* ts */ `
