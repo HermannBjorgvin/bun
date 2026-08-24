@@ -2646,6 +2646,8 @@ pub mod args {
         /// `node:fs` uses `O::RDWR` (Node's `'r+'`); `Bun.write` callers pass
         /// `O::WRONLY` so a write-only file stays truncatable.
         pub(crate) flags: i32,
+        /// Creation mode for the open. Only used when `flags` has `O::CREAT`.
+        pub(crate) mode: Mode,
     }
     fs_args_path_forwarders!(Truncate; path);
     impl Truncate {
@@ -2663,6 +2665,7 @@ pub mod args {
                 path,
                 len,
                 flags: bun_sys::O::RDWR,
+                mode: 0o644,
             })
         }
     }
@@ -7858,7 +7861,13 @@ impl NodeFS {
         }
     }
 
-    fn truncate_inner(&mut self, path: &PathLike, len: u64, flags: i32) -> Maybe<ret::Truncate> {
+    fn truncate_inner(
+        &mut self,
+        path: &PathLike,
+        len: u64,
+        flags: i32,
+        mode: Mode,
+    ) -> Maybe<ret::Truncate> {
         // Mask `len` to a `u63` envelope so the `i64` cast is always in range,
         // rather than `try_from().unwrap()`-panicking
         // on a hostile `> i64::MAX` value.
@@ -7866,7 +7875,7 @@ impl NodeFS {
         // Node implements fs.truncate(path) as open(path, 'r+') + ftruncate
         // (lib/fs.js), so each error reports the syscall that failed: a
         // missing path is an "open" error, not "truncate".
-        let file = sys::open(path.slice_z(&mut self.sync_error_buf), flags, 0o644);
+        let file = sys::open(path.slice_z(&mut self.sync_error_buf), flags, mode);
         let fd = match file {
             Ok(fd) => fd,
             Err(e) => return Err(e.with_path(path.slice())),
@@ -7881,7 +7890,9 @@ impl NodeFS {
             PathOrFileDescriptor::Fd(fd) => {
                 Syscall::ftruncate(*fd, (args.len & ((1u64 << 63) - 1)) as i64)
             }
-            PathOrFileDescriptor::Path(p) => self.truncate_inner(p, args.len, args.flags),
+            PathOrFileDescriptor::Path(p) => {
+                self.truncate_inner(p, args.len, args.flags, args.mode)
+            }
         }
     }
 
