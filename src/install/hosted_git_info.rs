@@ -50,7 +50,6 @@
 //! tags like `github:` which are handled as "shortcuts" by this library.
 
 use core::ops::Range;
-use core::ptr::NonNull;
 
 use bun_alloc::AllocError;
 use bun_core::StringBuilder;
@@ -333,24 +332,8 @@ impl HostedGitInfo {
 // parse_url
 // ──────────────────────────────────────────────────────────────────────────
 
-/// RAII handle over a heap-allocated `WTF::URL` (C++). The allocation comes from
-/// `URL__fromString` (C++ `new`), so it MUST be freed via `URL__deinit` — wrapping
-/// the pointer in `Box` is allocator-mismatch UB and never runs the C++ destructor.
-pub struct OwnedJscUrl(NonNull<JscUrl>);
-impl core::ops::Deref for OwnedJscUrl {
-    type Target = JscUrl;
-    fn deref(&self) -> &JscUrl {
-        // SAFETY: `from_string`/`from_utf8` returned a live heap WTF::URL we own.
-        unsafe { self.0.as_ref() }
-    }
-}
-impl Drop for OwnedJscUrl {
-    fn drop(&mut self) {
-        // SAFETY: pointer is the unique owner of a `new WTF::URL` from C++; `deinit`
-        // calls `URL__deinit` which `delete`s it.
-        unsafe { self.0.as_mut() }.deinit();
-    }
-}
+/// RAII handle over a heap-allocated `WTF::URL` (C++).
+pub type OwnedJscUrl = bun_url::whatwg::Parsed;
 
 // `url` is owned: `jsc.URL.fromString` creates it and the holder deinits.
 pub struct ParsedUrl<'a> {
@@ -698,7 +681,7 @@ impl<'a> UrlProtocolPair<'a> {
         // get rid of -- in theory, the URL layer could allocate once.
         let new_str = strings::concat(parts);
         // Drop handles `defer allocator.free(new_str)`.
-        JscUrl::from_utf8(&new_str).map(OwnedJscUrl)
+        OwnedJscUrl::from_utf8(&new_str)
     }
 }
 
