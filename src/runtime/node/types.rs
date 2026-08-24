@@ -1754,8 +1754,6 @@ pub type DirentKind = bun_sys::FileKind;
 // `&JSGlobalObject` / `&mut bun_core::String` are ABI-identical to non-null
 // pointers; `Option<&mut *mut JSString>` uses the niche-optimization layout
 // (`*mut *mut JSString`), so the validity proof lives in the type signature.
-// `Bun__Dirent__toJSWithBufferName` takes a raw pointer + length for the name
-// instead, so it stays unsafe to call and the caller proves the range is valid.
 unsafe extern "C" {
     safe fn Bun__JSDirentObjectConstructor(global: &JSGlobalObject) -> JSValue;
     safe fn Bun__Dirent__toJS(
