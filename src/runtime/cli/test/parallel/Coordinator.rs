@@ -348,17 +348,16 @@ impl<'a> Coordinator<'a> {
         }
     }
 
-    /// Normal completion: the worker reports the file's duration itself
-    /// (wall time minus run-queue wait) so contention from sibling workers
-    /// doesn't inflate the recorded number.
+    /// Normal completion: the worker-reported duration (wall time minus
+    /// run-queue wait), unaffected by sibling-worker contention.
     fn record_timing_ms(&mut self, file_idx: u32, ms: u32) {
         if let Some(t) = self.reporter.timings.as_mut() {
             t.record(self.files[file_idx as usize].as_bytes(), ms);
         }
     }
 
-    /// Crash path: no file_done frame arrived, so coordinator-observed wall
-    /// time since dispatch is all there is.
+    /// Crash path: no file_done frame arrived; wall time since dispatch is
+    /// all there is.
     fn record_timing_since(&mut self, file_idx: u32, dispatched_at: i64) {
         if let Some(t) = self.reporter.timings.as_mut() {
             t.record_since(self.files[file_idx as usize].as_bytes(), dispatched_at);

@@ -601,10 +601,8 @@ impl<'a> WorkerLoop<'a> {
                 }
             }
 
-            // Record the file's own cost, not N-workers-on-C-cores scheduler
-            // queueing: under oversubscription the coordinator-observed wall
-            // time scales with the worker count, which misbalances the
-            // --shard packing these numbers exist for.
+            // The file's own cost, not scheduler queueing: contended wall
+            // time scales with the worker count and misbalances --shard.
             let elapsed_ms =
                 u64::try_from(bun_core::time::milli_timestamp() - started_ms).unwrap_or(0);
             // Subtract only when both samples exist; a lone after-sample would
@@ -639,11 +637,9 @@ impl<'a> WorkerLoop<'a> {
     }
 }
 
-/// Nanoseconds this thread has spent runnable but waiting for a CPU, since it
-/// started. On Linux this is the second field of /proc/thread-self/schedstat
-/// (the main thread's run-queue delay). None on other platforms or when the
-/// read fails, so the recorded duration falls back to the worker-observed
-/// wall time.
+/// Nanoseconds this thread has spent runnable but waiting for a CPU (Linux:
+/// second field of /proc/thread-self/schedstat). None elsewhere or on a
+/// failed read; the caller then records plain wall time.
 fn runqueue_wait_ns() -> Option<u64> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {

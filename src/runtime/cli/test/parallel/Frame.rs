@@ -13,9 +13,8 @@ pub enum Kind {
     /// u32 file_idx, str formatted_line (ANSI included; printed verbatim)
     TestDone,
     /// 10 × u32: file_idx, pass, fail, skip, todo, expectations, skipped_label,
-    /// files, unhandled, duration_ms (worker-measured wall time minus the time
-    /// the worker's main thread spent waiting on the run queue, so recorded
-    /// `--timings` stay stable under CPU oversubscription)
+    /// files, unhandled, duration_ms (worker-measured wall time minus run-queue
+    /// wait; see `runqueue_wait_ns` in runner.rs)
     FileDone,
     /// 3 × str: failures, skips, todos (verbatim repeat-buffer bytes)
     RepeatBufs,
