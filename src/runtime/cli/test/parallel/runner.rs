@@ -560,6 +560,8 @@ impl<'a> WorkerLoop<'a> {
 
             let before = *self.reporter.summary();
             let before_unhandled = self.reporter.jest.unhandled_errors_between_tests;
+            let started_ms = bun_core::time::milli_timestamp();
+            let wait_before_ns = runqueue_wait_ns();
 
             // A worker never knows which file is its last, so preload-level hooks wrap every file (with or without --isolate).
             if let Err(err) = TestCommand::run(
@@ -599,6 +601,17 @@ impl<'a> WorkerLoop<'a> {
                 }
             }
 
+            // Record the file's own cost, not N-workers-on-C-cores scheduler
+            // queueing: under oversubscription the coordinator-observed wall
+            // time scales with the worker count, which misbalances the
+            // --shard packing these numbers exist for.
+            let elapsed_ms =
+                u64::try_from(bun_core::time::milli_timestamp() - started_ms).unwrap_or(0);
+            let waited_ms =
+                runqueue_wait_ns().saturating_sub(wait_before_ns) / bun_core::time::NS_PER_MS;
+            let duration_ms =
+                u32::try_from(elapsed_ms.saturating_sub(waited_ms)).unwrap_or(u32::MAX);
+
             let after = *self.reporter.summary();
             wf.begin(frame::Kind::FileDone);
             for v in [
@@ -611,11 +624,37 @@ impl<'a> WorkerLoop<'a> {
                 after.skipped_because_label - before.skipped_because_label,
                 after.files - before.files,
                 self.reporter.jest.unhandled_errors_between_tests - before_unhandled,
+                duration_ms,
             ] {
                 wf.u32(v);
             }
             self.cmds.send(wf.finish());
         }
+    }
+}
+
+/// Nanoseconds this thread has spent runnable but waiting for a CPU, since it
+/// started. On Linux this is the second field of /proc/thread-self/schedstat
+/// (the main thread's run-queue delay). Other platforms return 0, so the
+/// recorded duration falls back to the worker-observed wall time.
+fn runqueue_wait_ns() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // "<running_ns> <waiting_ns> <timeslices>"
+        let Ok(contents) = bun_sys::File::read_from(Fd::cwd(), b"/proc/thread-self/schedstat")
+        else {
+            return 0;
+        };
+        let mut fields = bun_core::strings::tokenize_any(&contents, b" \n");
+        let _running = fields.next();
+        fields
+            .next()
+            .and_then(|f| bun_core::fmt::parse_int::<u64>(f, 10).ok())
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        0
     }
 }
 
