@@ -1328,7 +1328,8 @@ test.skipIf(!taskset)("--update-timings under --parallel does not record sibling
       stdout: "pipe",
       stderr: "pipe",
     });
-    const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stdout).toContain("PARALLEL");
     expect(stderr).toContain(`${count} pass`);
     expect(exitCode).toBe(0);
     const json = await Bun.file(`${dir}/t.json`).json();

@@ -607,8 +607,14 @@ impl<'a> WorkerLoop<'a> {
             // --shard packing these numbers exist for.
             let elapsed_ms =
                 u64::try_from(bun_core::time::milli_timestamp() - started_ms).unwrap_or(0);
-            let waited_ms =
-                runqueue_wait_ns().saturating_sub(wait_before_ns) / bun_core::time::NS_PER_MS;
+            // Subtract only when both samples exist; a lone after-sample would
+            // subtract the thread's cumulative wait from before this file.
+            let waited_ms = match (wait_before_ns, runqueue_wait_ns()) {
+                (Some(before), Some(after)) => {
+                    after.saturating_sub(before) / bun_core::time::NS_PER_MS
+                }
+                _ => 0,
+            };
             let duration_ms =
                 u32::try_from(elapsed_ms.saturating_sub(waited_ms)).unwrap_or(u32::MAX);
 
@@ -635,26 +641,21 @@ impl<'a> WorkerLoop<'a> {
 
 /// Nanoseconds this thread has spent runnable but waiting for a CPU, since it
 /// started. On Linux this is the second field of /proc/thread-self/schedstat
-/// (the main thread's run-queue delay). Other platforms return 0, so the
-/// recorded duration falls back to the worker-observed wall time.
-fn runqueue_wait_ns() -> u64 {
+/// (the main thread's run-queue delay). None on other platforms or when the
+/// read fails, so the recorded duration falls back to the worker-observed
+/// wall time.
+fn runqueue_wait_ns() -> Option<u64> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // "<running_ns> <waiting_ns> <timeslices>"
-        let Ok(contents) = bun_sys::File::read_from(Fd::cwd(), b"/proc/thread-self/schedstat")
-        else {
-            return 0;
-        };
+        let contents = bun_sys::File::read_from(Fd::cwd(), b"/proc/thread-self/schedstat").ok()?;
         let mut fields = bun_core::strings::tokenize_any(&contents, b" \n");
         let _running = fields.next();
-        fields
-            .next()
-            .and_then(|f| bun_core::fmt::parse_int::<u64>(f, 10).ok())
-            .unwrap_or(0)
+        bun_core::fmt::parse_int::<u64>(fields.next()?, 10).ok()
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        0
+        None
     }
 }
 
