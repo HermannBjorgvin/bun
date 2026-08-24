@@ -3,13 +3,13 @@
 
 use bun_appkit::dynamic::{DynValue, Enc, Scalar, Signature};
 use bun_appkit::{ActivationPolicy, DynObject, Named, NsStr};
-use bun_core::{OwnedString, strings};
+use bun_core::strings;
 use bun_jsc::{ErrorCode, JSBigInt, JSGlobalObject, JSType, JSValue, JsError, JsResult, StringJsc};
 
 use super::objc::{ObjCClass, ObjCObject, ObjCSelector};
 
 /// A JavaScript string held alive so AppKit can read its characters in place.
-pub(crate) struct JsStr(OwnedString);
+pub(crate) struct JsStr(bun_core::String);
 
 impl JsStr {
     /// `what` names the value in the TypeError when `value` is not a string.
@@ -21,16 +21,12 @@ impl JsStr {
         if !value.is_string() {
             return Err(global.throw_invalid_arguments(format_args!("{what} must be a string")));
         }
-        Ok(JsStr(OwnedString::new(bun_core::String::from_js(
-            value, global,
-        )?)))
+        Ok(JsStr(bun_core::String::from_js(value, global)?))
     }
 
     /// Anything, via `String(value)`.
     pub(crate) fn coerce(global: &JSGlobalObject, value: JSValue) -> JsResult<JsStr> {
-        Ok(JsStr(OwnedString::new(bun_core::String::from_js(
-            value, global,
-        )?)))
+        Ok(JsStr(bun_core::String::from_js(value, global)?))
     }
 
     pub(crate) fn ns(&self) -> NsStr<'_> {
@@ -450,7 +446,7 @@ fn ns_value_at(
             return Ok(None);
         };
         let mut entries = Vec::new();
-        let mut iter = bun_jsc::JSPropertyIterator::init(
+        let iter = bun_jsc::JSPropertyIterator::init(
             global,
             object,
             bun_jsc::PropertyIteratorOptions {
@@ -458,11 +454,11 @@ fn ns_value_at(
                 include_value: true,
             },
         )?;
-        while let Some(key) = iter.next()? {
-            // The iterator lends the name; `JsStr` gives its reference back.
-            let key = JsStr(OwnedString::new(key.dupe_ref()));
+        while let Some((key, value)) = iter.next()? {
+            // The iterator lends the name; `JsStr` takes a reference of its own.
+            let key = JsStr((*key).clone());
             let key = check(global, DynObject::string(key.ns()))?;
-            let value = match ns_value_at(global, iter.value, what, depth + 1)? {
+            let value = match ns_value_at(global, value, what, depth + 1)? {
                 Some(o) => o,
                 None => check(global, DynObject::null())?,
             };

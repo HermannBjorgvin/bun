@@ -795,3 +795,11 @@ export const appKitInternals = {
   /** `-[NSApplication terminate:]`: the path the Quit menu item, the Dock's Quit and a logout take. */
   terminate: (): void => void require("internal/appkit_private").testing("terminate"),
 };
+
+// How many internal modules (node:fs etc.) this process created from bytecode embedded by `bun build --compile
+// --bytecode` instead of parsing their source.
+export const internalModulesLoadedFromBytecode: () => number = $newCppFunction(
+  "InternalModuleRegistry.cpp",
+  "jsInternalModulesLoadedFromBytecode",
+  0,
+);
