@@ -2642,6 +2642,9 @@ pub mod args {
         /// Passing a file descriptor is deprecated and may result in an error being thrown in the future.
         pub path: PathOrFileDescriptor,
         pub(crate) len: u64, // u63
+        /// Full `open(2)` flags for the path form, access mode included.
+        /// `node:fs` uses `O::RDWR` (Node's `'r+'`); `Bun.write` callers pass
+        /// `O::WRONLY` so a write-only file stays truncatable.
         pub(crate) flags: i32,
     }
     fs_args_path_forwarders!(Truncate; path);
@@ -2659,7 +2662,7 @@ pub mod args {
             Ok(Truncate {
                 path,
                 len,
-                flags: 0,
+                flags: bun_sys::O::RDWR,
             })
         }
     }
@@ -7863,11 +7866,7 @@ impl NodeFS {
         // Node implements fs.truncate(path) as open(path, 'r+') + ftruncate
         // (lib/fs.js), so each error reports the syscall that failed: a
         // missing path is an "open" error, not "truncate".
-        let file = sys::open(
-            path.slice_z(&mut self.sync_error_buf),
-            sys::O::RDWR | flags,
-            0o644,
-        );
+        let file = sys::open(path.slice_z(&mut self.sync_error_buf), flags, 0o644);
         let fd = match file {
             Ok(fd) => fd,
             Err(e) => return Err(e.with_path(path.slice())),
