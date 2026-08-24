@@ -1520,19 +1520,6 @@ impl ZigString {
         }
     }
 
-    /// `ZigString.toSliceFast` — like `to_slice` but skips the Latin-1-to-UTF-8
-    /// rescan for 8-bit inputs (caller asserts bytes are already valid UTF-8 /
-    /// ASCII). 16-bit inputs still allocate a UTF-8 copy.
-    pub fn to_slice_fast(&self) -> ZigStringSlice {
-        if self.len == 0 {
-            return ZigStringSlice::EMPTY;
-        }
-        if self.is_16bit() {
-            return ZigStringSlice::Owned(self.to_owned_slice());
-        }
-        self.to_slice_borrowed()
-    }
-
     /// `ZigString.sliceZBuf` — `Display`-format into `buf`, NUL-terminate, and
     /// return the borrowed `[:0]u8`. Errors if the formatted output (plus NUL)
     /// would not fit.
