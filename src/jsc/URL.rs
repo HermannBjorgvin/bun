@@ -102,3 +102,31 @@ impl URL {
         URL__pathname(self)
     }
 }
+
+/// A `URL` allocated by [`URL::from_utf8`] / [`URL::from_string`], destroyed
+/// on drop.
+pub struct OwnedUrl(NonNull<URL>);
+
+impl OwnedUrl {
+    pub fn from_utf8(input: &[u8]) -> Option<Self> {
+        URL::from_utf8(input).map(OwnedUrl)
+    }
+
+    pub fn from_string(str: String) -> Option<Self> {
+        URL::from_string(str).map(OwnedUrl)
+    }
+}
+
+impl core::ops::Deref for OwnedUrl {
+    type Target = URL;
+    fn deref(&self) -> &URL {
+        URL::opaque_ref(self.0.as_ptr())
+    }
+}
+
+impl Drop for OwnedUrl {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from `URL::from_*` and is destroyed only here.
+        unsafe { URL::destroy(self.0.as_ptr()) }
+    }
+}

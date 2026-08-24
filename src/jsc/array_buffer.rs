@@ -138,12 +138,59 @@ unsafe extern "C" {
     safe fn JSC__ArrayBuffer__deref(self_: &JSCArrayBuffer);
     // safe: by-value `JSValue`; no-op for non-buffer values.
     safe fn JSC__JSValue__unpinArrayBuffer(v: JSValue);
+    // safe: by-value `JSValue`; out-params are `&mut` (same ABI as `*mut`).
+    // The obligation is on the *returned* bytes (see `BorrowedBytes`).
+    safe fn JSC__JSValue__borrowBytesForOffThread(
+        v: JSValue,
+        out_ptr: &mut *const u8,
+        out_len: &mut usize,
+    ) -> i32;
+}
+
+/// The bytes of an ArrayBuffer / view, classified by what keeps them alive
+/// (`JSC__JSValue__borrowBytesForOffThread`).
+pub enum BorrowedBytes<'a> {
+    /// Detached buffer or not a buffer/view at all.
+    Detached,
+    /// A `FastTypedArray`'s GC-movable inline vector: copy it before returning
+    /// to JS.
+    Movable(&'a [u8]),
+    /// An `ArrayBuffer` that is now pinned (non-detachable) until
+    /// [`JSValue::unpin_array_buffer`]; keep the value GC-rooted meanwhile.
+    Pinned(&'a [u8]),
+    /// A bufferless oversize view's storage, immovable for the cell's
+    /// lifetime; keep the value GC-rooted while the bytes are in use.
+    Held(&'a [u8]),
 }
 
 impl JSValue {
     /// Releases a pin on this value's backing `JSC::ArrayBuffer`. Only for a value whose pin actually pinned a buffer; prefer [`ArrayBuffer::unpin`], which knows.
     pub fn unpin_array_buffer(self) {
         JSC__JSValue__unpinArrayBuffer(self);
+    }
+
+    /// This value's ArrayBuffer / view bytes for use after the current call
+    /// returns to JS (see [`BorrowedBytes`] for each variant's obligation). The
+    /// borrow is tied to `self`'s stack slot; the bytes themselves live as
+    /// long as the variant says.
+    pub fn borrow_bytes_for_off_thread(&self) -> BorrowedBytes<'_> {
+        let mut ptr: *const u8 = core::ptr::null();
+        let mut len: usize = 0;
+        let kind = JSC__JSValue__borrowBytesForOffThread(*self, &mut ptr, &mut len);
+        let bytes: &[u8] = if ptr.is_null() || len == 0 {
+            &[]
+        } else {
+            // SAFETY: for kinds 1..=3 C++ returned the live (ptr, len) of the
+            // buffer's storage, which stays put per the variant docs.
+            unsafe { core::slice::from_raw_parts(ptr, len) }
+        };
+        match kind {
+            0 => BorrowedBytes::Detached,
+            1 => BorrowedBytes::Movable(bytes),
+            2 => BorrowedBytes::Pinned(bytes),
+            3 => BorrowedBytes::Held(bytes),
+            _ => unreachable!("borrowBytesForOffThread kind {kind}"),
+        }
     }
 }
 

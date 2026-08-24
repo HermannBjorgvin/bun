@@ -1010,6 +1010,19 @@ where
     }
 }
 
+impl<T: AnyRefCounted> From<RefPtr<T>> for ScopedRef<T>
+where
+    T::DestructorCtx: Default,
+{
+    /// Release the ref `owned` holds when the guard drops.
+    #[inline]
+    fn from(owned: RefPtr<T>) -> Self {
+        let data = owned.data;
+        let _ = owned.leak();
+        Self(data)
+    }
+}
+
 impl<T: AnyRefCounted> Drop for ScopedRef<T>
 where
     T::DestructorCtx: Default,

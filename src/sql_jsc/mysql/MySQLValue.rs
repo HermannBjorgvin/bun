@@ -14,7 +14,7 @@ use bun_sql::mysql::protocol::any_mysql_error;
 use bun_sql::mysql::protocol::prepared_statement::ExecuteParam;
 use bun_sql::shared::Data;
 
-use crate::jsc::webcore::Blob;
+use bun_jsc::BorrowedBytes;
 
 pub(crate) fn field_type_from_js(
     global_object: &JSGlobalObject,
@@ -173,7 +173,7 @@ impl Drop for Bytes {
         if !self.pinned.is_empty() {
             // `pinned` is rooted by the caller's MarkedArgumentBuffer for the
             // lifetime of this Value (see struct doc); the FFI itself is `safe fn`.
-            JSC__JSValue__unpinArrayBuffer(self.pinned);
+            self.pinned.unpin_array_buffer();
         }
         // self.slice dropped automatically
     }
@@ -341,19 +341,13 @@ impl Value {
                     // Pin the backing ArrayBuffer so it stays non-detachable
                     // until Value drop unpins it; borrowing the slice is
                     // then safe without a copy. See `Bytes`.
-                    let mut ptr: *const u8 = core::ptr::null();
-                    let mut len: usize = 0;
-                    return match JSC__JSValue__borrowBytesForOffThread(value, &mut ptr, &mut len) {
+                    return match value.borrow_bytes_for_off_thread() {
                         // detached / null
-                        0 => Ok(Value::Bytes(Bytes::default())),
+                        BorrowedBytes::Detached => Ok(Value::Bytes(Bytes::default())),
                         // FastTypedArray — tiny, GC-movable vector; dupe.
-                        1 => Ok(Value::Bytes(Bytes {
-                            // SAFETY: ptr/len returned from helper are valid for the
-                            // duration of this call; init_dupe copies immediately.
-                            slice: ZigStringSlice::init_dupe(unsafe {
-                                core::slice::from_raw_parts(ptr, len)
-                            })
-                            .map_err(|_| any_mysql_error::Error::OutOfMemory)?,
+                        BorrowedBytes::Movable(bytes) => Ok(Value::Bytes(Bytes {
+                            slice: ZigStringSlice::init_dupe(bytes)
+                                .map_err(|_| any_mysql_error::Error::OutOfMemory)?,
                             pinned: JSValue::ZERO,
                         })),
                         // Oversize/Wasteful/DataView/JSArrayBuffer — pinned
@@ -361,22 +355,24 @@ impl Value {
                         // collect it (and free the backing store despite
                         // the pin) if user JS drops the last reference from
                         // a later parameter.
-                        kind @ (2 | 3) => {
+                        BorrowedBytes::Pinned(bytes) => {
                             roots.append(value);
                             Ok(Value::Bytes(Bytes {
-                                // SAFETY: backing storage is pinned or held (bufferless view) and
-                                // rooted via `roots`; slice stays valid until Bytes::drop unpins.
-                                slice: ZigStringSlice::from_utf8_never_free(unsafe {
-                                    core::slice::from_raw_parts(ptr, len)
-                                }),
-                                pinned: if kind == 2 { value } else { JSValue::ZERO },
+                                slice: ZigStringSlice::from_utf8_never_free(bytes),
+                                pinned: value,
                             }))
                         }
-                        _ => unreachable!(),
+                        BorrowedBytes::Held(bytes) => {
+                            roots.append(value);
+                            Ok(Value::Bytes(Bytes {
+                                slice: ZigStringSlice::from_utf8_never_free(bytes),
+                                pinned: JSValue::ZERO,
+                            }))
+                        }
                     };
                 }
 
-                if let Some(blob) = value.as_class_ref::<Blob>() {
+                if let Some(blob) = value.as_class_ref::<crate::jsc::webcore::Blob>() {
                     if blob.needs_to_read_file() {
                         return Err(js_error_to_mysql(global_object.throw_invalid_arguments(
                             format_args!("File blobs are not supported"),
@@ -816,20 +812,4 @@ fn gregorian_date(days: i32) -> Date {
         month: m,
         day: u8::try_from(d + 1).expect("int cast"),
     }
-}
-
-unsafe extern "C" {
-    /// By-value `JSValue`; C++ side null-checks and reads its own heap state.
-    /// No caller-side preconditions → `safe fn`.
-    safe fn JSC__JSValue__unpinArrayBuffer(v: JSValue);
-    /// 0 = detached/null, 1 = FastTypedArray (GC-movable — caller should dupe;
-    /// no unpin needed), 2 = pinned an existing ArrayBuffer (caller must
-    /// `unpinArrayBuffer`), 3 = held a bufferless OversizeTypedArray (nothing to unpin; root it as for 2).
-    /// Out-params are `&mut` (same ABI as `*mut`), so the only obligation left
-    /// is on the *returned* slice, not the call itself → `safe fn`.
-    safe fn JSC__JSValue__borrowBytesForOffThread(
-        v: JSValue,
-        out_ptr: &mut *const u8,
-        out_len: &mut usize,
-    ) -> i32;
 }
