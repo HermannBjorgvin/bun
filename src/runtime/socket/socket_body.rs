@@ -3626,8 +3626,6 @@ impl<const SSL: bool> NewSocket<SSL> {
             )
         } {
             Some(s) => s,
-            // `us_socket_adopt` refused the socket; it is untouched and `this`
-            // still owns it.
             None => {
                 // `deref` runs `deinit_and_destroy`, which drops the owned_ctx
                 // ref and the handlers `Rc`. Sole owner of the fresh allocation.
