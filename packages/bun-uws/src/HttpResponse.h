@@ -378,6 +378,15 @@ public:
          * first WebSocket frames written in the open handler. */
         internalEnd({nullptr, 0}, 0, false, false, false, true);
 
+        /* When this socket is not corked (an upgrade from an async handler),
+         * internalEnd ran the close gate: a connection already marked to close
+         * (Connection: close, HTTP/1.0, peer FIN, close-when-idle) was shut
+         * down and closed just now, and onClose has destructed
+         * HttpResponseData. Nothing below may touch it. */
+        if (us_socket_is_closed((us_socket_t *) this) || us_socket_is_shut_down((us_socket_t *) this)) {
+            return nullptr;
+        }
+
         /* Grab the httpContext from res */
         HttpContext<SSL> *httpContext = HttpContext<SSL>::fromSocket((struct us_socket_t *) this);
 
