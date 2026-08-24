@@ -1096,9 +1096,8 @@ extern "C" BlobHeader __attribute__((section("__BUN,__bun"))) BUN_COMPILED = { 0
 
 extern "C" uint64_t* Bun__getStandaloneModuleGraphMachoLength()
 {
-    // The embedded length is untrusted (truncated download, AV rewriting,
-    // post-build tampering). Validate it against the section size recorded in
-    // the load command so callers never read past the mapped section.
+    // The embedded length is untrusted (post-build corruption); clamp it to
+    // the section size from the load command.
     unsigned long sectionSize = 0;
     uint8_t* sectionData = getsectiondata(&_mh_execute_header, "__BUN", "__bun", &sectionSize);
     if (!sectionData || sectionSize < sizeof(uint64_t)) return nullptr;
@@ -1141,19 +1140,15 @@ static bool initializePESection()
 
     PIMAGE_SECTION_HEADER sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
 
-    // Exact 8-byte name written by the section writer (src/exe_format/pe.rs);
-    // a prefix match would also hit unrelated sections like ".bundle".
+    // Exact name written by src/exe_format/pe.rs; a prefix match would also hit ".bundle".
     static const BYTE bunSectionName[IMAGE_SIZEOF_SHORT_NAME] = { '.', 'b', 'u', 'n', 0, 0, 0, 0 };
 
     for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
         if (memcmp(sectionHeader->Name, bunSectionName, IMAGE_SIZEOF_SHORT_NAME) == 0) {
-            // Found the .bun section
-            // Section format: 8 bytes size (uint64_t) + data
-            // Only VirtualSize bytes of the section are guaranteed to be
-            // mapped, and the embedded length is untrusted (truncated
-            // download, AV rewriting, post-build tampering). Reject instead
-            // of handing out a slice that extends past the image, which
-            // would crash the process before main() gets a chance to run.
+            // Section format: 8 bytes size (uint64_t) + data.
+            // Only VirtualSize bytes are mapped and the embedded length is
+            // untrusted (post-build corruption), so reject out-of-bounds
+            // lengths instead of crashing on the read.
             uint64_t sectionSize = sectionHeader->Misc.VirtualSize;
             if (sectionSize < sizeof(uint64_t)) return false;
 
