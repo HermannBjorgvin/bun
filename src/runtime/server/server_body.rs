@@ -2109,7 +2109,7 @@ where
         upgrader.reclaim_promise_cell();
         upgrader.deref();
 
-        resp.upgrade(
+        let upgraded = resp.upgrade(
             ws,
             sec_websocket_key_str.slice(),
             proto_str.slice(),
@@ -2118,6 +2118,14 @@ where
             // deref; `UpgradeState::Pending` documents who keeps it alive.
             Some(bun_opaque::opaque_deref_mut(upgrade_ctx.as_ptr())),
         );
+        if upgraded.is_null() {
+            // The connection closed while uWS wrote the 101 (see
+            // HttpResponse::upgrade), so `ws` never became a WebSocket.
+            // SAFETY: `ws` is the live allocation `init` returned; its JS
+            // wrapper owns it and nothing else has a pointer to it yet.
+            unsafe { &*ws }.discard_unopened();
+            return Ok(JSValue::FALSE);
+        }
 
         Ok(JSValue::TRUE)
     }
