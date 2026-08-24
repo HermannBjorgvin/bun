@@ -565,8 +565,7 @@ pub struct S3UploadStreamWrapper {
     pub(crate) callback_context: *mut c_void,
     /// this is owned by the task not by the wrapper
     pub path: bun_ptr::RawSlice<u8>,
-    /// Pins the source ReadableStream (and the JS pump hanging off it) until
-    /// this wrapper drops.
+    /// Roots the source ReadableStream, and the JS pump reachable only through it, until this wrapper drops.
     pub readable_stream_ref: ReadableStreamStrong,
     pub global: GlobalRef, // JSC_BORROW
 }
@@ -1030,8 +1029,6 @@ pub(crate) fn upload_stream(
     // default-controller stream synchronously inside `assign_to_stream`.
     task.continue_stream();
 
-    // `sink.source` holds the JS pump's controller unrooted; this Strong is what
-    // keeps the pump alive while it is parked on backpressure.
     ctx.readable_stream_ref = ReadableStreamStrong::init(readable_stream, global_this);
 
     // Native ByteStream fast-path: wire the source/sink handles directly so
